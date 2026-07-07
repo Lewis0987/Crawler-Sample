@@ -1,0 +1,72 @@
+{
+  "timestamp": "2026-07-06 13:03:53",
+  "source": "api",
+  "success_count": 13,
+  "data": {
+    "電池概覽": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "Rack容量資訊": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "Rack極端值資訊": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "電池Pack資訊": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "PCS概覽": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "環控_空調": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "環控_水系統": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "環控_UPS": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "環控_串口ttyS0": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "多功能傳感器": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "AC380電量儀": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    },
+    "告警資訊": {
+      "_error": true,
+      "code": 200,
+      "msg": "query was successful"
+    },
+    "系統時間戳": {
+      "_error": true,
+      "code": 200,
+      "msg": "operation successful"
+    }
+  }
+}
