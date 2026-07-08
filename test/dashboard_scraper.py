@@ -45,8 +45,11 @@ MAX_LOOPS = 0               # 最多抓幾輪；0 = 無限（Ctrl+C 停止）
 OUTPUT_TO_CONSOLE = True
 OUTPUT_TO_JSON = True
 OUTPUT_TO_CSV = True
-JSON_PATH = "dashboard_data.json"   # 完整原始資料（每輪覆寫最新快照）
-CSV_PATH = "dashboard_data.csv"     # 每輪摘要（附加一列，累積時間序列）
+# 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+JSON_PATH = os.path.join(_OUTPUT_DIR, "dashboard_data.json")   # 完整原始資料（每輪覆寫最新快照）
+CSV_PATH = os.path.join(_OUTPUT_DIR, "dashboard_data.csv")     # 每輪摘要（附加一列，累積時間序列）
 
 # 告警本次取回筆數（只影響顯示筆數，不影響 API 回傳的 total）
 ALARM_PAGE_SIZE = 3

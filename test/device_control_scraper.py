@@ -15,6 +15,7 @@
 執行：python device_control_scraper.py
 """
 
+import os
 import json
 from datetime import datetime
 
@@ -23,7 +24,10 @@ from api_client import ApiClient
 USERNAME = "hmiUser"
 PASSWORD = "hmiUser123"
 
-JSON_PATH = "device_control_readonly.json"
+# 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+JSON_PATH = os.path.join(_OUTPUT_DIR, "device_control_readonly.json")
 
 # ---- 只讀白名單（唯一允許呼叫的端點；皆為 GET 查詢）----
 READONLY_ENDPOINTS = {

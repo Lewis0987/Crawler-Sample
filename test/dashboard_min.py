@@ -17,6 +17,7 @@
   - 完整原始資料仍寫入 dashboard_min.json
 """
 
+import os
 import json
 from datetime import datetime
 
@@ -26,7 +27,10 @@ import requests
 # ============ 設定區（要改就改這裡） ============
 BASE_URL = "http://192.168.128.110:8080/admin-api"   # 如 8853 有代理可改成 :8853
 TIMEOUT = 8                  # 單支逾時秒數
-JSON_PATH = "dashboard_min.json"  # 把 API 回傳資料存成完整 JSON
+# 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+JSON_PATH = os.path.join(_OUTPUT_DIR, "dashboard_min.json")  # 把 API 回傳資料存成完整 JSON
 
 # 打 API 抓資料 => 已確認 method=GET 的四大區塊 endpoint
 ENDPOINTS = {

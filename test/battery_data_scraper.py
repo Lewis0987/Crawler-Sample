@@ -20,6 +20,7 @@ API 盤點：兩頁都 import permission 的函式 d = getPackInformation（同�
 執行：python battery_data_scraper.py
 """
 
+import os
 import csv
 import json
 from datetime import datetime
@@ -29,8 +30,13 @@ from api_client import ApiClient
 BATTERY_PACK_API = "/hmiGuest/unauthorizedAccess/battery/getPackInformation"
 CELLS_PER_PACK = 20   # 預期每 pack 的 cell 數；少於此會在 console 警告
 
-PACK_JSON, PACK_CSV = "battery_data.json", "battery_data.csv"
-CELL_JSON, CELL_CSV = "battery_cells.json", "battery_cells.csv"
+# 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+PACK_JSON = os.path.join(_OUTPUT_DIR, "battery_data.json")
+PACK_CSV = os.path.join(_OUTPUT_DIR, "battery_data.csv")
+CELL_JSON = os.path.join(_OUTPUT_DIR, "battery_cells.json")
+CELL_CSV = os.path.join(_OUTPUT_DIR, "battery_cells.csv")
 
 # 欄位固定（數值皆為原始值；單位固定：電壓 V、溫度 ℃、SOC/SOH %）
 PACK_FIELDS = ["packNo", "totalVoltage",

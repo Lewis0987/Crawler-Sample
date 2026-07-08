@@ -1,0 +1,15 @@
+# 本機敏感設定（含可重放 password 密文）— 不可提交
+.env
+login_config.json
+config/local*.json
+
+# 範本可提交（不含真實密文）
+!.env.example
+!login_config.example.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 分析用暫存
+scratchpad/

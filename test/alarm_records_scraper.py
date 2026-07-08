@@ -14,6 +14,7 @@ API（免登入 guest）：GET /hmiGuest/unauthorizedAccess/alarm/list
 執行：python alarm_records_scraper.py
 """
 
+import os
 import csv
 import json
 import unicodedata
@@ -48,8 +49,11 @@ ALARM_LIST_API = "/hmiGuest/unauthorizedAccess/alarm/list"
 PAGE_SIZE = 100        # 每頁筆數（分頁抓全部用）
 MAX_PAGES = 200        # 安全上限，避免異常時無限迴圈
 
-JSON_PATH = "alarm_records.json"
-CSV_PATH = "alarm_records.csv"
+# 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+JSON_PATH = os.path.join(_OUTPUT_DIR, "alarm_records.json")
+CSV_PATH = os.path.join(_OUTPUT_DIR, "alarm_records.csv")
 
 # 想輸出的欄位（以實測 row 欄位為主）。
 # 保留原始 i18n key（typeMark/targetMark/val），並各自在其後補中文欄位 *Text。

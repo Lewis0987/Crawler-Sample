@@ -1,0 +1,6 @@
+# 爬蟲輸出結果統一放這裡，不進版控
+output/
+
+# Python
+__pycache__/
+*.pyc

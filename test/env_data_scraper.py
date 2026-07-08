@@ -18,6 +18,7 @@ API（免登入 guest，皆 GET）：
 執行：python env_data_scraper.py
 """
 
+import os
 import csv
 import json
 from datetime import datetime
@@ -35,10 +36,13 @@ ENDPOINTS = {
     "多功能傳感器": "/hmiGuest/unauthorizedAccess/envCon/multifunction",
 }
 
-JSON_PATH = "env_data.json"
-CSV_PATH = "env_data.csv"
-CURATED_JSON_PATH = "env_curated.json"
-CURATED_CSV_PATH = "env_curated.csv"
+# 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+JSON_PATH = os.path.join(_OUTPUT_DIR, "env_data.json")
+CSV_PATH = os.path.join(_OUTPUT_DIR, "env_data.csv")
+CURATED_JSON_PATH = os.path.join(_OUTPUT_DIR, "env_curated.json")
+CURATED_CSV_PATH = os.path.join(_OUTPUT_DIR, "env_curated.csv")
 
 # ---- curated 重點欄位（中文欄位 → 實際 mark；只挑人會看的重點，非全部 raw mark）----
 # 值透過 _flatten_metrics + _fmt_metric 帶出（狀態已中文化、數值已含單位）。

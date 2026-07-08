@@ -1,7 +1,12 @@
+import os
 import csv
 from collections import Counter
 
-cells = list(csv.DictReader(open('battery_cells.csv', encoding='utf-8-sig')))
+# 從專案根目錄的 output/ 讀取（由 battery_data_scraper.py 產生）
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+_CELLS_CSV = os.path.join(_OUTPUT_DIR, "battery_cells.csv")
+
+cells = list(csv.DictReader(open(_CELLS_CSV, encoding='utf-8-sig')))
 print('cell 總數:', len(cells))
 print('CSV 欄位:', list(cells[0].keys()))
 

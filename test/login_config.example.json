@@ -1,0 +1,5 @@
+{
+  "_note": "複製本檔為 login_config.json 後填入。login_config.json 已被 .gitignore 排除，勿提交。也可改用環境變數 LOGIN_PASSWORD_PAYLOAD（優先於本檔）。",
+  "username": "hmiUser",
+  "password_payload": "<在此貼上前端 DevTools 抓到的可重放 password 密文（hex）>"
+}
