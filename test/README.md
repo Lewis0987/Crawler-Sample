@@ -240,6 +240,42 @@ python device_control_scraper.py
 
 輸出：`D:\Crawler Sample\output\device_control_readonly.json`（登入狀態 + 唯讀查詢結果 + 控制 API 清單（僅記錄））
 
+**狀態顯示規則**：
+- 「目前狀態」取自 **guest / envCon / overview 可讀來源**；authed `/dataOrControl/air`、`/pcs`（403）僅作控制驗證、獨立顯示，不覆蓋狀態。
+- **排程開關狀態：僅當 `PCS控制模式 = 智慧模式` 時才顯示**（依 API `getRunMode` 判斷：`schedule / auto / smart / intelligent` → 智慧模式；`manual` → 手動、不顯示排程開關）。這是因為排程開關只在智慧模式下有意義。
+
+---
+
+### 6) `threshold_config_scraper.py` — 閥值管理（唯讀）
+
+讀取「告警抑制」開關 + 閥值列表（含 ECM/PCS/BMS 聯動控制）。**只讀：不修改閥值、不保存、不切換開關。**
+
+```
+cd D:\Crawler Sample\test
+python threshold_config_scraper.py
+```
+
+API（皆 **GET**，需登入）：
+- `/client/dynamic/threshold/config/config` → `{configId, suppressionFlagMainSwitch}`
+- `/client/dynamic/threshold/list?pageSize=1000` → `{total, rows[…]}`（**無 pageSize 只回第一頁 10 筆**，故帶 pageSize 抓齊全部）
+
+**⚠️ 開關值對照（依前端閥值頁：value `0`=綠色/checked=啟用、`1`=灰色=停用）**：
+- 告警抑制 `suppressionFlagMainSwitch`、每列 `linkageControlSwitch`（聯動控制開關）、`enableFlag`（告警開關）：**`0` → 已啟用、`1` → 已停用**。
+
+**其他欄位對照**：
+| 欄位 | 來源 | 對照 |
+|---|---|---|
+| 感測器型別 | `typeName` | device.type.temperature→多功能溫溼度、voltameter→電量儀 |
+| 觸發閥值 | `target`+`operatorStr`+`targetValue`+`targetUnit` | temperature→溫度、humidity→濕度、ch4→甲烷、h2→氫氣、phaseVoltageAB/BC/CA→相電壓AB/BC/CA |
+| 觸發條件 | `condition`+`conditionValue` | time → 時間持續 N 秒 |
+| 告警級別 | `level` | 0→嚴重、1→一般 |
+| ECM | `linkageControlVo.ipcOperate` | 0→黃燈恆亮、1→紅燈恆亮 |
+| PCS | `linkageControlVo.pcsOperate` | 17→無動作、2→PCS停機 |
+| BMS | `linkageControlVo.bcuOperate` | 17→無動作、10→普通下電 |
+
+**輸出**：`output/threshold_config.json`（原始 config+list）、`output/threshold_config_summary.json`、`output/threshold_config.csv`（皆保留完整 125 筆）。
+**終端**：只印前 `DETAIL_PRINT_LIMIT`（預設 10）筆，並顯示 `總筆數 / 顯示筆數`；完整資料看 JSON/CSV。
+
 ---
 
 ## 五、`run_all.py` 唯讀總入口（目前全綠）

@@ -77,6 +77,47 @@ MENU_TEXT = """
 """
 
 
+# ---- 顏色（開=藍 / 關=紅）----
+BLUE = "\033[94m"
+RED = "\033[91m"
+RESET = "\033[0m"
+
+
+def _enable_ansi():
+    """Windows Terminal / CMD 啟用 ANSI 色碼。"""
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            k.SetConsoleMode(k.GetStdHandle(-11), 7)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            pass
+
+
+def colorize(v):
+    """開/開啟/已啟用/已上電→藍；關/關閉/已停用/已下電→紅；其餘原色。"""
+    s = str(v)
+    if s in ("開", "ON", "on", "true", "1") or "開啟" in s or "啟用" in s or "已上電" in s:
+        return BLUE + s + RESET
+    if s in ("關", "OFF", "off", "false", "0") or "關閉" in s or "已停用" in s or "已下電" in s:
+        return RED + s + RESET
+    return s
+
+
+# 各區塊「控制選單」參考清單（僅顯示、不自動執行）
+_CONTROL_MENUS = {
+    "PCS": ["PCS充電", "PCS放電", "PCS停機", "設定有功功率", "切換離網模式"],
+    "電池": ["電池上電", "電池下電"],
+    "進排風": ["開啟進排風", "關閉進排風"],
+    "空調": ["開啟空調", "關閉空調", "設定空調模式", "設定溫度"],
+    "冷卻循環": ["開啟冷卻循環", "關閉冷卻循環"],
+}
+# 區塊顯示順序（依需求：PCS→電池→進排風→空調→冷卻循環）
+_DASHBOARD_ORDER = ("PCS", "電池", "進排風", "空調", "冷卻循環")
+# 電池區塊反饋欄位（總覽不重複顯示，仍保留在 scraper console / JSON）
+_FEEDBACK_LABELS = {"主正反饋", "主正", "主負反饋", "主負", "環流"}
+
+
 def _load_json(path):
     if not os.path.exists(path):
         return None
@@ -173,19 +214,19 @@ def show_readonly_summary():
     if data is None:
         print("尚未產生結果檔（device_control_readonly.json 不存在或無法讀取）")
         return
-    rd = data.get("readonly_data") or {}
-    print("\n---------- 目前設備狀態 ----------")
-    print(f"logged_in     = {data.get('logged_in')}")
-    print(f"空調狀態       = {_fmt_value(rd.get('空調狀態'))}")
-    print(f"PCS狀態        = {_fmt_value(rd.get('PCS狀態'))}")
-    print(f"PCS運行模式    = {_fmt_value(rd.get('PCS運行模式'))}")
-    sw = rd.get("排程開關狀態")
-    if isinstance(sw, dict) and not sw.get("_error"):
-        print("手動模式開關狀態 = "
-              f"schedulePlanSwitch={sw.get('schedulePlanSwitch')} "
-              f"manualModeSwitch={sw.get('manualModeSwitch')}")
-    else:
-        print(f"手動模式開關狀態 = {_fmt_value(sw)}")
+    ss = data.get("status_summary") or {}
+    print("\n---------- 目前設備狀態（可讀來源）----------")
+    print(f"logged_in = {data.get('logged_in')}")
+    # 只顯示 5 區塊；【其他】(DO/DI 原始) 與 verify 403 只留在 JSON，不印
+    for section in ("PCS", "電池", "空調", "進排風", "冷卻循環"):
+        fields = ss.get(section)
+        if not isinstance(fields, dict):
+            continue
+        print(f"[{section}]")
+        for label, value in fields.items():
+            if label.startswith("_"):
+                continue
+            print(f"  {label}：{value}")
 
 
 def handle_choice(choice):
@@ -248,14 +289,71 @@ def handle_choice(choice):
     return True
 
 
-def main():
-    print("設備控制選單啟動（控制動作會實際送出；查詢為唯讀；電池上下電需 YES 確認）")
+def refresh_status():
+    """執行唯讀 scraper 刷新狀態，只印登入 4 行，回傳 status_summary。"""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8", SCRAPER],
+            cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except Exception as e:
+        print(f"[錯誤] 無法刷新狀態：{e}")
+        return {}
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith(("嘗試登入", "[ENV] loaded", "HMI login")):
+            print(line)
+    if proc.returncode != 0:
+        print("[錯誤] 狀態查詢失敗")
+        for l in (proc.stderr or "").strip().splitlines()[-5:]:
+            print("   ", l)
+    data = _load_json(READONLY_RESULT) or {}
+    return data.get("status_summary") or {}
+
+
+def _core_switch_fields(block, fields):
+    """只取各區塊「當前開關狀態」核心欄位，其餘詳細狀態不顯示。"""
+    out = {}
+    if block == "PCS":
+        if "PCS控制模式" in fields:
+            out["PCS控制模式"] = fields["PCS控制模式"]
+        if "排程開關狀態" in fields:                       # 僅智慧模式時 scraper 才會有此欄位
+            out["PCS排程開關狀態"] = fields["排程開關狀態"]
+    elif block == "電池":
+        out["電池上下電狀態"] = fields.get("電池上下電狀態", "暫無資料")
+    elif block == "進排風":
+        v = str(fields.get("進排風執行狀態", ""))
+        out["進排風開關"] = ("開啟" if ("開啟" in v or "運轉" in v)
+                            else ("關閉" if v else "暫無資料"))
+    elif block == "空調":
+        v = str(fields.get("空調開關", ""))
+        out["空調開關"] = {"開": "開啟", "關": "關閉"}.get(v, v or "暫無資料")
+    elif block == "冷卻循環":
+        out["冷卻循環開關"] = fields.get("冷卻循環水泵狀態", "暫無資料")
+    return out
+
+
+def render_dashboard(status):
+    """依區塊顯示：僅「當前開關狀態」（含顏色）+ 控制選單參考（僅顯示，不執行）。"""
+    for block in _DASHBOARD_ORDER:
+        simp = _core_switch_fields(block, status.get(block) or {})
+        print(f"\n【{block}】狀態：")
+        if simp:
+            for label, value in simp.items():
+                print(f"{label}：{colorize(value)}")
+        else:
+            print("  （暫無資料）")
+        print("\n控制選單：")
+        for i, item in enumerate(_CONTROL_MENUS.get(block, []), 1):
+            print(f"{i}. {item}")
+
+
+def _exec_menu():
+    """實際執行控制的子選單（沿用既有 handle_choice 邏輯）。"""
     while True:
         print(MENU_TEXT)
         try:
             choice = input("請輸入選項：").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n偵測到中斷，結束程式。")
             break
         try:
             if not handle_choice(choice):
@@ -263,6 +361,25 @@ def main():
         except Exception as e:
             print(f"[錯誤] 執行選項 {choice} 時發生例外：{e}")
         print()
+
+
+def main():
+    _enable_ansi()
+    print("設備控制總覽（狀態為顯示用，不會自動執行控制）")
+    while True:
+        status = refresh_status()
+        render_dashboard(status)
+        try:
+            choice = input("\n[r] 重新整理　[e] 進入控制執行選單　[0] 離開：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n結束程式。")
+            break
+        if choice == "0":
+            print("結束程式。")
+            break
+        if choice == "e":
+            _exec_menu()
+        # 其他（含 r / 空白）→ 迴圈頂端重新刷新
 
 
 if __name__ == "__main__":

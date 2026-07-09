@@ -43,6 +43,9 @@ TASKS = [
      "outputs": ["alarm_records.json", "alarm_records.csv"]},
     {"key": "device", "script": "device_control_scraper.py",
      "outputs": ["device_control_readonly.json"]},
+    {"key": "threshold", "script": "threshold_config_scraper.py",
+     "outputs": ["threshold_config.json", "threshold_config_summary.json",
+                 "threshold_config.csv"]},
 ]
 TASK_BY_KEY = {t["key"]: t for t in TASKS}
 KEYS = [t["key"] for t in TASKS]
