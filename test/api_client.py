@@ -18,8 +18,11 @@
 
 import os
 import json
+import pathlib
 
 import requests
+
+import sm2_util  # 新模式：Python 端即時 SM2 加密（sm-crypto doEncrypt cipherMode=1 對應）
 
 
 # ============ 共用設定 ============
@@ -32,39 +35,92 @@ DEFAULT_HEADERS = {
 DEFAULT_USERNAME = "hmiUser"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
 # 登入密碼設定檔（與本檔同目錄）。實際密文請放這裡或環境變數，勿寫進程式碼。
 LOGIN_CONFIG_FILE = os.path.join(_HERE, "login_config.json")
-# .env 搜尋位置：test/ 與專案根目錄
-_ENV_FILES = [os.path.join(_HERE, ".env"), os.path.join(os.path.dirname(_HERE), ".env")]
 
 _dotenv_loaded = False
 
 
+def _env_files_in(d):
+    """
+    掃描單一目錄下的 env 檔（用 pathlib，不寫死檔名）。
+    回傳順序：.env 優先，其餘 *.env 依「檔名」排序。
+    （Windows 上 .env 未必被 *.env 掃到，故單獨處理並去重。）
+    """
+    p = pathlib.Path(d)
+    files = []
+    dotenv = p / ".env"
+    if dotenv.is_file():
+        files.append(dotenv)
+    try:
+        globbed = sorted(p.glob("*.env"), key=lambda x: x.name)
+    except OSError:
+        globbed = []
+    for f in globbed:
+        if f.is_file() and f.name != ".env" and f not in files:
+            files.append(f)
+    return files
+
+
+def discover_env_candidates():
+    """
+    依優先序回傳 env 候選檔（去重、保序）：
+      1. API_ENV_FILE 指定檔（若存在）
+      2. api_client.py 同層 .env
+      3. 同層其他 *.env（依檔名排序）
+      4. 專案根目錄 .env
+      5. 專案根目錄其他 *.env（依檔名排序）
+    """
+    candidates = []
+    forced = os.environ.get("API_ENV_FILE")
+    if forced:
+        fp = pathlib.Path(forced)
+        if fp.is_file():
+            candidates.append(fp)
+    for d in (_HERE, _ROOT):
+        for f in _env_files_in(d):
+            if f not in candidates:
+                candidates.append(f)
+    return candidates
+
+
+def _apply_env_file(path):
+    """把 KEY=VALUE 載入 os.environ（僅在尚未設定時；# 註解、去引號、不展開）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key, val = key.strip(), val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except OSError as e:
+        print(f"[ENV] 讀取失敗 {path}: {e}")
+
+
 def _load_dotenv():
     """
-    極簡 .env 讀取器（無第三方相依）：把 KEY=VALUE 載入 os.environ。
-    - 只在尚未設定該環境變數時填入（真正的環境變數優先）。
-    - 支援 # 註解、去除前後引號；不做變數展開。
+    動態搜尋並載入單一 env 檔（掃 api_client 同層與專案根的 .env / *.env）。
+    只載入優先序最高的一個；多個候選會列出。不改變登入讀取邏輯。
     """
     global _dotenv_loaded
     if _dotenv_loaded:
         return
     _dotenv_loaded = True
-    for path in _ENV_FILES:
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, val = line.split("=", 1)
-                    key, val = key.strip(), val.strip().strip('"').strip("'")
-                    if key and key not in os.environ:
-                        os.environ[key] = val
-        except OSError:
-            pass
+    candidates = discover_env_candidates()
+    if not candidates:
+        print("[ENV] no env file found")
+        return
+    if len(candidates) > 1:
+        print("[ENV] candidates:")
+        for c in candidates:
+            print(f"  - {c}")
+    chosen = candidates[0]
+    print(f"[ENV] loaded: {chosen}")
+    _apply_env_file(chosen)
 
 
 def mask_secret(s):
@@ -76,42 +132,61 @@ def mask_secret(s):
     return f"{s[:5]}...{s[-5:]} (len={len(s)})"
 
 
+def _clean(v):
+    """去除佔位字串（例如 '<...>'）與空白；空值回 None。"""
+    if v is None:
+        return None
+    v = str(v).strip()
+    if not v or v.startswith("<"):
+        return None
+    return v
+
+
 def load_login_config():
     """
-    讀取登入設定，優先序（高→低）：
-      1. 環境變數（含 .env）：LOGIN_PASSWORD_PAYLOAD、HMI_USERNAME / LOGIN_USERNAME
-      2. login_config.json（key: password_payload / username）
-    回傳 dict：{"username": ..., "password_payload": ..., "source": "env"|"config"|None}
-    找不到密文時 password_payload 為 None（呼叫端需自行處理）。
+    讀取登入設定（環境變數/.env 優先，其次 login_config.json）。
 
-    【背景】前端 LoginForm 會把 password 用 SM2（sm-crypto，hex/04 前綴密文）加密後才送出，
-    每次登入密文不同；但實測「同一段密文可重放多次登入」。因此短期方案是把 DevTools 抓到的
-    可重放密文放進 .env / 環境變數 / login_config.json，login_hmi() 直接送出，
-    不在 Python 端重現加密流程。
+    回傳 dict：
+      - username         : 帳號（預設 hmiUser）
+      - password_payload : 舊模式，DevTools 抓到的可重放 SM2 密文（LOGIN_PASSWORD_PAYLOAD）
+      - hmi_password     : 新模式，密碼原文（HMI_PASSWORD）
+      - sm2_public_key   : 新模式，SM2 公鑰 hex（SM2_PUBLIC_KEY）
+      - source           : 密文來源 "env"|"config"|None（僅指 password_payload）
+
+    【兩種登入模式】
+      舊模式：直接送 password_payload（可重放密文）。
+      新模式：以 sm2_util.sm2_encrypt(hmi_password, sm2_public_key) 每次即時加密
+              （對齊前端 sm-crypto doEncrypt cipherMode=1，04 前綴 C1C3C2 hex）。
     """
     _load_dotenv()
 
-    username = os.environ.get("HMI_USERNAME") or os.environ.get("LOGIN_USERNAME")
-    payload = os.environ.get("LOGIN_PASSWORD_PAYLOAD")
+    username = _clean(os.environ.get("HMI_USERNAME")) or _clean(os.environ.get("LOGIN_USERNAME"))
+    payload = _clean(os.environ.get("LOGIN_PASSWORD_PAYLOAD"))
+    hmi_password = _clean(os.environ.get("HMI_PASSWORD"))
+    sm2_public_key = _clean(os.environ.get("SM2_PUBLIC_KEY"))
     source = "env" if payload else None
 
-    if payload is None and os.path.exists(LOGIN_CONFIG_FILE):
+    if os.path.exists(LOGIN_CONFIG_FILE):
         try:
             with open(LOGIN_CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                username = username or data.get("username")
-                fv = data.get("password_payload")
-                # 忽略仍是佔位字串的情況（例如 "<...>"）
-                if fv and not str(fv).startswith("<"):
-                    payload = fv
-                    source = "config"
+                username = username or _clean(data.get("username"))
+                if payload is None:
+                    fv = _clean(data.get("password_payload"))
+                    if fv:
+                        payload = fv
+                        source = "config"
+                hmi_password = hmi_password or _clean(data.get("hmi_password"))
+                sm2_public_key = sm2_public_key or _clean(data.get("sm2_public_key"))
         except (ValueError, OSError):
             pass
 
     return {
         "username": username or DEFAULT_USERNAME,
         "password_payload": payload,
+        "hmi_password": hmi_password,
+        "sm2_public_key": sm2_public_key,
         "source": source,
     }
 
@@ -183,15 +258,14 @@ class ApiClient:
         - POST /system/auth/login（JSON body，Content-Type application/json）
         - body：{"username": ..., "password": ...(密文), "captchaVerification": ""}
 
-        【password 來源（短期可重放方案）】
-          前端 LoginForm 會把 password 用 SM2 加密（每次密文不同、hex/04 前綴）才送出，
-          我們不在 Python 端重現加密；改為使用 DevTools 抓到的「可重放密文」。
-          密碼取值優先序（config 覆蓋傳入參數）：
-            1. 環境變數 LOGIN_PASSWORD_PAYLOAD
-            2. login_config.json 的 password_payload
-            3. 呼叫端傳入的 password（相容 / 測試用）
+        【password 來源（雙模式，優先序高→低）】
+          1. 舊模式 payload：env/config 的 LOGIN_PASSWORD_PAYLOAD（DevTools 抓到的可重放 SM2 密文）
+             → 直接送出。
+          2. 新模式 SM2：env/config 同時有 HMI_PASSWORD（密碼原文）+ SM2_PUBLIC_KEY（公鑰）
+             → 以 sm2_util.sm2_encrypt() 每次即時 SM2 加密（對齊前端 sm-crypto doEncrypt cipherMode=1）。
+          3. fallback：呼叫端傳入的 password（相容 / 測試用）。
           → device_control_scraper.py 的 client.login(USERNAME, PASSWORD) 不需修改，
-             只要設定好 config/env，就會自動改送可重放密文。
+             只要設定好 config/env，就會自動採用對應模式。
 
         - 成功時 accessToken 取自 resp["data"]["accessToken"]，並設定 Authorization: Bearer。
         - tenant-id 不需要（VITE_GLOB_APP_TENANT_ENABLE=false）。
@@ -206,16 +280,33 @@ class ApiClient:
 
         cfg = load_login_config()
         resolved_user = username or cfg["username"]
-        # config/env 的密文優先；沒設定時才退回傳入的 password
-        resolved_pw = cfg["password_payload"] if cfg["password_payload"] else password
-        pw_source = cfg["source"] if cfg["password_payload"] else ("arg" if password else None)
+
+        # password 解析（雙模式，優先序：payload → sm2 → arg）
+        resolved_pw = None
+        pw_source = None
+        sm2_error = None
+        if cfg["password_payload"]:
+            resolved_pw = cfg["password_payload"]
+            pw_source = "env-payload" if cfg["source"] == "env" else "config-payload"
+        elif cfg["hmi_password"] and cfg["sm2_public_key"]:
+            try:
+                resolved_pw = sm2_util.sm2_encrypt(cfg["hmi_password"], cfg["sm2_public_key"])
+                pw_source = "sm2"
+            except Exception as e:
+                sm2_error = str(e)
+                pw_source = "sm2-error"
+        elif password:
+            resolved_pw = password
+            pw_source = "arg"
 
         _SOURCE_MSG = {
-            "env": "Using LOGIN_PASSWORD_PAYLOAD from env",
-            "config": "Using login config password payload",
+            "env-payload": "Using LOGIN_PASSWORD_PAYLOAD from env (payload mode)",
+            "config-payload": "Using login_config password_payload (payload mode)",
+            "sm2": "Using SM2 dynamic encryption (HMI_PASSWORD + SM2_PUBLIC_KEY)",
+            "sm2-error": "SM2 encryption failed",
             "arg": "Using plain password fallback",
         }
-        _log(_SOURCE_MSG.get(pw_source, "No password payload found"))
+        _log(_SOURCE_MSG.get(pw_source, "No password source found"))
 
         debug = {"url": url, "method": "POST", "content_type": "application/json",
                  "username": resolved_user, "password_source": pw_source,
@@ -225,9 +316,13 @@ class ApiClient:
         self.token_info = {}
 
         if not resolved_pw:
-            debug["error"] = ("未取得 password 密文：請設定環境變數 LOGIN_PASSWORD_PAYLOAD，"
-                              "或在 login_config.json 填入 password_payload（前端 DevTools 抓到的可重放密文）。")
-            _log("HMI login failed: 未設定 LOGIN_PASSWORD_PAYLOAD（env / .env / login_config.json 皆無密文）")
+            if pw_source == "sm2-error":
+                debug["error"] = f"SM2 加密失敗：{sm2_error}（請確認 SM2_PUBLIC_KEY 格式為 128/130 hex）"
+                _log(f"HMI login failed: SM2 加密失敗：{sm2_error}")
+            else:
+                debug["error"] = ("未取得 password：請設定 (A) LOGIN_PASSWORD_PAYLOAD（可重放密文），"
+                                  "或 (B) HMI_PASSWORD + SM2_PUBLIC_KEY（即時 SM2 加密）。")
+                _log("HMI login failed: 未設定 LOGIN_PASSWORD_PAYLOAD，也沒有 HMI_PASSWORD+SM2_PUBLIC_KEY")
             return (None, debug) if return_debug else None
 
         _log(f"HMI login: user={resolved_user} password={mask_secret(resolved_pw)}")

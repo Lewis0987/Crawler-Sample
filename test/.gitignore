@@ -1,5 +1,7 @@
 # 本機敏感設定（含可重放 password 密文）— 不可提交
+# 涵蓋 .env 與任意 *.env（例如 login.env / 1.env / abc.env）
 .env
+*.env
 login_config.json
 config/local*.json
 

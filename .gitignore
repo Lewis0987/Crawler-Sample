@@ -1,6 +1,17 @@
 # 爬蟲輸出結果統一放這裡，不進版控
 output/
 
+# 本機敏感設定（登入 env / config）— 不可提交
+# 涵蓋 .env 與任意 *.env（例如 login.env / 1.env / abc.env）
+.env
+*.env
+login_config.json
+config/local*.json
+
+# 範本可提交（不含真實密文）
+!.env.example
+!login_config.example.json
+
 # Python
 __pycache__/
 *.pyc

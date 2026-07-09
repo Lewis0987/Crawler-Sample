@@ -60,36 +60,87 @@ BASE_URL = http://192.168.128.110:8080/admin-api
 
 設備控制頁（`run_all.py` 的 device、`device_control_scraper.py`、`device_control_operator.py`）需登入取得 `accessToken`。
 
-前端登入時 password 會被 **SM2 加密**（每次密文不同）；本專案**不重現前端加密**，改採實測可行的「**可重放密文**」方案：把前端 DevTools 抓到的加密 password 放進 `.env`，登入時直接送出。
+前端登入時 password 會被 **SM2 加密**（`sm-crypto doEncrypt cipherMode=1`，04 前綴 C1C3C2 hex，每次密文不同）。本專案登入支援**雙模式**（皆由 `api_client.py` 統一處理）：
 
-### `.env` 位置與格式
+- **SM2 即時加密（新・已驗證，建議長期使用）**：env 放密碼原文 `HMI_PASSWORD` + 公鑰 `SM2_PUBLIC_KEY`，登入時用 `sm2_util.py` 即時加密（每次動態產生，不需固定密文）。
+- **可重放密文（舊・fallback）**：env 放 `LOGIN_PASSWORD_PAYLOAD`（DevTools 抓到的密文），直接送出。
 
-`.env` 放在：`D:\Crawler Sample\test\.env`
+### env 檔動態搜尋規則
 
-格式範例（**README/範本只放格式，不放真實密文**）：
+`api_client.py` 會**動態搜尋** env 檔（不寫死檔名），支援 `.env` 與**任意 `*.env`**（例如 `login.env`、`1.env`、`abc.env`）。
+
+**搜尋位置**：
+1. `api_client.py` 同層目錄（`D:\Crawler Sample\test`）
+2. 專案根目錄（`D:\Crawler Sample`）
+
+**優先順序（高 → 低，只載入最高的「單一」檔）**：
+1. `API_ENV_FILE` 環境變數指定的檔（若存在）
+2. 同層目錄的 `.env`
+3. 同層目錄其他 `*.env`（依**檔名字母序**取第一個）
+4. 專案根目錄的 `.env`
+5. 專案根目錄其他 `*.env`（依檔名字母序）
+
+**執行時輸出**：
+- 載入時印 `[ENV] loaded: <實際路徑>`
+- 若有多個候選，會先印 `[ENV] candidates:` 全清單再載入首位
+- 若都找不到，印 `[ENV] no env file found`
+
+> 驗證腳本：`python test_env_discovery.py`（B1~B3 本地離線測搜尋/排序；加 `--with-login` 才做真實登入）。
+
+### env 檔內容格式（`test/login.env` 或任意 `*.env`）
+
+env 檔（不論檔名）填以下欄位（**README/範本只放格式，不放真實密文**）：
 
 ```
 HMI_USERNAME=hmiUser
-LOGIN_PASSWORD_PAYLOAD=前端 DevTools 抓到的可重放密文
+# --- SM2 即時加密模式（建議）---
+HMI_PASSWORD=<HMI 登入密碼原文>
+SM2_PUBLIC_KEY=<前端 sm-crypto 用的公鑰 hex，128 或 130（04 開頭）>
+# --- 可重放密文 fallback（可留空）---
+LOGIN_PASSWORD_PAYLOAD=
 ```
 
-password 取值優先序（高 → 低）：
+欄位說明：
+- `HMI_USERNAME`（可選）：預設 `hmiUser`。
+- `HMI_PASSWORD` + `SM2_PUBLIC_KEY`：走 **SM2 即時加密**。
+- `LOGIN_PASSWORD_PAYLOAD`：**可留空**；填了會優先於 SM2（fallback 舊模式）。
 
-1. 環境變數 / `.env` 的 `LOGIN_PASSWORD_PAYLOAD`
-2. `login_config.json` 的 `password_payload`
+**password 取值優先順序（高 → 低）**：
+1. `LOGIN_PASSWORD_PAYLOAD`（env / `login_config.json`）→ 直接送密文
+2. `HMI_PASSWORD` + `SM2_PUBLIC_KEY` → `sm2_util.sm2_encrypt()` 即時 SM2 加密
 3. `client.login(USERNAME, PASSWORD)` 傳入值（相容 / 測試用）
 
-### 目前已確認
+> 要用 SM2 模式，就把 `LOGIN_PASSWORD_PAYLOAD` 留空、填好 `HMI_PASSWORD` 與 `SM2_PUBLIC_KEY`。
 
-- `password_source = env`
-- HMI login **success**
-- `accessToken` 可成功取得，並自動帶 `Authorization: Bearer <token>`
-- `run_all.py`、`device_control_scraper.py`、`device_control_operator.py` 皆可用這組登入資訊
+### 目前已確認（實測）
+
+- **SM2 即時加密登入成功**：`password_source = sm2`、`HMI login success`（`code=200`）、每次密文不同（len 214、04 前綴）皆通過。
+- `accessToken` 自動帶入 `Authorization: Bearer <token>`。
+- `run_all.py`（device）、`device_control_scraper.py`、`device_control_operator.py` 皆走**同一套** `api_client` 登入，讀 `test/login.env`。
+- 舊 `LOGIN_PASSWORD_PAYLOAD` 模式仍保留為 fallback（實測亦可登入）。
+
+### 實際執行 / 驗證範例
+
+```
+cd D:\Crawler Sample\test
+
+# 雙模式登入驗證（S1~S3 離線；--with-login 走真實 SM2 登入）
+python test_sm2_login.py --with-login
+
+# 只讀查詢（會登入 → 抓設備控制唯讀狀態）
+python device_control_scraper.py
+
+# 控制（dry-run 預覽，不送出）
+python device_control_operator.py --action pcs_manual_off
+
+# 整批唯讀
+python run_all.py --only device
+```
 
 ### 安全注意
 
-- ⚠️ **`.env` 不可提交到版控**（已列入 `test/.gitignore`）。
-- ⚠️ **`.env.example` 只能保留範例格式，不可放真實密文**。
+- ⚠️ **`.env` 與任意 `*.env` 不可提交到版控**：`test/.gitignore` 與根目錄 `.gitignore` 皆已加入 `.env`、`*.env`、`login_config.json` 規則（涵蓋 `login.env` / `1.env` / `abc.env` 等）。
+- ⚠️ **`.env.example` 只能保留範例格式，不可放真實密文**（`.env.example` 不被 `*.env` 規則誤擋，可正常提交）。
 - token 與 `LOGIN_PASSWORD_PAYLOAD` 只以**遮罩**顯示（前 5 + … + 後 5 / 長度），不完整輸出。
 
 ---
@@ -294,6 +345,32 @@ python run_all.py --only device
 - 但目前帳號對 `/client/dynamic/dataOrControl/air` **沒有操作權限**。
 - 因此目前只能確認「控制 API 已送成功」，**無法靠現有 verify API 確認空調實際狀態**。
 - 空調**不可**視為「完全可驗證」。
+
+### 3. 控制指令總表（script / 參數 / 驗證狀態）
+
+所有控制都可用 **命令列**（`device_control_operator.py`，預設 dry-run，加 `--execute` 才送出）或 **選單**（`device_control_menu.py`）。下表為命令列參數：
+
+| 功能 | 命令列參數（前綴 `python device_control_operator.py`） | endpoint | 驗證狀態 |
+|---|---|---|---|
+| PCS 手動模式開 | `--action pcs_manual_on --execute` | PUT `editManualSwitch` | ✅ **已驗證成功**（verify 確認 `manualModeSwitch=1`） |
+| PCS 手動模式關 | `--action pcs_manual_off --execute` | PUT `editManualSwitch` | ✅ **已驗證成功**（`manualModeSwitch=0`） |
+| PCS 充電（啟動充電） | `--action pcs_charge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出**；verify 只讀 403→partial |
+| PCS 放電（啟動放電） | `--action pcs_discharge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 同上（`activePowerSetPoint = -N`） |
+| PCS 停止充放電（停機） | `--action pcs_stop_power --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出** |
+| 電池上電 | `--action battery_power_on --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 已實作；**高風險、未實測**；輪詢 `getBcuState` 最多 60s |
+| 電池下電 | `--action battery_power_off --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 同上 |
+| 進排風開 | `--action vent_on --execute` | POST `switchingQuantityControl` | ⚠️ 已實作、dry-run 通過；**未實測**；無 verify API（partial） |
+| 進排風關 | `--action vent_off --execute` | POST `switchingQuantityControl` | ⚠️ 同上 |
+| 冷卻循環開 | `--action cooling_on --execute` | POST `waterPumpControl/1` | ⚠️ 已實作、dry-run 通過；**未實測**；無 verify API（partial） |
+| 冷卻循環關 | `--action cooling_off --execute` | POST `waterPumpControl/0` | ⚠️ 同上 |
+| 空調開 | `--action ac_on --execute` | POST `airConditioningControl` | ⚠️ 控制曾回 `200`，但 verify（`/dataOrControl/air`）**403**，無法確認實際狀態 |
+| 空調關 | `--action ac_off --execute` | POST `airConditioningControl` | ⚠️ 同上 |
+
+**power 規則**：`pcs_charge` / `pcs_discharge` 必填 `--power N`（0~150）；充電 `+N`、放電 `-N`；`pcs_stop_power` 不需 `--power`。
+
+**只讀查詢狀態（`device_control_scraper.py`）**：多數端點可讀；**`空調狀態` 與 `PCS狀態`（authed `/client/dynamic/dataOrControl/air`、`/pcs`）回 `403 No operation permission`**（帳號無操作權限，UI 實際改讀 guest 端點）；登入前呼叫則會是 `401`。
+
+> ✅ = 已實際送出並由 verify 確認；⚠️ = 程式已就緒、dry-run 驗證通過，但**尚未實際 `--execute` 送出**（送出前請確認現場安全）。
 
 ---
 
