@@ -245,6 +245,8 @@ python battery_data_scraper.py
 
 翻譯規則：欄位中文化；狀態值透過 `dashboard_scraper.STATUS_MAP` 翻譯；數值自動帶單位。
 
+> 串口 ttyS0 的 14 個數位點（紅燈/黃燈/綠燈/水泵運轉/液位高/液位低/緊急按鈕/門禁/火警/消防故障/突波保護SPD/空調故障/排風/蜂鳴器）**刻意保留原始 `0/1`**：HMI 本身即以 0/1 呈現，CSV 與 UI 一致，不再轉中文（非遺漏）。
+
 ```
 cd D:\Crawler Sample\test
 python env_data_scraper.py
