@@ -76,12 +76,14 @@ def main():
         {"PCS控制模式": "手動模式", "PCS排程開關狀態": "關",
          "PCS工作模式": "併網", "PCS功率控制模式": "直流恆功率"}))
 
-    # 4) 電網模式=離網（唯讀狀態；systemOffGridStatus=true）
+    # 4) 離網 + 離網交流電壓（唯讀狀態；systemOffGridStatus=true）
+    #    離網時功率控制模式應顯示「離網交流電壓」，不可誤顯示併網的交流有功/直流恆流/直流恆功率
     results.append(run_case(
-        "4. 電網模式=離網（唯讀狀態顯示）",
+        "4. 離網 + 離網交流電壓（即使 energyDispatchingMode=ac/dc 也不顯示併網模式）",
         "智慧模式", {"schedulePlanSwitch": 0},
-        {"systemOffGridStatus": "type.attr.desc.true", "energyDispatchingMode": "type.attr.desc.ac"},
-        {"PCS控制模式": "智慧模式", "PCS工作模式": "離網", "PCS功率控制模式": "交流有功"}))
+        {"systemOffGridStatus": "type.attr.desc.true",
+         "energyDispatchingMode": "type.attr.desc.dc", "dcControlMode": "type.attr.desc.fixedPower"},
+        {"PCS控制模式": "智慧模式", "PCS工作模式": "離網", "PCS功率控制模式": "離網交流電壓"}))
 
     # 5) 欄位缺失 → 功率控制模式=未知；電網模式=未知（不猜、不套預設值）
     results.append(run_case(
@@ -105,6 +107,10 @@ def main():
         ({"energyDispatchingMode": "type.attr.desc.ac"}, "交流有功"),
         ({"energyDispatchingMode": "type.attr.desc.dc", "dcControlMode": "type.attr.desc.constantCurrent"}, "直流恆流"),
         ({"energyDispatchingMode": "type.attr.desc.dc", "dcControlMode": "type.attr.desc.fixedPower"}, "直流恆功率"),
+        # 離網：不論 energyDispatchingMode/dcControlMode 為何，一律顯示「離網交流電壓」
+        ({"systemOffGridStatus": "type.attr.desc.true", "energyDispatchingMode": "type.attr.desc.dc",
+          "dcControlMode": "type.attr.desc.fixedPower"}, "離網交流電壓"),
+        ({"systemGridTiedStatus": "type.attr.desc.offGrid", "energyDispatchingMode": "type.attr.desc.ac"}, "離網交流電壓"),
         ({"energyDispatchingMode": "type.attr.desc.dc"}, "未知"),
         ({}, "未知"),
     ]

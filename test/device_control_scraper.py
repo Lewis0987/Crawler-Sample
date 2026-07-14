@@ -200,18 +200,23 @@ def _pcs_raw(pcs_data):
 
 def parse_pcs_power_control_mode(raw):
     """
-    PCS 工作模式 / 功率控制模式（共用解析）— 依 API「當下實際欄位」判斷，**不套任何預設值**：
-      交流有功 / 直流恆流 / 直流恆功率 / 未知
+    PCS 功率控制模式（共用解析）— 依 API「當下實際欄位」判斷，**不套任何預設值**：
+      交流有功 / 直流恆流 / 直流恆功率 / 離網交流電壓 / 未知
 
     來源欄位（guest PCS `/hmiGuest/unauthorizedAccess/envCon/pcs` 實際回傳的 mark）：
-      - energyDispatchingMode：type.attr.desc.ac → 交流；type.attr.desc.dc → 直流
-      - dcControlMode（僅直流時看）：含 current → 直流恆流；含 power/watt → 直流恆功率
+      - **離網**（systemOffGridStatus=true / systemGridTiedStatus=offGrid，見 parse_pcs_grid_mode）
+        → 「離網交流電壓」（離網時 PCS 為交流電壓源，非併網的有功/直流控制）
+      - 併網時：
+        - energyDispatchingMode：type.attr.desc.ac → 交流有功；type.attr.desc.dc → 直流
+        - dcControlMode（僅直流時看）：含 current → 直流恆流；含 power/watt → 直流恆功率
     欄位查不到或無法判斷 → 「未知」（不猜、不套預設）。
 
-    註：目前實測值 energyDispatchingMode=type.attr.desc.ac、dcControlMode=type.attr.desc.fixedPower。
-    直流恆流的實際 enum 尚未於實機觀察到，故以子字串（current/power）判斷，判不到即回「未知」。
+    註：僅補「狀態顯示」，不含任何離網控制；離網判斷取自 API 電網狀態欄位（非文字推論）。
     """
     raw = raw or {}
+    # 離網：功率控制模式為「離網交流電壓」（依 API 電網狀態，避免誤顯示併網的直流恆流/恆功率）
+    if parse_pcs_grid_mode(raw) == "off_grid":
+        return "離網交流電壓"
     disp = str(raw.get("energyDispatchingMode", "")).lower()
     if disp.endswith("ac"):
         return "交流有功"
@@ -289,7 +294,7 @@ def parse_pcs_modes(runmode, schedule, pcs_raw=None):
       - control_mode      : smart / manual / unknown         ← getRunMode（不可用排程/電網反推）
       - schedule_enabled  : True / False / None              ← getScheduleSwitch.schedulePlanSwitch（1/0）
       - grid_mode         : grid_connected / off_grid / unknown  ← guest PCS 執行狀態（唯讀狀態顯示）
-      - power_control_mode: 交流有功 / 直流恆流 / 直流恆功率 / 未知
+      - power_control_mode: 交流有功 / 直流恆流 / 直流恆功率 / 離網交流電壓 / 未知
             ← parse_pcs_power_control_mode()：依 API 當下實際欄位，**不套預設值**（判不到→未知）
     schedulePlanSwitch=0 仍可能為智慧模式；各項不互相覆蓋、不互相推導。
     """
@@ -349,7 +354,7 @@ def parse_pcs(pcs_data, schedule, runmode):
     out["PCS排程開關狀態"] = _SCHEDULE_DISPLAY[modes["schedule_enabled"]]        # 開/關 ← schedulePlanSwitch
     # 顯示 label 用「PCS工作模式」；底層機器語意仍為 grid_mode（systemGridTiedStatus/systemOffGridStatus）
     out["PCS工作模式"] = _GRID_MODE_DISPLAY[modes["grid_mode"]]                 # 併網/離網/未知（唯讀狀態，label=工作模式）
-    out["PCS功率控制模式"] = modes["power_control_mode"]                         # 交流有功/直流恆流/直流恆功率/未知（依 API 實際）
+    out["PCS功率控制模式"] = modes["power_control_mode"]                         # 交流有功/直流恆流/直流恆功率/離網交流電壓/未知（依 API 實際）
 
     # 手動模式開關 ← getScheduleSwitch.manualModeSwitch（保留，供控制驗證用）
     if isinstance(schedule, dict) and "manualModeSwitch" in schedule:

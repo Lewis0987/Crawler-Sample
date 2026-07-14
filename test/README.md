@@ -293,7 +293,7 @@ python device_control_scraper.py
   - **PCS控制模式**（智慧模式 / 手動模式 / 未知）：**唯一來源＝`getRunMode`**（`auto/schedule/smart/intelligent`→智慧；`manual`→手動）。**不可用排程開關反推模式**。
   - **PCS排程開關狀態**（開 / 關）：來源 `getScheduleSwitch.schedulePlanSwitch`（1/0）；即使 `=0`，控制模式仍可能是智慧模式。
   - **PCS工作模式**（併網 / 離網 / 未知）：**唯讀狀態顯示**（顯示 label＝「PCS工作模式」；底層機器語意仍為 `grid_mode`，解析 `parse_pcs_grid_mode`），來源 guest PCS `systemGridTiedStatus`（gridTied→併網）/ `systemOffGridStatus`（true→離網）。**永遠顯示**、不因值為「併網」而隱藏；與已移除的離網「控制」無關。（僅顯示文字改名，API 欄位/變數/parse 邏輯不變。）
-  - **PCS功率控制模式**（交流有功 / 直流恆流 / 直流恆功率 / 未知）：共用 `parse_pcs_power_control_mode(raw)`，**依 API 當下實際欄位判斷、不套任何預設值**。來源 `energyDispatchingMode`（ac→交流有功；dc 再看 `dcControlMode`：current→直流恆流、power→直流恆功率）；查不到→「未知」。
+  - **PCS功率控制模式**（交流有功 / 直流恆流 / 直流恆功率 / **離網交流電壓** / 未知）：共用 `parse_pcs_power_control_mode(raw)`，**依 API 當下實際欄位判斷、不套任何預設值**。**離網時**（`systemOffGridStatus=true` / `systemGridTiedStatus=offGrid`）→「離網交流電壓」（離網為交流電壓源，不顯示併網的直流恆流/恆功率）。**併網時**：`energyDispatchingMode`（ac→交流有功；dc 再看 `dcControlMode`：current→直流恆流、power→直流恆功率）；查不到→「未知」。（僅補離網「狀態顯示」，**不含任何離網控制**。）
   - JSON 另存機器語意 `status_summary.PCS._pcs_modes = {control_mode, schedule_enabled, grid_mode, power_control_mode}`。
   - 儀表板 PCS 顯示 **當前狀態 / 控制模式 / 排程開關狀態 / 工作模式 / 功率控制模式**（5 個固定唯讀欄位，永遠顯示）。
   - 驗證：`python test_pcs_modes.py`（模式解析）、`python test_pcs_control.py`（3 模式 payload/驗證），全 PASS。
@@ -570,7 +570,7 @@ python device_control_menu.py
 - **PCS 停機（`[READY]`）**：可實際送出（安全停止）。
 
 選單附加行為：
-- **狀態儀表板**：進選單 / 查詢時彩色顯示各區塊狀態；PCS 顯示 5 個固定唯讀欄位 **當前狀態 / 控制模式 / 排程開關狀態 / 工作模式 / 功率控制模式**（當前狀態=待機/充電/放電/啟動中/停止中/故障/未知，讀 API 實際旗標；工作模式=併網/離網；功率控制模式=交流有功/直流恆流/直流恆功率）、電池顯示**電池上下電狀態**（接觸器反饋）。
+- **狀態儀表板**：進選單 / 查詢時彩色顯示各區塊狀態；PCS 顯示 5 個固定唯讀欄位 **當前狀態 / 控制模式 / 排程開關狀態 / 工作模式 / 功率控制模式**（當前狀態=待機/充電/放電/啟動中/停止中/故障/未知，讀 API 實際旗標；工作模式=併網/離網；功率控制模式=交流有功/直流恆流/直流恆功率/離網交流電壓）、電池顯示**電池上下電狀態**（接觸器反饋）。
 - **前置檢查**：與 operator 相同（PCS 充/放電需電池已上電、電池下電需待機、停止充放電免檢查）；被擋下時顯示 `BLOCKED` 與原因、不送出。
 
 ---
