@@ -33,29 +33,35 @@ READONLY_RESULT = os.path.join(OUTPUT_DIR, "device_control_readonly.json")
 OPERATOR = os.path.join(HERE, "device_control_operator.py")
 SCRAPER = os.path.join(HERE, "device_control_scraper.py")
 
+# 查詢目前設備狀態
+QUERY_CHOICE = "1"
 # 一般控制（直接 --execute）
 MENU_ACTIONS = {
-    "1": ("pcs_manual_on", "PCS 手動模式開"),
-    "2": ("pcs_manual_off", "PCS 手動模式關"),
-    "3": ("ac_on", "空調開"),
-    "4": ("ac_off", "空調關"),
-    "11": ("vent_on", "進排風開"),
-    "12": ("vent_off", "進排風關"),
-    "13": ("cooling_on", "冷卻循環開"),
-    "14": ("cooling_off", "冷卻循環關"),
+    "2": ("pcs_manual_on", "PCS 手動模式開"),
+    "3": ("pcs_manual_off", "PCS 手動模式關"),
+    "10": ("ac_on", "空調開"),
+    "11": ("ac_off", "空調關"),
+    "12": ("vent_on", "進排風開"),
+    "13": ("vent_off", "進排風關"),
+    "14": ("cooling_on", "冷卻循環開"),
+    "15": ("cooling_off", "冷卻循環關"),
 }
 # 高風險控制（需 YES 二次確認，並帶 --yes）
 HIGH_RISK_ACTIONS = {
-    "9": ("battery_power_on", "電池上電"),
-    "10": ("battery_power_off", "電池下電"),
+    "8": ("battery_power_on", "電池上電"),
+    "9": ("battery_power_off", "電池下電"),
 }
-# PCS 功率控制（6=放電 / 7=充電，皆需功率；8 不需）
-# ⚠️ 本站實測：activePowerSetPoint 正=放電、負=充電；operator 已對齊 action 名稱＝實際行為。
-PCS_POWER_ACTIONS = {
-    "6": ("pcs_discharge", "PCS 放電", True),
-    "7": ("pcs_charge", "PCS 充電", True),
-    "8": ("pcs_stop_power", "PCS 停止充放電", False),
+# PCS 功率控制：3 種模式（4/5/6），選後進入第二層（充/放電）。
+# 三種模式 payload/enum/方向皆經 DevTools 確認、可實送。
+PCS_MODE_MENU = {
+    "4": {"label": "交流有功", "param": "有功功率", "unit": "kW", "lo": 0, "hi": 150,
+          "charge": "pcs_charge", "discharge": "pcs_discharge", "confirmed": True},
+    "5": {"label": "直流恆流", "param": "直流電流", "unit": "A", "lo": 0, "hi": 150,
+          "charge": "pcs_dc_current_charge", "discharge": "pcs_dc_current_discharge", "confirmed": True},
+    "6": {"label": "直流恆功率", "param": "直流功率", "unit": "kW", "lo": 0, "hi": 150,
+          "charge": "pcs_dc_power_charge", "discharge": "pcs_dc_power_discharge", "confirmed": True},
 }
+PCS_STOP_CHOICE = "7"  # PCS 停止充放電（安全停止，維持可執行）
 
 # ---- 控制後等待驗證（設備約 0~60 秒才完成切換）----
 VERIFY_TIMEOUT = 60      # 最大等待秒數
@@ -78,20 +84,30 @@ VERIFY_EXPECT = {
 MENU_TEXT = """
 ==============================
 設備控制選單
-1. PCS 手動模式開
-2. PCS 手動模式關
-3. 空調開
-4. 空調關
-5. 查詢目前設備狀態
-6. PCS 放電
-7. PCS 充電
-8. PCS 停止充放電
-9. 電池上電
-10. 電池下電
-11. 進排風開
-12. 進排風關
-13. 冷卻循環開
-14. 冷卻循環關
+==============================
+
+1. 查詢目前設備狀態
+
+2. PCS 手動模式開
+3. PCS 手動模式關
+
+4. PCS 交流有功控制（充/放電）
+5. PCS 直流恆流控制（充/放電）
+6. PCS 直流恆功率控制（充/放電）
+7. PCS 停止充放電
+
+8. 電池上電
+9. 電池下電
+
+10. 空調開
+11. 空調關
+
+12. 進排風開
+13. 進排風關
+
+14. 冷卻循環開
+15. 冷卻循環關
+
 0. 離開
 ==============================
 """
@@ -136,7 +152,7 @@ def colorize(v):
 
 # 各區塊「控制選單」參考清單（僅顯示、不自動執行）
 _CONTROL_MENUS = {
-    "PCS": ["PCS充電", "PCS放電", "PCS停機", "設定有功功率", "切換離網模式"],
+    "PCS": ["交流有功控制", "直流恆流控制", "直流恆功率控制", "PCS停機"],
     "電池": ["電池上電", "電池下電"],
     "進排風": ["開啟進排風", "關閉進排風"],
     "空調": ["開啟空調", "關閉空調", "設定空調模式", "設定溫度"],
@@ -144,6 +160,8 @@ _CONTROL_MENUS = {
 }
 # 區塊顯示順序（依需求：PCS→電池→進排風→空調→冷卻循環）
 _DASHBOARD_ORDER = ("PCS", "電池", "進排風", "空調", "冷卻循環")
+# 區塊之間的分隔線（取代原本的空白行）
+_BLOCK_SEP = "─" * 24
 # 電池區塊反饋欄位（總覽不重複顯示，仍保留在 scraper console / JSON）
 _FEEDBACK_LABELS = {"主正反饋", "主正", "主負反饋", "主負", "環流"}
 
@@ -188,21 +206,94 @@ def _fmt_value(v):
     return str(v)
 
 
-def _prompt_power():
-    """PCS 充/放電功率輸入（0~150）；回傳 float 或 None（取消）。"""
+def _prompt_value(param, unit, lo, hi):
+    """通用參數輸入（數字 + 範圍驗證）；回傳 float 或 None（取消/不合法）。"""
     try:
-        raw = input("請輸入功率 kW（0~150）：").strip()
+        raw = input(f"請輸入{param}（{lo}~{hi} {unit}）：").strip()
     except (EOFError, KeyboardInterrupt):
         return None
     try:
-        p = float(raw)
+        v = float(raw)
     except ValueError:
-        print("功率格式錯誤，取消。")
+        print(f"{param}格式錯誤（需數字），取消。")
         return None
-    if not (0 <= p <= 150):
-        print("功率超出 0~150，取消。")
+    if not (lo <= v <= hi):
+        print(f"{param}超出允許範圍 {lo}~{hi} {unit}，取消。")
         return None
-    return p
+    return v
+
+
+def _pcs_mode_submenu(cfg):
+    """
+    PCS 控制第二層：選充/放電 → 輸入參數 → 二次 YES 確認。
+    依 confirmed 分流：
+      - confirmed=True（交流有功）：【正式控制模式】，YES 後呼叫 operator --execute 實送並 verify。
+      - confirmed=False（安全網）：僅 dry-run（不帶 --execute，不送控制 API）。
+    """
+    label, param, unit = cfg["label"], cfg["param"], cfg["unit"]
+    confirmed = bool(cfg.get("confirmed"))
+    print(f"\n【{label}控制】")
+    if not confirmed:
+        # 安全網：若某模式未確認（confirmed=False），仍只 dry-run，不送控制 API。
+        print("此模式尚未確認 payload，僅產生 dry-run，不會送出控制 API。")
+    print("方向：")
+    print("1. 充電")
+    print("2. 放電")
+    print("0. 返回")
+    try:
+        d = input("請選擇方向：").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if d not in ("1", "2"):
+        print("已返回。")
+        return
+    direction = "charge" if d == "1" else "discharge"
+    dir_label = "充電" if d == "1" else "放電"
+    action = cfg[direction]
+
+    v = _prompt_value(param, unit, cfg["lo"], cfg["hi"])
+    if v is None:
+        return
+    v_str = str(int(v) if float(v).is_integer() else v)
+
+    # 執行摘要
+    print("\n即將執行：")
+    print(f"控制類型：{label}")
+    print(f"方向：{dir_label}")
+    print(f"設定值：{v_str} {unit}")
+
+    if confirmed:
+        # 正式實送
+        print("\n【正式控制模式】")
+        print("此操作將實際送出 PCS 控制命令。")
+        try:
+            ans = input("確認執行？請輸入完整大寫 YES：").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("未取得確認，取消。")
+            return
+        if ans != "YES":
+            print("未輸入完整大寫 YES，已取消，未送出。")
+            return
+        rc = _run_script([OPERATOR, "--action", action, "--power", v_str, "--execute"],
+                         f"{label}{dir_label}（{action}）execute")
+        show_action_result()
+        wait_and_verify(action)      # 送出後回讀驗證
+    else:
+        # 未確認模式（安全網）→ 僅 dry-run
+        print("\n此模式未確認 payload，僅產生 dry-run 預覽（不會送出控制 API）。")
+        try:
+            ans = input("是否產生 dry-run 預覽？請輸入完整大寫 YES：").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("未取得確認，取消。")
+            return
+        if ans != "YES":
+            print("已取消。")
+            return
+        rc = _run_script([OPERATOR, "--action", action, "--power", v_str],
+                         f"{label}{dir_label}（{action}）dry-run")
+        show_action_result()
+    if rc != 0:
+        print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
 
 
 def show_action_result():
@@ -244,26 +335,6 @@ def show_action_result():
         print(f"  verify_attempts = {len(verify['verify_attempts'])}")
     for w in (data.get("warnings") or []):
         print(f"  [warn] {w}")
-
-
-def show_readonly_summary():
-    data = _load_json(READONLY_RESULT)
-    if data is None:
-        print("尚未產生結果檔（device_control_readonly.json 不存在或無法讀取）")
-        return
-    ss = data.get("status_summary") or {}
-    print("\n---------- 目前設備狀態（可讀來源）----------")
-    print(f"logged_in = {data.get('logged_in')}")
-    # 只顯示 5 區塊；【其他】(DO/DI 原始) 與 verify 403 只留在 JSON，不印
-    for section in ("PCS", "電池", "空調", "進排風", "冷卻循環"):
-        fields = ss.get(section)
-        if not isinstance(fields, dict):
-            continue
-        print(f"[{section}]")
-        for label, value in fields.items():
-            if label.startswith("_"):
-                continue
-            print(f"  {label}：{value}")
 
 
 def refresh_status_silent():
@@ -346,27 +417,24 @@ def handle_choice(choice):
             print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
         return True
 
-    # PCS 功率控制（6 充電 / 7 放電 需功率；8 停止不需）
-    if choice in PCS_POWER_ACTIONS:
-        action, label, needs_power = PCS_POWER_ACTIONS[choice]
-        args = [OPERATOR, "--action", action, "--execute"]
-        if needs_power:
-            p = _prompt_power()
-            if p is None:
-                print("已取消。")
-                return True
-            args += ["--power", str(p)]
-        rc = _run_script(args, f"{label}（{action}）")
+    # PCS 功率控制（6 交流有功 / 7 直流恆流 / 8 直流恆功率）→ 進入第二層
+    if choice in PCS_MODE_MENU:
+        _pcs_mode_submenu(PCS_MODE_MENU[choice])
+        return True
+
+    # PCS 停止充放電（安全停止；維持可執行）
+    if choice == PCS_STOP_CHOICE:
+        rc = _run_script([OPERATOR, "--action", "pcs_stop_power", "--execute"], "PCS 停止充放電")
         show_action_result()
-        wait_and_verify(action)
         if rc != 0:
             print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
         return True
 
-    # 查詢
-    if choice == "5":
+    # 查詢：scraper 本身已印一份完整設備狀態（含 JSON 寫入行），不再重複列印。
+    if choice == QUERY_CHOICE:
         rc = _run_script([SCRAPER], "查詢目前設備狀態（唯讀）")
-        show_readonly_summary()
+        if rc != 0:
+            print("（注意：查詢腳本回傳非 0，請檢視上方訊息）")
         return True
 
     print("無效選項，請重新輸入。")
@@ -398,10 +466,11 @@ def _core_switch_fields(block, fields):
     """只取各區塊「當前開關狀態」核心欄位，其餘詳細狀態不顯示。"""
     out = {}
     if block == "PCS":
-        if "PCS控制模式" in fields:
-            out["PCS控制模式"] = fields["PCS控制模式"]
-        if "排程開關狀態" in fields:                       # 僅智慧模式時 scraper 才會有此欄位
-            out["PCS排程開關狀態"] = fields["排程開關狀態"]
+        # PCS 五個固定狀態欄位（皆唯讀，永遠顯示，不因控制功能增減而移除）：
+        # 當前狀態（API 實際運轉狀態）/ 控制模式 / 排程開關狀態 / 工作模式 / 功率控制模式。
+        for key in ("PCS當前狀態", "PCS控制模式", "PCS排程開關狀態", "PCS工作模式", "PCS功率控制模式"):
+            if key in fields:
+                out[key] = fields[key]
     elif block == "電池":
         # 依「最終格式」規範：儀表板電池區塊只顯示核心開關「電池上下電狀態」。
         # （放電/充電/待機的「當前狀態」不在儀表板顯示，但仍用於 operator 的電池下電前置檢查。）
@@ -419,18 +488,21 @@ def _core_switch_fields(block, fields):
 
 
 def render_dashboard(status):
-    """依區塊顯示：僅「當前開關狀態」（含顏色）+ 控制選單參考（僅顯示，不執行）。"""
-    for block in _DASHBOARD_ORDER:
+    """依區塊顯示：僅「當前開關狀態」（含顏色）+ 控制選單參考（僅顯示，不執行）。
+    區塊之間以分隔線區隔（取代原本的空白行）。"""
+    for i, block in enumerate(_DASHBOARD_ORDER):
         simp = _core_switch_fields(block, status.get(block) or {})
+        if i > 0:                       # 區塊之間插入分隔線（第一個區塊前不加）
+            print(f"\n{_BLOCK_SEP}")
         print(f"\n【{block}】狀態：")
         if simp:
             for label, value in simp.items():
                 print(f"{label}：{colorize(value)}")
         else:
             print("  （暫無資料）")
-        print("\n控制選單：")
-        for i, item in enumerate(_CONTROL_MENUS.get(block, []), 1):
-            print(f"{i}. {item}")
+        print("控制選單：")
+        for j, item in enumerate(_CONTROL_MENUS.get(block, []), 1):
+            print(f"{j}. {item}")
 
 
 def _exec_menu():

@@ -58,6 +58,8 @@ BASE_URL = http://192.168.128.110:8080/admin-api
 | `run_all.py` | 唯讀總入口，依序執行 6 支 scraper 並彙總 | （呼叫各 scraper） |
 | `inspect_sm2_key.py` | 唯讀：分析 `SM2_PUBLIC_KEY` 格式（128/130/ASN.1/密文誤填），遮罩中段 | 否 |
 | `test_sm2_login.py` | SM2 登入驗證（S1~S3 離線 + `--with-login` 真實登入；印長度診斷不印完整值） | 否 |
+| `test_pcs_modes.py` | PCS 模式解析驗證（離線：控制模式/排程獨立解析＋工作模式） | 否 |
+| `test_pcs_control.py` | PCS 3 模式 payload 組裝／方向／範圍驗證（離線，不送控制） | 否 |
 | `test_env_discovery.py` | **[diagnostic]** env 動態搜尋/排序驗證（run_all 不依賴） | 否 |
 | `inspect_device_status.py` / `inspect_device.py` | **[diagnostic]** dump 設備端點原始結構 / 摘要唯讀結果（run_all 不依賴） | 否 |
 | `login_probe.py` | **[deprecated/diagnostic]** 密文重放登入測試（正式流程已改 SM2；run_all 不依賴） | 否 |
@@ -286,7 +288,15 @@ python device_control_scraper.py
 
 **狀態顯示規則**：
 - 「目前狀態」取自 **guest / envCon / overview 可讀來源**；authed `/dataOrControl/air`、`/pcs`（403）僅作控制驗證、獨立顯示，不覆蓋狀態。
-- **排程開關狀態：僅當 `PCS控制模式 = 智慧模式` 時才顯示**（依 API `getRunMode` 判斷：`schedule / auto / smart / intelligent` → 智慧模式；`manual` → 手動、不顯示排程開關）。這是因為排程開關只在智慧模式下有意義。
+- **PCS 五個固定狀態欄位（皆唯讀、永遠顯示，不因控制功能增減而移除）**：`PCS當前狀態 / PCS控制模式 / PCS排程開關狀態 / PCS工作模式 / PCS功率控制模式`，各自獨立、互不推導。
+  - **PCS當前狀態**（待機 / 充電 / 放電 / 啟動中 / 停止中 / 故障 / 未知）：**直接對照 HMI/API 的狀態欄位值**（`parse_pcs_current_status`），對齊 HMI「當前狀態」。來源 guest PCS `system*Status` 欄位的**實際值**（值本身即描述字，非 true/false）：`systemChargingStatus=charging→充電`、`systemDischargingStatus=discharging→放電`、`systemStandbyStatus=standby→待機`、`systemBootingStatus=booting→啟動中`、`systemFaultStatus`/`systemFailedStatus` 非 normal→故障、`systemOnOrOffStatus=stopping→停止中`、`systemOnOrOffStatus=stop/running（且無充放/故障/啟動）→待機`（對照 HMI：停機/在網待命皆顯示待機）。優先序 故障>充電>放電>啟動中>停止中>待機；皆無→未知。**不由 控制模式/功率/電流/電壓/排程/手動 推論**（例如「工作模式=併網、功率控制模式=交流有功」不代表正在充電）。若 API 無此欄位 → **未知**。
+  - **PCS控制模式**（智慧模式 / 手動模式 / 未知）：**唯一來源＝`getRunMode`**（`auto/schedule/smart/intelligent`→智慧；`manual`→手動）。**不可用排程開關反推模式**。
+  - **PCS排程開關狀態**（開 / 關）：來源 `getScheduleSwitch.schedulePlanSwitch`（1/0）；即使 `=0`，控制模式仍可能是智慧模式。
+  - **PCS工作模式**（併網 / 離網 / 未知）：**唯讀狀態顯示**（顯示 label＝「PCS工作模式」；底層機器語意仍為 `grid_mode`，解析 `parse_pcs_grid_mode`），來源 guest PCS `systemGridTiedStatus`（gridTied→併網）/ `systemOffGridStatus`（true→離網）。**永遠顯示**、不因值為「併網」而隱藏；與已移除的離網「控制」無關。（僅顯示文字改名，API 欄位/變數/parse 邏輯不變。）
+  - **PCS功率控制模式**（交流有功 / 直流恆流 / 直流恆功率 / 未知）：共用 `parse_pcs_power_control_mode(raw)`，**依 API 當下實際欄位判斷、不套任何預設值**。來源 `energyDispatchingMode`（ac→交流有功；dc 再看 `dcControlMode`：current→直流恆流、power→直流恆功率）；查不到→「未知」。
+  - JSON 另存機器語意 `status_summary.PCS._pcs_modes = {control_mode, schedule_enabled, grid_mode, power_control_mode}`。
+  - 儀表板 PCS 顯示 **當前狀態 / 控制模式 / 排程開關狀態 / 工作模式 / 功率控制模式**（5 個固定唯讀欄位，永遠顯示）。
+  - 驗證：`python test_pcs_modes.py`（模式解析）、`python test_pcs_control.py`（3 模式 payload/驗證），全 PASS。
 
 ---
 
@@ -382,11 +392,24 @@ python run_all.py --only threshold
   - 進排風：`vent_on` / `vent_off`
   - 冷卻循環：`cooling_on` / `cooling_off`
   - 電池上下電（高風險，需 `--yes` 二次確認）：`battery_power_on` / `battery_power_off`
-  - PCS 功率控制：`pcs_charge --power N` / `pcs_discharge --power N` / `pcs_stop_power`
-- 參數：`--execute`（真正送出）、`--power N`（0~150，`pcs_charge`/`pcs_discharge` 必填）、`--yes`（高風險略過互動確認）。
-- 控制後回讀狀態做 verify；**不重試、不批量**；不含離網 / 故障復位 / sys 手動上下電。
+  - PCS 功率控制（3 種模式 × 充/放電，皆需 `--power N`）：
+    - 交流有功（**已確認**）：`pcs_charge` / `pcs_discharge`（單位 kW）
+    - 直流恆流（**[READY]，DevTools 已確認**）：`pcs_dc_current_charge` / `pcs_dc_current_discharge`（單位 A）
+    - 直流恆功率（**[READY]，DevTools 已確認**）：`pcs_dc_power_charge` / `pcs_dc_power_discharge`（單位 kW）
+    - 停止充放電：`pcs_stop_power`
+- 參數：`--execute`（真正送出）、`--power N`（0~150，充放電必填；直流恆流單位為 A）、`--yes`（高風險略過互動確認）。
+- ✅ **三種模式（交流有功 / 直流恆流 / 直流恆功率）**：payload、enum、方向皆經 DevTools 確認 → **可 `--execute` 實送**（仍受電池已上電前置檢查與完整大寫 YES 二次確認）。三者方向一致：**充=−N、放=+N**。
+- 控制後回讀狀態做 verify；**不重試、不批量**；不含故障復位 / sys 手動上下電等未列出控制。
 - 產出：`D:\Crawler Sample\output\device_control_action_result.json`
   （含 `logged_in / action / dry_run / power / control_request / control_response / verify / control_success / verify_success / success / warnings`）
+
+**PCS manualControl enum 對照（DevTools 實測）** — 共同欄位：`param=1, gridInterconnectionMode=0, offGridAcVoltRegulation=null`
+
+| 模式 | energyDispatchingMode | activePowerControlMode | dcControlMode | 設定值欄位 | 方向 | 狀態 |
+|---|---:|---:|---:|---|---|---|
+| 交流有功 | 0 | 0 | null | `activePowerSetPoint` | 充=−N、放=+N | ✅ READY |
+| 直流恆流 | 1 | null | 0 | `dcCurrentSetPoint` | 充=−N、放=+N | ✅ READY |
+| 直流恆功率 | 1 | null | 1 | `dcPowerSetPoint` | 充=−N、放=+N | ✅ READY |
 
 ### 3) `device_control_menu.py`
 - 互動式**總覽**：依區塊（PCS / 電池 / 進排風 / 空調 / 冷卻循環）顯示**當前開關狀態**（開/上電→藍、關/下電→紅）＋ 各區塊控制選單參考。總覽為顯示用、**不自動執行**。
@@ -437,9 +460,11 @@ python run_all.py --only threshold
 |---|---|---|---|
 | PCS 手動模式開 | `--action pcs_manual_on --execute` | PUT `editManualSwitch` | ✅ **已驗證成功**（verify 確認 `manualModeSwitch=1`） |
 | PCS 手動模式關 | `--action pcs_manual_off --execute` | PUT `editManualSwitch` | ✅ **已驗證成功**（`manualModeSwitch=0`） |
-| PCS 充電（啟動充電） | `--action pcs_charge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出**；`activePowerSetPoint = -N`（本站：負=充電）；**前置檢查：電池須「已上電」** |
-| PCS 放電（啟動放電） | `--action pcs_discharge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 同上（`activePowerSetPoint = +N`，本站：正=放電）；**前置檢查：電池須「已上電」** |
-| PCS 停止充放電（停機） | `--action pcs_stop_power --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出**；**免電池前置檢查** |
+| PCS 交流有功 充電 | `--action pcs_charge --power N --execute` | POST `sinexcel/…/manualControl` | ✅ **[READY] 已開放實送**（confirmed=True）；`activePowerSetPoint = -N`（本站：負=充電）；**前置檢查：電池須「已上電」**；實機送出由使用者手動 `YES` 觸發 |
+| PCS 交流有功 放電 | `--action pcs_discharge --power N --execute` | POST `sinexcel/…/manualControl` | ✅ 同上（`activePowerSetPoint = +N`，本站：正=放電）；**前置檢查：電池須「已上電」** |
+| PCS 直流恆流 充/放電 | `--action pcs_dc_current_charge\|pcs_dc_current_discharge --power N`（單位 A） | POST `sinexcel/…/manualControl` | ✅ **[READY] 已開放實送**（DevTools 確認）；`energyDispatchingMode=1, dcControlMode=0`；充=`dcCurrentSetPoint -N`、放=`+N` |
+| PCS 直流恆功率 充/放電 | `--action pcs_dc_power_charge\|pcs_dc_power_discharge --power N`（單位 kW） | POST `sinexcel/…/manualControl` | ✅ **[READY] 已開放實送**（DevTools 確認）；`energyDispatchingMode=1, dcControlMode=1`；充=`dcPowerSetPoint -N`、放=`+N` |
+| PCS 停止充放電（停機） | `--action pcs_stop_power --execute` | POST `sinexcel/…/manualControl` | ✅ **[READY] 已開放實送**；**免電池前置檢查** |
 | 電池上電 | `--action battery_power_on --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 已實作；**高風險、未實測**；輪詢接觸器反饋最多 60s |
 | 電池下電 | `--action battery_power_off --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 同上；**前置檢查：電池須「待機」**（充/放電中會擋下） |
 | 進排風開 | `--action vent_on --execute` | POST `switchingQuantityControl` | ⚠️ 已實作、dry-run 通過；**未實測**；無 verify API（partial） |
@@ -483,9 +508,17 @@ python device_control_operator.py --action cooling_off --execute
 python device_control_operator.py --action battery_power_on --execute
 python device_control_operator.py --action battery_power_off --execute
 
-# PCS 功率控制（充/放電需 --power 0~150；停止不需）
+# PCS 功率控制（充/放電需 --power；停止不需）
+# 交流有功（已確認，可 --execute）：
 python device_control_operator.py --action pcs_charge --power 20 --execute
 python device_control_operator.py --action pcs_discharge --power 20 --execute
+# 直流恆流（[READY]，可實送；充=負 A、放=正 A）：
+python device_control_operator.py --action pcs_dc_current_charge --power 4 --execute
+python device_control_operator.py --action pcs_dc_current_discharge --power 5 --execute
+# 直流恆功率（[READY]，可實送；充=負 kW、放=正 kW）：
+python device_control_operator.py --action pcs_dc_power_charge --power 5 --execute
+python device_control_operator.py --action pcs_dc_power_discharge --power 6 --execute
+# 停止充放電：
 python device_control_operator.py --action pcs_stop_power --execute
 ```
 
@@ -495,9 +528,11 @@ python device_control_operator.py --action pcs_stop_power --execute
 python device_control_operator.py --action pcs_charge --power 20
 ```
 
-- `pcs_charge`：`activePowerSetPoint = -abs(power)`（充電）；`pcs_discharge`：`= +abs(power)`（放電）。
-- `--power` 超出 0~150 直接拒絕、不送 API；`pcs_charge`/`pcs_discharge` 未帶 `--power` 會報錯。
-- `pcs_charge`/`pcs_discharge` 前需電池**已上電**、`battery_power_off` 前需電池**待機**，否則直接 `blocked`、不送出。
+- **交流有功**：`pcs_charge`→`activePowerSetPoint = -abs(power)`（充電）；`pcs_discharge`→`= +abs(power)`（放電）。
+- **直流恆流**（DevTools 確認）：`energyDispatchingMode=1, dcControlMode=0`；充=`dcCurrentSetPoint -N`、放=`+N`（A）。可 `--execute`。
+- **直流恆功率**（DevTools 確認）：`energyDispatchingMode=1, dcControlMode=1`；充=`dcPowerSetPoint -N`、放=`+N`（kW）。可 `--execute`。
+- `--power` 超出 0~150 直接拒絕、不送 API；所有充放電未帶 `--power` 會報錯。
+- 所有充放電前需電池**已上電**、`battery_power_off` 前需電池**待機**，否則直接 `blocked`、不送出。
 
 ### B. 選單版：`device_control_menu.py`
 
@@ -515,21 +550,27 @@ python device_control_menu.py
 3. 空調開
 4. 空調關
 5. 查詢目前設備狀態
-6. PCS 放電          （提示輸入功率 kW 0~150）
-7. PCS 充電          （提示輸入功率 kW 0~150）
-8. PCS 停止充放電
-9. 電池上電          （高風險，需輸入 YES）
-10. 電池下電         （高風險，需輸入 YES）
-11. 進排風開
-12. 進排風關
-13. 冷卻循環開
-14. 冷卻循環關
+6. PCS 交流有功控制（充/放電）   [READY]  → 第二層：1.充電 2.放電 0.返回 → 輸入 kW（0~150）
+7. PCS 直流恆流控制（充/放電）   [READY]  → 第二層：1.充電 2.放電 0.返回 → 輸入 A（0~150）
+8. PCS 直流恆功率控制（充/放電） [READY]  → 第二層：1.充電 2.放電 0.返回 → 輸入 kW（0~150）
+9. PCS 停止充放電                [READY]
+10. 電池上電          （高風險，需輸入 YES）
+11. 電池下電         （高風險，需輸入 YES）
+12. 進排風開
+13. 進排風關
+14. 冷卻循環開
+15. 冷卻循環關
 0. 離開
 ```
 
+**PCS 功率控制（二層選單）**：選 6/7/8 進入模式 → 選充/放電 → 輸入參數（依單位/範圍驗證）→ 顯示「即將執行（控制類型/方向/設定值）」→ 輸入完整大寫 `YES`。依 `confirmed` 分流：
+- **交流有功（`[READY]`，已確認）**：顯示「【正式控制模式】此操作將實際送出 PCS 控制命令」，`YES` 後**呼叫 operator `--execute` 實際送出並 verify**。
+- **直流恆流（`[READY]`，DevTools 已確認）**：同交流有功，`YES` 後 `--execute` 實送並 verify。
+- **直流恆功率（`[READY]`，DevTools 已確認）**：同上，`YES` 後 `--execute` 實送並 verify（充=−N、放=+N）。
+- **PCS 停機（`[READY]`）**：可實際送出（安全停止）。
+
 選單附加行為：
-- **狀態儀表板**：進選單 / 查詢時彩色顯示各區塊狀態；PCS 顯示控制模式與排程開關（智慧模式才顯示排程）、電池顯示**電池上下電狀態**（接觸器反饋）與**當前狀態**（放電 / 充電 / 待機，依功率方向）。
-- **控制後回讀驗證**：具可靠回讀欄位的 action 送出後最多輪詢 60 秒（每 2 秒）確認狀態；PCS 充/放電/停止因只讀來源無單一可靠欄位 → verify partial、不輪詢。
+- **狀態儀表板**：進選單 / 查詢時彩色顯示各區塊狀態；PCS 顯示 5 個固定唯讀欄位 **當前狀態 / 控制模式 / 排程開關狀態 / 工作模式 / 功率控制模式**（當前狀態=待機/充電/放電/啟動中/停止中/故障/未知，讀 API 實際旗標；工作模式=併網/離網；功率控制模式=交流有功/直流恆流/直流恆功率）、電池顯示**電池上下電狀態**（接觸器反饋）。
 - **前置檢查**：與 operator 相同（PCS 充/放電需電池已上電、電池下電需待機、停止充放電免檢查）；被擋下時顯示 `BLOCKED` 與原因、不送出。
 
 ---
@@ -553,8 +594,8 @@ python device_control_menu.py
 2. `device_control_operator.py` 是**控制版**（單一 action、控制端點白名單 + 禁止字樣雙重把關）。
 3. 未加 `--execute` 時只能 **dry-run**，不真正送控制。
 4. **不重試、不批量**；控制 API 失敗直接輸出失敗結果。
-5. **不做離網模式 / 故障復位 / sys 手動上下電 / 其他未列出的控制**（`_FORBIDDEN_EXACT` + exact-match 白名單雙重把關）。
-6. **PCS 功率控制**（`pcs_charge`/`pcs_discharge`）`--power` 限 0~150，超出直接拒絕、不送 API；本站方向 **充電為負（-N）、放電為正（+N）**；且送出前電池須**已上電**（未上電 → `blocked`）。
+5. **不做故障復位 / sys 手動上下電 / 其他未列出的控制**（`_FORBIDDEN_EXACT` + exact-match 白名單雙重把關）。
+6. **PCS 功率控制**分 3 模式 × 充/放電，`--power` 限 0~150；**三種模式（交流有功／直流恆流／直流恆功率）皆經 DevTools 確認、可 `--execute` 實送**，方向一致（充=−N、放=+N）；送出前電池須**已上電**（未上電 → `blocked`）。
 7. **電池上下電為高風險**：`--execute` 後需輸入 `YES` 二次確認（或帶 `--yes`）；`battery_power_off` 送出前電池須**待機**（充/放電中 → `blocked`）；控制 API 只送一次，對接觸器反饋最多輪詢 60 秒驗證。
 8. `.env` **不可提交版控**；`.env.example` **只放範例格式，不可放真實密文**。
 9. verify API 若權限不足 / 欄位不足，**不可**直接視為控制失敗，需區分：
@@ -673,8 +714,14 @@ python device_control_operator.py --action battery_power_off --execute
 
 PCS 功率控制（充/放電需 --power 0~150）：
 ```
+# 交流有功、直流恆流（DevTools 已確認，可實送）
 python device_control_operator.py --action pcs_charge --power 20 --execute
 python device_control_operator.py --action pcs_discharge --power 20 --execute
+python device_control_operator.py --action pcs_dc_current_charge --power 4 --execute
+python device_control_operator.py --action pcs_dc_current_discharge --power 5 --execute
+# 直流恆功率（[READY]，可實送；充=負 kW、放=正 kW）
+python device_control_operator.py --action pcs_dc_power_charge --power 5 --execute
+python device_control_operator.py --action pcs_dc_power_discharge --power 6 --execute
 python device_control_operator.py --action pcs_stop_power --execute
 ```
 

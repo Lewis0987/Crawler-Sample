@@ -9,7 +9,7 @@
   2. 預設 dry-run：只印 endpoint / method / payload，不真的送出。
   3. 僅在 --execute 時才真正送出控制 API。
   4. 不重試、不批量。
-  5. 控制端點採 exact-match 白名單；不含離網 / 故障復位 / sys/control 手動上下電。
+  5. 控制端點採 exact-match 白名單；不含故障復位 / sys/control 手動上下電等未列出控制。
   6. token 與 LOGIN_PASSWORD_PAYLOAD 只遮罩，不完整輸出。
   7. --power 僅接受 0~150（超出直接拒絕，不送 API）。
   8. 高風險 action（電池上/下電）--execute 後需二次確認輸入 YES（或帶 --yes）。
@@ -106,33 +106,92 @@ ACTIONS = {
                           "payload": {"command": "2"}, "kind": "battery",
                           "high_risk": True, "poll_expect": False},
 
-    # PCS 功率控制（充/放電需 --power；payload 由 power 動態組出，activePowerSetPoint 帶正負號）
-    "pcs_charge":     {"method": "POST", "endpoint": _PCS_POWER_EP,
-                       "payload": None, "kind": "pcs_power"},
-    "pcs_discharge":  {"method": "POST", "endpoint": _PCS_POWER_EP,
-                       "payload": None, "kind": "pcs_power"},
+    # PCS 功率控制（3 種模式 × 充/放電；payload 由 --power 動態組出）
+    #   交流有功（ac_active）：已確認 — activePowerSetPoint 帶正負（充=負、放=正）。
+    #   直流恆流（dc_current）/ 直流恆功率（dc_power）：欄位名已知，但 enum/方向待 DevTools 確認
+    #     → confirmed=False，僅允許 dry-run（run() 會阻擋實送）。
+    "pcs_charge":     {"method": "POST", "endpoint": _PCS_POWER_EP, "payload": None,
+                       "kind": "pcs_power", "pcs_mode": "ac_active", "direction": "charge"},
+    "pcs_discharge":  {"method": "POST", "endpoint": _PCS_POWER_EP, "payload": None,
+                       "kind": "pcs_power", "pcs_mode": "ac_active", "direction": "discharge"},
+    "pcs_dc_current_charge":    {"method": "POST", "endpoint": _PCS_POWER_EP, "payload": None,
+                                 "kind": "pcs_power", "pcs_mode": "dc_current", "direction": "charge"},
+    "pcs_dc_current_discharge": {"method": "POST", "endpoint": _PCS_POWER_EP, "payload": None,
+                                 "kind": "pcs_power", "pcs_mode": "dc_current", "direction": "discharge"},
+    "pcs_dc_power_charge":      {"method": "POST", "endpoint": _PCS_POWER_EP, "payload": None,
+                                 "kind": "pcs_power", "pcs_mode": "dc_power", "direction": "charge"},
+    "pcs_dc_power_discharge":   {"method": "POST", "endpoint": _PCS_POWER_EP, "payload": None,
+                                 "kind": "pcs_power", "pcs_mode": "dc_power", "direction": "discharge"},
     "pcs_stop_power": {"method": "POST", "endpoint": _PCS_POWER_EP,
                        "payload": {"param": 2}, "kind": "pcs_power"},
 }
 
-# 必填 --power 的 action
-REQUIRES_POWER = {"pcs_charge", "pcs_discharge"}
+# ======================================================================
+# PCS 功率控制模式定義（單一設定來源；payload 由 _build_pcs_payload() 依此表組出）
+# ======================================================================
+# 每個模式 6 個關鍵欄位 + confirmed 旗標。confirmed=True 才可 --execute；
+# confirmed=False 一律 [HOLD]（只 dry-run），對齊「未確認 payload 不送控制」。
+#
+# 【拿到 DevTools Request Payload 後，只需在此表填值即可完成實際控制】：
+#   1. energyDispatchingMode      ← 該模式實際 enum 整數
+#   2. power_control_field/value  ← 交流用 activePowerControlMode；直流用 dcControlMode（填實際 enum）
+#   3. set_field                  ← 設定值欄位（已定：AC=activePowerSetPoint / 恆流=dcCurrentSetPoint / 恆功率=dcPowerSetPoint）
+#   4. direction                  ← 方向表示法：
+#        "sign"                                     → 設定值帶正負（交流有功已確認：充=負、放=正）
+#        {"field":"<欄位>","charge":x,"discharge":y} → 用獨立 enum 欄位表示充/放電
+#   5. min/max/unit               ← 依前端/API 實際上下限（目前為 HMI 畫面範例 0~150）
+#   6. confirmed                  ← 全部確認後改 True → 自動解除 HOLD
+# 在此之前一律 confirmed=False、enum 留 None（SAFE/HOLD），不猜 enum、不送控制。
+PCS_CONTROL_MODES = {
+    "ac_active": {
+        "label": "交流有功", "unit": "kW", "min": 0, "max": 150,
+        "set_field": "activePowerSetPoint",
+        "energyDispatchingMode": 0,                                        # DevTools 確認
+        "power_control_field": "activePowerControlMode", "power_control_value": 0,  # DevTools 確認
+        "direction": "sign",                                              # DevTools 確認：充=負、放=正
+        "confirmed": True,
+    },
+    "dc_current": {
+        "label": "直流恆流", "unit": "A", "min": 0, "max": 150,
+        "set_field": "dcCurrentSetPoint",
+        "energyDispatchingMode": 1,                                        # DevTools 確認
+        "power_control_field": "dcControlMode", "power_control_value": 0,   # DevTools 確認
+        "direction": "sign",                                              # DevTools 確認：充=負、放=正
+        "confirmed": True,
+    },
+    "dc_power": {
+        "label": "直流恆功率", "unit": "kW", "min": 0, "max": 150,
+        "set_field": "dcPowerSetPoint",
+        "energyDispatchingMode": 1,                                        # DevTools 確認
+        "power_control_field": "dcControlMode", "power_control_value": 1,   # DevTools 確認
+        "direction": "sign",                                              # DevTools 確認：充=負、放=正
+        "confirmed": True,
+    },
+}
+
+# 必填 --power 的 action：所有帶 pcs_mode 的充放電 action
+REQUIRES_POWER = {a for a, s in ACTIONS.items() if s.get("pcs_mode")}
 
 # 送出前需先確認「電池已上電」的 action（否則一律阻擋）
 # 註：pcs_stop_power（停止充放電）屬安全停止指令，即使電池已下電/未知/切換中也應允許 → 不納入前置檢查。
-PRECHECK_BATTERY_ON = {"pcs_charge", "pcs_discharge"}
-_PCS_LABEL = {"pcs_charge": "PCS 充電", "pcs_discharge": "PCS 放電",
-              "pcs_stop_power": "PCS 停止充放電"}
+PRECHECK_BATTERY_ON = set(REQUIRES_POWER)
+_PCS_LABEL = {a: f"PCS {PCS_CONTROL_MODES[s['pcs_mode']]['label']}"
+                 f"{'充電' if s.get('direction') == 'charge' else '放電'}"
+              for a, s in ACTIONS.items() if s.get("pcs_mode")}
+_PCS_LABEL["pcs_stop_power"] = "PCS 停止充放電"
 
 
-def _pcs_active_payload(signed_power):
-    """PCS 充放電 payload；activePowerSetPoint 帶正負號（本站：充電=負、放電=正）。"""
+def _pcs_payload_base():
+    """
+    PCS manualControl payload schema（欄位固定、順序對齊 DevTools；未用到者送 null）。
+    共同欄位（DevTools 實測）：param=1、gridInterconnectionMode=0、offGridAcVoltRegulation=null。
+    """
     return {
         "param": 1,
         "gridInterconnectionMode": 0,
-        "energyDispatchingMode": 0,
-        "activePowerControlMode": 0,
-        "activePowerSetPoint": signed_power,
+        "energyDispatchingMode": None,
+        "activePowerControlMode": None,
+        "activePowerSetPoint": None,
         "dcControlMode": None,
         "dcCurrentSetPoint": None,
         "dcPowerSetPoint": None,
@@ -140,18 +199,45 @@ def _pcs_active_payload(signed_power):
     }
 
 
+def _build_pcs_payload(mode, direction, value):
+    """
+    依 PCS_CONTROL_MODES 設定表組 payload（單一來源；幅值/範圍驗證於此）。
+    - energyDispatchingMode / power_control_field / set_field / direction 全部取自設定表，
+      因此拿到 DevTools payload 後只需改設定表、不需改本函式。
+    - direction："sign" → 設定值帶正負（充=負、放=正，交流有功已確認）；
+                 dict   → 以獨立 enum 欄位表示方向；
+                 None   → 方向未確認（DC），先放正幅值，且該模式 confirmed=False → run() 禁止實送。
+    """
+    cfg = PCS_CONTROL_MODES[mode]
+    v = int(value) if float(value).is_integer() else float(value)
+    v = abs(v)
+    if not (cfg["min"] <= v <= cfg["max"]):
+        raise RuntimeError(f"{cfg['label']}數值超出允許範圍 {cfg['min']}~{cfg['max']} {cfg['unit']}：{v}")
+
+    payload = _pcs_payload_base()
+    payload["energyDispatchingMode"] = cfg["energyDispatchingMode"]
+    if cfg.get("power_control_field"):
+        payload[cfg["power_control_field"]] = cfg["power_control_value"]
+
+    setval = v
+    d = cfg.get("direction")
+    if d == "sign":
+        setval = -v if direction == "charge" else v      # 充=負、放=正（已確認）
+    elif isinstance(d, dict):
+        payload[d["field"]] = d[direction]               # 獨立方向 enum 欄位
+    # d is None → 方向待 DevTools；先放正幅值（該模式 confirmed=False，不會實送）
+    payload[cfg["set_field"]] = setval
+    return payload
+
+
 def _resolve_payload(action, spec, power):
-    """
-    依 action 決定實際 payload：充放電由 power 動態組出，其餘用靜態 payload。
-    ⚠️ 本站實測方向：activePowerSetPoint 為「正」= 放電、「負」= 充電。
-       故 pcs_charge → -abs(power)、pcs_discharge → +abs(power)（action 名稱＝實際行為）。
-    """
-    if action in ("pcs_charge", "pcs_discharge"):
+    """依 action 決定 payload：帶 pcs_mode 的充放電由 power 動態組出，其餘用靜態 payload。"""
+    mode = spec.get("pcs_mode")
+    if mode:
+        m = PCS_CONTROL_MODES[mode]
         if power is None:
-            raise RuntimeError(f"{action} 需要 --power（0~150）")
-        p = int(power) if float(power).is_integer() else float(power)
-        p = abs(p)
-        return _pcs_active_payload(-p if action == "pcs_charge" else p)
+            raise RuntimeError(f"{action} 需要 --power（{m['label']} {m['min']}~{m['max']} {m['unit']}）")
+        return _build_pcs_payload(mode, spec["direction"], power)
     return spec["payload"]
 
 
@@ -447,7 +533,8 @@ def run(action, execute, power=None, assume_yes=False):
     print(f"control_req : {method} {endpoint}")
     print(f"payload     : {json.dumps(payload, ensure_ascii=False)}")
     if power is not None:
-        print(f"power       : {power} kW")
+        _u = PCS_CONTROL_MODES[spec["pcs_mode"]]["unit"] if spec.get("pcs_mode") else "kW"
+        print(f"value       : {power} {_u}")
 
     client = ApiClient()
     token = client.login_hmi(USERNAME)
@@ -466,12 +553,24 @@ def run(action, execute, power=None, assume_yes=False):
         precheck = _battery_off_precheck(client, logged_in, action)
     blocked = bool(precheck and not precheck["allowed"])
 
+    # 未確認 payload 的 PCS 模式（直流恆流/恆功率）：一律只允許 dry-run，禁止實送。
+    mode_key = spec.get("pcs_mode")
+    mode_unconfirmed = bool(mode_key and not PCS_CONTROL_MODES[mode_key]["confirmed"])
+
+    # 判斷順序（安全優先）：登入 → dry-run → 未確認模式 [HOLD] → 前置檢查 → 送出。
+    #   未確認 PCS 模式（DC）在 --execute 時「一律」先被 [HOLD] 阻擋（不論電池前置檢查結果），
+    #   確保「未取得 DevTools payload 前絕不送 DC 控制」。
     if not logged_in:
         print("登入失敗，略過控制與驗證。")
-    elif blocked:
-        print("前置檢查未通過，已取消 PCS 控制（未送出任何控制 API）。")
     elif not execute:
         print("DRY-RUN：未送出控制 API。加上 --execute 才會實際送出。")
+    elif mode_unconfirmed:
+        m = PCS_CONTROL_MODES[mode_key]
+        reason = m.get("hold_reason", "payload/enum/充放電方向尚未由 DevTools 確認")
+        warnings.append(f"{m['label']}：{reason}；僅允許 dry-run，未送出控制 API。")
+        print(f"[HOLD] {m['label']}：{reason}。僅 dry-run，未送出控制 API。")
+    elif blocked:
+        print("前置檢查未通過，已取消 PCS 控制（未送出任何控制 API）。")
     else:
         # 高風險二次確認
         if spec.get("high_risk"):
