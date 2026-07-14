@@ -114,13 +114,56 @@ def _kdf(z: bytes, klen: int) -> bytes:
     return out[:klen]
 
 
-def _parse_pubkey(pub_hex: str):
-    """接受 130 hex(04 開頭) 或 128 hex(x||y)；回傳 (x, y)。"""
-    h = pub_hex.strip().lower().replace("0x", "")
+# ASN.1/DER 內用來辨識 SM2 SubjectPublicKeyInfo 的 OID
+_OID_EC_PUBLIC_KEY = "2a8648ce3d0201"   # 1.2.840.10045.2.1 ecPublicKey
+_OID_SM2 = "2a811ccf5501822d"           # 1.2.156.10197.1.301 sm2p256v1
+
+
+def normalize_public_key(pub_hex: str) -> str:
+    """
+    把各種輸入正規化成 130 hex 的 SM2 EC point（'04' + X + Y）。
+    支援：
+      - 128 hex（x||y）        → 補 '04'
+      - 130 hex（'04' 開頭）    → 原樣
+      - ASN.1/DER SubjectPublicKeyInfo（'30' 開頭）→ 解析出 EC point
+    無法解析時 raise ValueError（訊息含 length 與格式判斷）。
+    """
+    h = (pub_hex or "").strip().lower().replace("0x", "").replace(" ", "").replace("\n", "")
+    if not h:
+        raise ValueError("SM2 public key 為空")
+    if any(c not in "0123456789abcdef" for c in h):
+        raise ValueError(f"SM2 public key 非十六進位（可能是 PEM/Base64），length={len(h)}")
+
+    if len(h) == 128:
+        return "04" + h
     if len(h) == 130 and h.startswith("04"):
-        h = h[2:]
-    if len(h) != 128:
-        raise ValueError(f"SM2 公鑰長度不正確：{len(h)} hex（應 128 或 130）")
+        return h
+
+    # ASN.1 / DER（SubjectPublicKeyInfo）
+    if h.startswith("30"):
+        idx = h.find("034200")   # BIT STRING(0x42=66B) + 未使用位元 00 + 04(未壓縮)
+        if idx >= 0:
+            pt = h[idx + 6: idx + 6 + 130]
+            if len(pt) == 130 and pt.startswith("04"):
+                return pt
+        idx2 = h.rfind("04")     # 後備：最後一段 04+128hex
+        if idx2 >= 0 and len(h) - idx2 >= 130:
+            pt = h[idx2: idx2 + 130]
+            if len(pt) == 130:
+                return pt
+        raise ValueError(f"SM2 public key 疑似 ASN.1/DER 但無法取出 EC point，length={len(h)}")
+
+    # 疑似 SM2 密文（04 + C1 + C3 + C2），常見誤把加密後 password 貼成公鑰
+    if h.startswith("04") and len(h) > 130:
+        raise ValueError(f"SM2 public key length={len(h)}：符合 SM2『密文』特徵(04+C1+C3+C2)，"
+                         f"疑似誤填『加密後 password 密文』；請改填真正的公鑰（128 或 130 hex）")
+
+    raise ValueError(f"SM2 public key 長度/格式不正確：length={len(h)}（應為 128 或 130 hex，或 ASN.1 DER）")
+
+
+def _parse_pubkey(pub_hex: str):
+    """正規化為 130 hex 後回傳 (x, y)。"""
+    h = normalize_public_key(pub_hex)[2:]  # 去掉 '04'
     return int(h[:64], 16), int(h[64:], 16)
 
 

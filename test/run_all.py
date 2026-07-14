@@ -37,7 +37,7 @@ TASKS = [
      "outputs": ["battery_data.json", "battery_data.csv",
                  "battery_cells.json", "battery_cells.csv"]},
     {"key": "env", "script": "env_data_scraper.py",
-     "outputs": ["env_data.json", "env_data.csv",
+     "outputs": ["env_data.json",
                  "env_curated.json", "env_curated.csv"]},
     {"key": "alarm", "script": "alarm_records_scraper.py",
      "outputs": ["alarm_records.json", "alarm_records.csv"]},
@@ -45,7 +45,7 @@ TASKS = [
      "outputs": ["device_control_readonly.json"]},
     {"key": "threshold", "script": "threshold_config_scraper.py",
      "outputs": ["threshold_config.json", "threshold_config_summary.json",
-                 "threshold_config.csv"]},
+                 "threshold_config_summary.csv"]},
 ]
 TASK_BY_KEY = {t["key"]: t for t in TASKS}
 KEYS = [t["key"] for t in TASKS]

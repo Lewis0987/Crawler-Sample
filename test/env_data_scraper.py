@@ -14,7 +14,8 @@ API（免登入 guest，皆 GET）：
 每支回傳 list，內含 metricsDataVoList（{mark,value,unit}）。
 本 scraper 用共用的 _flatten_metrics/_fmt_metric/_zh 帶出每個 mark 的實際值（不硬猜欄位）。
 
-輸出：env_data.json（完整原始）＋ console 摘要 ＋ env_data.csv（全部 mark 攤平成一列）
+輸出：env_data.json（完整原始 API 資料）＋ env_curated.json / env_curated.csv（UI 精簡欄位）＋ console 摘要。
+     CSV 只輸出 curated/UI 欄位（env_curated.csv）；不再輸出 raw 全欄位 CSV。
 執行：python env_data_scraper.py
 """
 
@@ -242,17 +243,14 @@ def main():
         "endpoints": ENDPOINTS,
         "data": data,
     }
-    save_json(record)
+    save_json(record)   # 完整原始 API 資料（raw）全保留在 env_data.json
 
-    # 既有 raw 摘要輸出（保留）
-    summary = summarize_env_data(data)
-    save_csv(build_env_row(data))
-
-    # 新增 curated 重點摘要輸出（另存 env_curated.json / .csv）
+    # CSV 只輸出 curated / UI 欄位（env_curated.csv）；不再輸出 raw 全欄位 CSV，
+    # 避免與 env_curated.csv 同時保留兩份大量重複資料。raw 仍在 env_data.json。
     curated = summarize_env_curated(data)
     save_curated(curated)
 
-    # console 只印 curated 重點（raw 全欄位仍在 env_data.json/.csv）
+    # console 只印 curated 重點（raw 全欄位仍在 env_data.json）
     print_curated(curated)
 
 

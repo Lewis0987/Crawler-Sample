@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+[DIAGNOSTIC 一次性診斷工具]（run_all.py 不會呼叫本檔）
 唯讀：dump 設備控制相關端點的真實結構（mark / value / unit），
 供 device_control_scraper.py 建立狀態解析用。不送任何控制。
 

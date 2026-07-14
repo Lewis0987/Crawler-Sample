@@ -1,13 +1,17 @@
-# 本機敏感設定（含可重放 password 密文）— 不可提交
-# 涵蓋 .env 與任意 *.env（例如 login.env / 1.env / abc.env）
+# 本機敏感設定（登入 env / config）— 不可提交
+# 涵蓋 .env 與任意 *.env（含 login*.env，例如 login123.env / login.env）
 .env
 *.env
+login*.env
 login_config.json
 config/local*.json
 
 # 範本可提交（不含真實密文）
 !.env.example
 !login_config.example.json
+
+# 爬蟲輸出（實際輸出在專案根 output/，此處一併保險排除）
+output/
 
 # Python
 __pycache__/

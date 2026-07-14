@@ -48,6 +48,38 @@ CELL_FIELDS = ["packNo", "cellNo", "voltage", "temperature", "soc", "soh", "bala
 # CSV 用（人可讀中文欄位，順序固定）
 CELL_CSV_FIELDS = ["Pack", "序號", "電壓", "溫度", "SOC", "SOH", "均衡狀態"]
 
+# Pack 極值摘要 CSV（人可讀中文欄位＋單位於表頭，數值保持原始數字；順序固定）。
+# 對應 UI「電池數據 / 極值資訊」：每個極值皆為「數值＋電芯編號」成對呈現。
+# 機器欄位（PACK_FIELDS）仍完整保留在 battery_data.json。
+PACK_CSV_FIELDS = ["Pack", "總電壓(V)",
+                   "最高單體電壓(V)", "最高電壓電芯編號",
+                   "最低單體電壓(V)", "最低電壓電芯編號",
+                   "最高溫度(℃)", "最高溫度電芯編號",
+                   "最低溫度(℃)", "最低溫度電芯編號",
+                   "最高SOC(%)", "最低SOC(%)", "最高SOH(%)", "最低SOH(%)"]
+# 機器欄位 → 中文欄位 對照（順序即 PACK_CSV_FIELDS）
+_PACK_CSV_MAP = [
+    ("packNo", "Pack"), ("totalVoltage", "總電壓(V)"),
+    ("maxCellVoltage", "最高單體電壓(V)"), ("maxCellNo", "最高電壓電芯編號"),
+    ("minCellVoltage", "最低單體電壓(V)"), ("minCellNo", "最低電壓電芯編號"),
+    ("maxTemp", "最高溫度(℃)"), ("maxTempCellNo", "最高溫度電芯編號"),
+    ("minTemp", "最低溫度(℃)"), ("minTempCellNo", "最低溫度電芯編號"),
+    ("socMax", "最高SOC(%)"), ("socMin", "最低SOC(%)"),
+    ("sohMax", "最高SOH(%)"), ("sohMin", "最低SOH(%)"),
+]
+
+
+def to_pack_csv_rows(pack_summary):
+    """把 Pack 摘要（機器欄位）轉成中文欄位 CSV 列；缺值輸出空字串。"""
+    out = []
+    for p in pack_summary:
+        row = {}
+        for mkey, zh in _PACK_CSV_MAP:
+            v = p.get(mkey)
+            row[zh] = "" if v is None else v
+        out.append(row)
+    return out
+
 # 均衡狀態對照：0=無均衡（前端確認）；1=均衡中（推定，站上目前全為 0）。查不到保留原值。
 BALANCE_MAP = {0: "無均衡", 1: "均衡中", "0": "無均衡", "1": "均衡中"}
 
@@ -207,7 +239,7 @@ def main():
     # 兩層分別輸出（不混在一起）
     _save_json({"timestamp": ts, "source_api": BATTERY_PACK_API,
                 "pack_count": len(pack_summary), "packs": pack_summary}, PACK_JSON)
-    _save_csv(pack_summary, PACK_FIELDS, PACK_CSV)
+    _save_csv(to_pack_csv_rows(pack_summary), PACK_CSV_FIELDS, PACK_CSV)
 
     _save_json({"timestamp": ts, "source_api": BATTERY_PACK_API,
                 "pack_count": len(pack_summary), "cell_count": len(cell_rows),

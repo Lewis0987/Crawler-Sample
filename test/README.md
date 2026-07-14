@@ -8,7 +8,8 @@
 2. 電池數據（Battery Data）
 3. 環控數據（Environmental Control）
 4. 告警記錄（Alarm Records）
-5. 設備控制（Device Control：唯讀盤點 + 低風險控制）
+5. 設備控制（Device Control：唯讀狀態 + 低風險控制）
+6. 閥值管理（Threshold：唯讀，告警抑制 + 閥值列表）
 
 ## 專案路徑
 
@@ -43,27 +44,69 @@ BASE_URL = http://192.168.128.110:8080/admin-api
 
 | 檔案 | 角色 | 直接產出資料檔 |
 |---|---|---|
-| `api_client.py` | 共用 HTTP 層：session、BASE_URL、`get` / `get_many`、`unwrap`、`login` / `login_hmi`（Bearer token）、`.env` / config 讀取 | 否 |
+| `api_client.py` | 共用 HTTP 層：session、BASE_URL、`get` / `get_many`、`unwrap`、`login_hmi`（SM2 登入 + Bearer token）、`.env` / config 讀取、機密遮罩 | 否 |
+| `sm2_util.py` | 零依賴 SM2（配 SM3/KDF）：`normalize_public_key()`、`sm2_encrypt()`（C1C3C2，對齊前端 cipherMode=1） | 否 |
 | `dashboard_scraper.py` | 共用解析工具：`_flatten_metrics`、`_fmt_metric`、`_zh`、`STATUS_MAP`、各 summarize helper | 否 |
 | `dashboard_min.py` | 數據概覽爬蟲（最小版） | `dashboard_min.json` |
 | `battery_data_scraper.py` | 電池數據爬蟲（Pack 摘要 + Pack 明細 20 cell） | `battery_data.json` / `.csv`、`battery_cells.json` / `.csv` |
-| `env_data_scraper.py` | 環控數據爬蟲（6 張卡 raw + curated 摘要） | `env_data.json` / `.csv`、`env_curated.json` / `.csv` |
+| `env_data_scraper.py` | 環控數據爬蟲（6 張卡 raw + curated 摘要） | `env_data.json`（raw）、`env_curated.json` / `.csv`（UI） |
 | `alarm_records_scraper.py` | 告警記錄爬蟲（分頁抓全部 + 中文欄位/可讀時間/排序） | `alarm_records.json` / `.csv` |
-| `device_control_scraper.py` | 設備控制頁**唯讀**盤點 / 查詢（只讀、不控制） | `device_control_readonly.json` |
+| `device_control_scraper.py` | 設備控制頁**唯讀**狀態（PCS/電池/空調/進排風/冷卻循環，對齊 HMI） | `device_control_readonly.json` |
 | `device_control_operator.py` | 設備控制**指令式**工具（單一 action，dry-run / `--execute`） | `device_control_action_result.json` |
-| `device_control_menu.py` | 設備控制**互動式選單**（數字選單，底層呼叫 operator / scraper） | （呼叫上述兩者） |
-| `run_all.py` | 唯讀總入口，依序執行五支 scraper 並彙總 | （呼叫各 scraper） |
+| `device_control_menu.py` | 設備控制**互動式總覽/選單**（區塊狀態 + 顏色 + 執行子選單） | （呼叫 operator / scraper） |
+| `threshold_config_scraper.py` | 閥值管理**唯讀**（告警抑制 + 125 筆閥值，含 ECM/PCS/BMS 聯動） | `threshold_config.json` / `_summary.json` / `_summary.csv` |
+| `run_all.py` | 唯讀總入口，依序執行 6 支 scraper 並彙總 | （呼叫各 scraper） |
+| `inspect_sm2_key.py` | 唯讀：分析 `SM2_PUBLIC_KEY` 格式（128/130/ASN.1/密文誤填），遮罩中段 | 否 |
+| `test_sm2_login.py` | SM2 登入驗證（S1~S3 離線 + `--with-login` 真實登入；印長度診斷不印完整值） | 否 |
+| `test_env_discovery.py` | **[diagnostic]** env 動態搜尋/排序驗證（run_all 不依賴） | 否 |
+| `inspect_device_status.py` / `inspect_device.py` | **[diagnostic]** dump 設備端點原始結構 / 摘要唯讀結果（run_all 不依賴） | 否 |
+| `login_probe.py` | **[deprecated/diagnostic]** 密文重放登入測試（正式流程已改 SM2；run_all 不依賴） | 否 |
 
 ---
 
 ## 三、登入 / `.env` 狀態
 
+### HMI Login（正式流程摘要）
+
+目前採用與前端一致的 **SM2 動態登入**，所有模組共用 `api_client.login_hmi()`（不各自複製登入邏輯）。
+
+必要設定（`.env` / 任意 `*.env`，例如 `login123.env`）：
+
+```
+HMI_USERNAME=hmiUser
+HMI_PASSWORD=<明文密碼>
+SM2_PUBLIC_KEY=<130 hex 公鑰>
+```
+
+`LOGIN_PASSWORD_PAYLOAD` 已**棄用**，預設保持空白（程式已不讀取）。
+
+流程：
+
+```
+HMI_PASSWORD（明文）
+   ↓  sm2_util.sm2_encrypt()  （SM2 C1C3C2 加密，對齊前端 doEncrypt cipherMode=1）
+原始密文 212 hex
+   ↓  外層前置單一 "04"
+最終 password 214 hex
+   ↓  POST /system/auth/login  {username, password, captchaVerification:""}
+取得 accessToken → Authorization: Bearer <token>
+```
+
+注意：
+- `SM2_PUBLIC_KEY` 是 **130 hex 公鑰**（04 開頭）。
+- Network Payload 中的 **214 hex password 是「密文」不是公鑰** — 不要貼進 `SM2_PUBLIC_KEY`（`normalize_public_key()` 會擋下並報錯）。
+- 密碼更新後**不需**重新抓固定 payload（每次即時加密）。
+- 登入 log 固定 4 行、不含機密：`嘗試登入（hmiUser）…` / `[ENV] loaded: <path>` / `HMI login: user=hmiUser` / `HMI login success`。
+
+以下為細節說明。
+
 設備控制頁（`run_all.py` 的 device、`device_control_scraper.py`、`device_control_operator.py`）需登入取得 `accessToken`。
 
-前端登入時 password 會被 **SM2 加密**（`sm-crypto doEncrypt cipherMode=1`，04 前綴 C1C3C2 hex，每次密文不同）。本專案登入支援**雙模式**（皆由 `api_client.py` 統一處理）：
+前端登入時 password 會被 **SM2 加密**（`sm-crypto doEncrypt cipherMode=1`，04 前綴 C1C3C2 hex，每次密文不同）。本專案登入採 **SM2 即時加密單一模式**（由 `api_client.py` 統一處理）：
 
-- **SM2 即時加密（新・已驗證，建議長期使用）**：env 放密碼原文 `HMI_PASSWORD` + 公鑰 `SM2_PUBLIC_KEY`，登入時用 `sm2_util.py` 即時加密（每次動態產生，不需固定密文）。
-- **可重放密文（舊・fallback）**：env 放 `LOGIN_PASSWORD_PAYLOAD`（DevTools 抓到的密文），直接送出。
+- env 放密碼原文 `HMI_PASSWORD` + 公鑰 `SM2_PUBLIC_KEY`，登入時用 `sm2_util.py` 即時加密（每次動態產生，不需固定密文）。
+- 對齊前端 `jsencrypt` 的 `Pr(c) = "04" + sm2.doEncrypt(c, publicKeyHex, 1)`（cipherMode=1 → C1C3C2，再補 `04` 前綴，最終約 214 hex）。
+- `api_client.encrypt_password_sm2()` → `sm2_util.sm2_encrypt()` 產生與前端一致的密文；`normalize_public_key()` 會自動處理 128/130(04 前綴)/ASN.1-DER 三種公鑰輸入。
 
 ### env 檔動態搜尋規則
 
@@ -87,44 +130,39 @@ BASE_URL = http://192.168.128.110:8080/admin-api
 
 > 驗證腳本：`python test_env_discovery.py`（B1~B3 本地離線測搜尋/排序；加 `--with-login` 才做真實登入）。
 
-### env 檔內容格式（`test/login.env` 或任意 `*.env`）
+### env 檔內容格式（`test/login123.env` 或任意 `*.env`）
 
 env 檔（不論檔名）填以下欄位（**README/範本只放格式，不放真實密文**）：
 
 ```
 HMI_USERNAME=hmiUser
-# --- SM2 即時加密模式（建議）---
+# --- SM2 即時加密（唯一模式）---
 HMI_PASSWORD=<HMI 登入密碼原文>
-SM2_PUBLIC_KEY=<前端 sm-crypto 用的公鑰 hex，128 或 130（04 開頭）>
-# --- 可重放密文 fallback（可留空）---
-LOGIN_PASSWORD_PAYLOAD=
+SM2_PUBLIC_KEY=<前端 sm-crypto 用的公鑰 hex，128 或 130（04 開頭），亦支援 ASN.1-DER>
 ```
 
 欄位說明：
 - `HMI_USERNAME`（可選）：預設 `hmiUser`。
-- `HMI_PASSWORD` + `SM2_PUBLIC_KEY`：走 **SM2 即時加密**。
-- `LOGIN_PASSWORD_PAYLOAD`：**可留空**；填了會優先於 SM2（fallback 舊模式）。
+- `HMI_PASSWORD` + `SM2_PUBLIC_KEY`：登入時走 **SM2 即時加密**（兩者皆必填）。
 
 **password 取值優先順序（高 → 低）**：
-1. `LOGIN_PASSWORD_PAYLOAD`（env / `login_config.json`）→ 直接送密文
-2. `HMI_PASSWORD` + `SM2_PUBLIC_KEY` → `sm2_util.sm2_encrypt()` 即時 SM2 加密
-3. `client.login(USERNAME, PASSWORD)` 傳入值（相容 / 測試用）
+1. `HMI_PASSWORD` + `SM2_PUBLIC_KEY` → `encrypt_password_sm2()` / `sm2_util.sm2_encrypt()` 即時 SM2 加密（`password_source = sm2`）
+2. `client.login_hmi(password=...)` 傳入值（相容 / 測試用，`password_source = arg`）
 
-> 要用 SM2 模式，就把 `LOGIN_PASSWORD_PAYLOAD` 留空、填好 `HMI_PASSWORD` 與 `SM2_PUBLIC_KEY`。
+> 正常情況只需填 `HMI_PASSWORD` 與 `SM2_PUBLIC_KEY` 即可（走 SM2）。
 
 ### 目前已確認（實測）
 
 - **SM2 即時加密登入成功**：`password_source = sm2`、`HMI login success`（`code=200`）、每次密文不同（len 214、04 前綴）皆通過。
 - `accessToken` 自動帶入 `Authorization: Bearer <token>`。
-- `run_all.py`（device）、`device_control_scraper.py`、`device_control_operator.py` 皆走**同一套** `api_client` 登入，讀 `test/login.env`。
-- 舊 `LOGIN_PASSWORD_PAYLOAD` 模式仍保留為 fallback（實測亦可登入）。
+- `run_all.py`（device）、`device_control_scraper.py`、`device_control_operator.py`、`threshold_config_scraper.py`、`device_control_menu.py` 皆走**同一套** `api_client.login_hmi()` 登入，讀 `test/login123.env`（或任意 `*.env`）。
 
 ### 實際執行 / 驗證範例
 
 ```
 cd D:\Crawler Sample\test
 
-# 雙模式登入驗證（S1~S3 離線；--with-login 走真實 SM2 登入）
+# 登入驗證（S1~S3 離線；--with-login 走真實 SM2 登入）
 python test_sm2_login.py --with-login
 
 # 只讀查詢（會登入 → 抓設備控制唯讀狀態）
@@ -141,7 +179,7 @@ python run_all.py --only device
 
 - ⚠️ **`.env` 與任意 `*.env` 不可提交到版控**：`test/.gitignore` 與根目錄 `.gitignore` 皆已加入 `.env`、`*.env`、`login_config.json` 規則（涵蓋 `login.env` / `1.env` / `abc.env` 等）。
 - ⚠️ **`.env.example` 只能保留範例格式，不可放真實密文**（`.env.example` 不被 `*.env` 規則誤擋，可正常提交）。
-- token 與 `LOGIN_PASSWORD_PAYLOAD` 只以**遮罩**顯示（前 5 + … + 後 5 / 長度），不完整輸出。
+- **機密遮罩政策**：Console / Debug log / JSON 輸出**一律不輸出**完整機密——`HMI_PASSWORD`、`accessToken`、`refreshToken`、`Authorization: Bearer`、完整 SM2 密文（`04...`）、`SM2_PRIVATE_KEY`、Cookie / Session ID 皆不落地。需除錯時只以**遮罩**顯示：`前 5 + … + 後 5 (len=N)`（例：`accessToken = fd98e...80031 (len=32)`）。`token_info` 中的完整 token 僅存在記憶體、供帶 Header 用。
 
 ---
 
@@ -165,9 +203,11 @@ python dashboard_min.py
 資料來源為單一端點 `battery/getPackInformation`（免登入、無參數，一次回全部 Pack，每個 Pack 的 `packList` 已含 20 個 cell）。輸出拆成兩層：
 
 **A. Pack 摘要層**（`battery_data.json` / `battery_data.csv`，一個 Pack 一列）
-欄位：`packNo, totalVoltage, maxCellVoltage, maxCellNo, minCellVoltage, minCellNo, maxTemp, maxTempCellNo, minTemp, minTempCellNo, socMax, socMin, sohMax, sohMin`
+- `battery_data.json`：保留機器欄位 `packNo, totalVoltage, maxCellVoltage, maxCellNo, minCellVoltage, minCellNo, maxTemp, maxTempCellNo, minTemp, minTempCellNo, socMax, socMin, sohMax, sohMin`。
+- `battery_data.csv`：對應 UI「極值資訊」，改中文欄位（單位置於表頭、數值保持數字）：
+  `Pack, 總電壓(V), 最高單體電壓(V), 最高電壓電芯編號, 最低單體電壓(V), 最低電壓電芯編號, 最高溫度(℃), 最高溫度電芯編號, 最低溫度(℃), 最低溫度電芯編號, 最高SOC(%), 最低SOC(%), 最高SOH(%), 最低SOH(%)`。
 
-> 註：API 沒有單一 Pack 級 SOC/SOH，故以實測的 `socMax/socMin`、`sohMax/sohMin`（最高/最低）呈現。
+> 註：API 沒有單一 Pack 級 SOC/SOH，故以實測的最高/最低（`socMax/socMin`、`sohMax/sohMin`）呈現。
 
 **B. Pack 明細層**（`battery_cells.json` / `battery_cells.csv`，一個 cell 一列）
 `battery_cells.csv` 欄位順序：`Pack, 序號, 電壓, 溫度, SOC, SOH, 均衡狀態`
@@ -196,12 +236,14 @@ python battery_data_scraper.py
 | AC380 電量儀 | `envCon/voltameter` |
 | 多功能傳感器 | `envCon/multifunction` |
 
-輸出兩層：
+輸出：
 
-**A. 原始完整攤平**：`env_data.json` / `env_data.csv`
-**B. curated 精簡摘要**：`env_curated.json` / `env_curated.csv`
+**A. 原始完整資料（僅 JSON）**：`env_data.json`（保留全部 6 卡 raw API 欄位）
+**B. curated 精簡摘要（UI 欄位）**：`env_curated.json` / `env_curated.csv`
 
-翻譯規則：欄位中文化；狀態值透過 `dashboard_scraper.STATUS_MAP` 翻譯；數值自動帶單位；`env_data.*` 保留完整 raw，`env_curated.*` 為精簡摘要，兩者並存。
+> CSV 只輸出 curated/UI 欄位（`env_curated.csv`）；**不再輸出 raw 全欄位 CSV**（原 `env_data.csv` 已移除），避免與 curated 兩份大量重複。raw 完整資料仍在 `env_data.json`。
+
+翻譯規則：欄位中文化；狀態值透過 `dashboard_scraper.STATUS_MAP` 翻譯；數值自動帶單位。
 
 ```
 cd D:\Crawler Sample\test
@@ -216,11 +258,11 @@ python env_data_scraper.py
 
 1. **排序**：依 `alarmTime` 由新到舊（DESC）。
 2. **告警狀態中文化**：`alarmStatus=false → 已恢復`、`true → 告警中`。
-3. **時間欄位**：保留原始 epoch 毫秒，另補 `alarmTimeText` / `createTimeText`。
-4. **告警代碼中文欄位**：保留原始 `typeMark/targetMark/val`，另補 `*Text`。
-5. **告警級別**：`0 → 嚴重`、`1 → 一般`。
+3. **告警級別**：`0 → 嚴重`、`1 → 一般`。
+4. **時間**：CSV 只輸出 UI 顯示格式 `YYYY-MM-DD HH:MM:SS`（epoch 毫秒等原始欄位只在 JSON）。
 
-`alarm_records.csv` 前導 5 欄為人可讀欄位（`告警物件, 告警內容, 告警級別, 告警狀態, 告警時間`），其後保留完整明細。
+- `alarm_records.csv`：只輸出 UI 告警表格 5 欄（`告警物件, 告警內容, 告警級別, 告警狀態, 告警時間`）。
+- `alarm_records.json`：保留完整原始欄位（`alarmTime/createTime/level/alarmStatus/typeMark/targetMark/val…` 及各 `*Text`）供除錯。
 
 ```
 cd D:\Crawler Sample\test
@@ -273,7 +315,7 @@ API（皆 **GET**，需登入）：
 | PCS | `linkageControlVo.pcsOperate` | 17→無動作、2→PCS停機 |
 | BMS | `linkageControlVo.bcuOperate` | 17→無動作、10→普通下電 |
 
-**輸出**：`output/threshold_config.json`（原始 config+list）、`output/threshold_config_summary.json`、`output/threshold_config.csv`（皆保留完整 125 筆）。
+**輸出**：`output/threshold_config.json`（原始 config+list）、`output/threshold_config_summary.json`、`output/threshold_config_summary.csv`（皆保留完整 125 筆）。
 **終端**：只印前 `DETAIL_PRINT_LIMIT`（預設 10）筆，並顯示 `總筆數 / 顯示筆數`；完整資料看 JSON/CSV。
 
 ---
@@ -295,12 +337,13 @@ python run_all.py
 | env | OK |
 | alarm | OK |
 | device | OK |
+| threshold | OK |
 
 ```
-Total: 5, OK: 5, FAIL: 0, SKIP: 0
+Total: 6, OK: 6, FAIL: 0, SKIP: 0
 ```
 
-代表 `dashboard_min.py` / `battery_data_scraper.py` / `env_data_scraper.py` / `alarm_records_scraper.py` / `device_control_scraper.py` 都可正常輸出到 `D:\Crawler Sample\output`。
+代表 `dashboard_min.py` / `battery_data_scraper.py` / `env_data_scraper.py` / `alarm_records_scraper.py` / `device_control_scraper.py` / `threshold_config_scraper.py` 都可正常輸出到 `D:\Crawler Sample\output`。
 
 `run_all.py` 檢查產物存在時，一律看 `D:\Crawler Sample\output\` 內的檔案。也可只跑單一頁籤：
 
@@ -310,6 +353,7 @@ python run_all.py --only battery
 python run_all.py --only env
 python run_all.py --only alarm
 python run_all.py --only device
+python run_all.py --only threshold
 ```
 
 ---
@@ -343,8 +387,9 @@ python run_all.py --only device
   （含 `logged_in / action / dry_run / power / control_request / control_response / verify / control_success / verify_success / success / warnings`）
 
 ### 3) `device_control_menu.py`
-- 給人工現場操作的互動式選單版，執行後用數字選單控制，不用手打 action 名稱。
-- 底層仍是 `subprocess` 呼叫 `device_control_operator.py`（控制）與 `device_control_scraper.py`（查詢）。
+- 互動式**總覽**：依區塊（PCS / 電池 / 進排風 / 空調 / 冷卻循環）顯示**當前開關狀態**（開/上電→藍、關/下電→紅）＋ 各區塊控制選單參考。總覽為顯示用、**不自動執行**。
+- 輸入 `e` 進入**控制執行子選單**（沿用數字選單，含電池 YES 二次確認、PCS 功率輸入）；`r` 重新整理、`0` 離開。
+- 底層仍是 `subprocess` 呼叫 `device_control_operator.py`（控制）與 `device_control_scraper.py`（狀態）。
 
 ---
 
@@ -390,11 +435,11 @@ python run_all.py --only device
 |---|---|---|---|
 | PCS 手動模式開 | `--action pcs_manual_on --execute` | PUT `editManualSwitch` | ✅ **已驗證成功**（verify 確認 `manualModeSwitch=1`） |
 | PCS 手動模式關 | `--action pcs_manual_off --execute` | PUT `editManualSwitch` | ✅ **已驗證成功**（`manualModeSwitch=0`） |
-| PCS 充電（啟動充電） | `--action pcs_charge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出**；verify 只讀 403→partial |
-| PCS 放電（啟動放電） | `--action pcs_discharge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 同上（`activePowerSetPoint = -N`） |
-| PCS 停止充放電（停機） | `--action pcs_stop_power --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出** |
-| 電池上電 | `--action battery_power_on --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 已實作；**高風險、未實測**；輪詢 `getBcuState` 最多 60s |
-| 電池下電 | `--action battery_power_off --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 同上 |
+| PCS 充電（啟動充電） | `--action pcs_charge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出**；`activePowerSetPoint = -N`（本站：負=充電）；**前置檢查：電池須「已上電」** |
+| PCS 放電（啟動放電） | `--action pcs_discharge --power N --execute` | POST `sinexcel/…/manualControl` | ⚠️ 同上（`activePowerSetPoint = +N`，本站：正=放電）；**前置檢查：電池須「已上電」** |
+| PCS 停止充放電（停機） | `--action pcs_stop_power --execute` | POST `sinexcel/…/manualControl` | ⚠️ 已實作、dry-run 通過；**未實測送出**；**免電池前置檢查** |
+| 電池上電 | `--action battery_power_on --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 已實作；**高風險、未實測**；輪詢接觸器反饋最多 60s |
+| 電池下電 | `--action battery_power_off --execute`（需輸入 `YES`） | POST `manuallyPowerOnAndPowerOff` | ⚠️ 同上；**前置檢查：電池須「待機」**（充/放電中會擋下） |
 | 進排風開 | `--action vent_on --execute` | POST `switchingQuantityControl` | ⚠️ 已實作、dry-run 通過；**未實測**；無 verify API（partial） |
 | 進排風關 | `--action vent_off --execute` | POST `switchingQuantityControl` | ⚠️ 同上 |
 | 冷卻循環開 | `--action cooling_on --execute` | POST `waterPumpControl/1` | ⚠️ 已實作、dry-run 通過；**未實測**；無 verify API（partial） |
@@ -402,7 +447,13 @@ python run_all.py --only device
 | 空調開 | `--action ac_on --execute` | POST `airConditioningControl` | ⚠️ 控制曾回 `200`，但 verify（`/dataOrControl/air`）**403**，無法確認實際狀態 |
 | 空調關 | `--action ac_off --execute` | POST `airConditioningControl` | ⚠️ 同上 |
 
-**power 規則**：`pcs_charge` / `pcs_discharge` 必填 `--power N`（0~150）；充電 `+N`、放電 `-N`；`pcs_stop_power` 不需 `--power`。
+**power 規則**：`pcs_charge` / `pcs_discharge` 必填 `--power N`（0~150）；本站方向 **充電 `activePowerSetPoint = -N`、放電 `= +N`**（action 名稱＝實際行為）；`pcs_stop_power` 不需 `--power`。
+
+**電池狀態前置檢查（operator 內強制，CLI / 選單皆生效）**：
+- `pcs_charge` / `pcs_discharge`：電池須為**已上電**（依接觸器反饋判定），否則 `blocked`、不送 API。
+- `battery_power_off`：電池須為**待機**（依功率方向判定），充電中 / 放電中 / 狀態未知皆 `blocked`。
+- `pcs_stop_power`：**免前置檢查**。
+- 被擋下時 result JSON 帶 `precheck` / `blocked`，且 `control_success = success = false`、不送出、不等待。
 
 **只讀查詢狀態（`device_control_scraper.py`）**：多數端點可讀；**`空調狀態` 與 `PCS狀態`（authed `/client/dynamic/dataOrControl/air`、`/pcs`）回 `403 No operation permission`**（帳號無操作權限，UI 實際改讀 guest 端點）；登入前呼叫則會是 `401`。
 
@@ -442,8 +493,9 @@ python device_control_operator.py --action pcs_stop_power --execute
 python device_control_operator.py --action pcs_charge --power 20
 ```
 
-- `pcs_charge`：`activePowerSetPoint = +abs(power)`；`pcs_discharge`：`= -abs(power)`。
+- `pcs_charge`：`activePowerSetPoint = -abs(power)`（充電）；`pcs_discharge`：`= +abs(power)`（放電）。
 - `--power` 超出 0~150 直接拒絕、不送 API；`pcs_charge`/`pcs_discharge` 未帶 `--power` 會報錯。
+- `pcs_charge`/`pcs_discharge` 前需電池**已上電**、`battery_power_off` 前需電池**待機**，否則直接 `blocked`、不送出。
 
 ### B. 選單版：`device_control_menu.py`
 
@@ -461,8 +513,8 @@ python device_control_menu.py
 3. 空調開
 4. 空調關
 5. 查詢目前設備狀態
-6. PCS 充電          （提示輸入功率 kW 0~150）
-7. PCS 放電          （提示輸入功率 kW 0~150）
+6. PCS 放電          （提示輸入功率 kW 0~150）
+7. PCS 充電          （提示輸入功率 kW 0~150）
 8. PCS 停止充放電
 9. 電池上電          （高風險，需輸入 YES）
 10. 電池下電         （高風險，需輸入 YES）
@@ -472,6 +524,11 @@ python device_control_menu.py
 14. 冷卻循環關
 0. 離開
 ```
+
+選單附加行為：
+- **狀態儀表板**：進選單 / 查詢時彩色顯示各區塊狀態；PCS 顯示控制模式與排程開關（智慧模式才顯示排程）、電池顯示**電池上下電狀態**（接觸器反饋）與**當前狀態**（放電 / 充電 / 待機，依功率方向）。
+- **控制後回讀驗證**：具可靠回讀欄位的 action 送出後最多輪詢 60 秒（每 2 秒）確認狀態；PCS 充/放電/停止因只讀來源無單一可靠欄位 → verify partial、不輪詢。
+- **前置檢查**：與 operator 相同（PCS 充/放電需電池已上電、電池下電需待機、停止充放電免檢查）；被擋下時顯示 `BLOCKED` 與原因、不送出。
 
 ---
 
@@ -495,8 +552,8 @@ python device_control_menu.py
 3. 未加 `--execute` 時只能 **dry-run**，不真正送控制。
 4. **不重試、不批量**；控制 API 失敗直接輸出失敗結果。
 5. **不做離網模式 / 故障復位 / sys 手動上下電 / 其他未列出的控制**（`_FORBIDDEN_EXACT` + exact-match 白名單雙重把關）。
-6. **PCS 功率控制**（`pcs_charge`/`pcs_discharge`）`--power` 限 0~150，超出直接拒絕、不送 API；`pcs_charge` 為正、`pcs_discharge` 為負。
-7. **電池上下電為高風險**：`--execute` 後需輸入 `YES` 二次確認（或帶 `--yes`）；控制 API 只送一次，對 `getBcuState` 最多輪詢 60 秒（每 4 秒）驗證。
+6. **PCS 功率控制**（`pcs_charge`/`pcs_discharge`）`--power` 限 0~150，超出直接拒絕、不送 API；本站方向 **充電為負（-N）、放電為正（+N）**；且送出前電池須**已上電**（未上電 → `blocked`）。
+7. **電池上下電為高風險**：`--execute` 後需輸入 `YES` 二次確認（或帶 `--yes`）；`battery_power_off` 送出前電池須**待機**（充/放電中 → `blocked`）；控制 API 只送一次，對接觸器反饋最多輪詢 60 秒驗證。
 8. `.env` **不可提交版控**；`.env.example` **只放範例格式，不可放真實密文**。
 9. verify API 若權限不足 / 欄位不足，**不可**直接視為控制失敗，需區分：
    - `control_success`：控制 API 是否送出成功
@@ -527,9 +584,10 @@ python device_control_menu.py
 - 建立並重用 `requests.Session()`、共用 `BASE_URL`、統一 timeout / headers 與錯誤處理。
 - 主要函式：
   - `get / get_many / unwrap` — 唯讀 GET 與芋道封包 `{code, data, msg}` 解封包（code 0/200 取 `data`）。
-  - `login_hmi(username=None, password=None, ...)` — 依 `.env` / config 決定 password（可重放密文），POST `/system/auth/login` 取得 `accessToken`，之後帶 `Authorization: Bearer <token>`。
+  - `login_hmi(username=None, password=None, ...)` — 以 `HMI_PASSWORD` + `SM2_PUBLIC_KEY` 即時 SM2 加密（`encrypt_password_sm2`），POST `/system/auth/login` 取得 `accessToken`，之後帶 `Authorization: Bearer <token>`；debug 內 token 一律遮罩。
+  - `encrypt_password_sm2(password, public_key_hex)` — 正規化公鑰後呼叫 `sm2_util.sm2_encrypt`，輸出 `"04"+C1C3C2` hex（對齊前端）。
   - `login(username, password)` — 舊名相容，內部呼叫 `login_hmi`。
-  - `load_login_config()` / `mask_secret()` — 讀 `.env` / config；遮罩密文。
+  - `load_login_config()` / `mask_secret()` — 讀 `.env` / config；`mask_secret` 產生 `前5...後5 (len=N)` 遮罩。
 
 ### `dashboard_scraper.py`
 - 共用解析與格式化：`_flatten_metrics`、`_fmt_metric`、`_zh`、`STATUS_MAP` 與各 summarize helper。
@@ -543,18 +601,23 @@ python device_control_menu.py
 | 檔案 | 來源 | 內容 |
 |---|---|---|
 | `dashboard_min.json` | `dashboard_min.py` | 數據概覽原始資料 |
-| `battery_data.json` / `.csv` | `battery_data_scraper.py` | Pack 摘要（14 列） |
-| `battery_cells.json` / `.csv` | `battery_data_scraper.py` | Pack cell 明細（280 列） |
-| `env_data.json` / `.csv` | `env_data_scraper.py` | 6 卡完整攤平 |
-| `env_curated.json` / `.csv` | `env_data_scraper.py` | 環控 curated 精簡摘要 |
-| `alarm_records.json` / `.csv` | `alarm_records_scraper.py` | 告警完整記錄 |
-| `device_control_readonly.json` | `device_control_scraper.py` | 設備控制**唯讀**狀態 + 控制 API 清單（僅記錄） |
+| `dashboard_data.json` / `.csv` | `dashboard_scraper.py`（連續輪詢，非 run_all） | JSON=概覽全區塊原始快照；CSV=概覽卡片欄位時間序列（40 欄） |
+| `battery_data.json` / `.csv` | `battery_data_scraper.py` | JSON=Pack 機器欄位；CSV=極值 UI 中文欄位（14 列） |
+| `battery_cells.json` / `.csv` | `battery_data_scraper.py` | Pack cell 明細（280 列，7 欄） |
+| `env_data.json` | `env_data_scraper.py` | 6 卡完整 raw（**僅 JSON**，無 CSV） |
+| `env_curated.json` / `.csv` | `env_data_scraper.py` | 環控 curated / UI 精簡摘要 |
+| `alarm_records.json` / `.csv` | `alarm_records_scraper.py` | JSON=完整原始；CSV=UI 告警表格 5 欄 |
+| `device_control_readonly.json` | `device_control_scraper.py` | 設備控制**唯讀**狀態（status_summary + 原始資料 + verify 403） |
 | `device_control_action_result.json` | `device_control_operator.py` | 本次控制 action 的送出內容、回應、verify 結果與 success 狀態 |
+| `threshold_config.json` | `threshold_config_scraper.py` | 閥值管理原始（config + 完整 125 筆 list） |
+| `threshold_config_summary.json` | `threshold_config_scraper.py` | 閥值管理解析摘要（告警抑制 + 125 筆可讀列表） |
+| `threshold_config_summary.csv` | `threshold_config_scraper.py` | 閥值管理表格（完整 125 筆） |
 
 補充：
 
 - `device_control_readonly.json` — 來源 `device_control_scraper.py`，用途：只讀抓取設備控制頁目前狀態。
 - `device_control_action_result.json` — 來源 `device_control_operator.py`，用途：記錄本次控制 action 的 request / response / verify / success。
+- `threshold_config*.json` / `.csv` — 來源 `threshold_config_scraper.py`；JSON/CSV 保留完整 125 筆，終端只印前 10 筆。
 
 ---
 
@@ -569,9 +632,15 @@ cd D:\Crawler Sample\test
 python run_all.py
 ```
 
-只跑 device 只讀：
+只跑 device / threshold 只讀：
 ```
 python run_all.py --only device
+python run_all.py --only threshold
+```
+
+閥值管理（唯讀，終端印前 10 筆、JSON/CSV 完整 125 筆）：
+```
+python threshold_config_scraper.py
 ```
 
 PCS 手動模式開 / 關：

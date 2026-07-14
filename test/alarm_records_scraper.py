@@ -201,13 +201,15 @@ def save_csv(rows, path=CSV_PATH):
     if not rows:
         return
     try:
-        # 前導 5 個人可讀欄（順序固定）＋ 後面保留完整明細欄位
-        fieldnames = CURATED_ORDER + ROW_FIELDS
+        # CSV 只輸出 UI 告警表格欄位（5 欄，順序與前端一致）；
+        # 原始/除錯欄位（alarmTime/createTime/level/alarmStatus… 等）只保留在 JSON。
+        # extrasaction="ignore"：rows 內多出的明細欄位不寫入 CSV；restval=""：缺值輸出空字串。
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=CURATED_ORDER,
+                                    extrasaction="ignore", restval="")
             writer.writeheader()
             writer.writerows(rows)
-        print(f"告警明細已寫入：{path}（{len(rows)} 列）")
+        print(f"告警明細已寫入：{path}（{len(rows)} 列，UI 欄位 {len(CURATED_ORDER)} 欄）")
     except OSError as e:
         print(f"  [警告] 寫入 CSV 失敗：{e}")
 

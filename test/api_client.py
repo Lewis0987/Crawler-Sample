@@ -132,6 +132,32 @@ def mask_secret(s):
     return f"{s[:5]}...{s[-5:]} (len={len(s)})"
 
 
+def _redact_login_body(body):
+    """回傳 login 回應的遮罩副本：data.accessToken / refreshToken 只留前後幾字元，其餘不動。"""
+    if not isinstance(body, dict):
+        return body
+    safe = dict(body)
+    data = safe.get("data")
+    if isinstance(data, dict):
+        data = dict(data)
+        for k in ("accessToken", "refreshToken"):
+            if data.get(k):
+                data[k] = mask_secret(data[k])
+        safe["data"] = data
+    return safe
+
+
+def _extract_error_message(body):
+    """從回應 body 兼容多種錯誤欄位擷取訊息：msg / message / errorMessage / error。"""
+    if not isinstance(body, dict):
+        return None
+    for k in ("msg", "message", "errorMessage", "error", "error_description"):
+        v = body.get(k)
+        if v:
+            return str(v)
+    return None
+
+
 def _clean(v):
     """去除佔位字串（例如 '<...>'）與空白；空值回 None。"""
     if v is None:
@@ -147,24 +173,18 @@ def load_login_config():
     讀取登入設定（環境變數/.env 優先，其次 login_config.json）。
 
     回傳 dict：
-      - username         : 帳號（預設 hmiUser）
-      - password_payload : 舊模式，DevTools 抓到的可重放 SM2 密文（LOGIN_PASSWORD_PAYLOAD）
-      - hmi_password     : 新模式，密碼原文（HMI_PASSWORD）
-      - sm2_public_key   : 新模式，SM2 公鑰 hex（SM2_PUBLIC_KEY）
-      - source           : 密文來源 "env"|"config"|None（僅指 password_payload）
+      - username       : 帳號（預設 hmiUser；HMI_USERNAME / LOGIN_USERNAME）
+      - hmi_password   : 密碼原文（HMI_PASSWORD）
+      - sm2_public_key : SM2 公鑰 hex（SM2_PUBLIC_KEY；支援 128/130/ASN.1-DER）
 
-    【兩種登入模式】
-      舊模式：直接送 password_payload（可重放密文）。
-      新模式：以 sm2_util.sm2_encrypt(hmi_password, sm2_public_key) 每次即時加密
-              （對齊前端 sm-crypto doEncrypt cipherMode=1，04 前綴 C1C3C2 hex）。
+    登入採 SM2 即時加密：password = sm2_util.sm2_encrypt(hmi_password, sm2_public_key)
+    （對齊前端 sm-crypto doEncrypt cipherMode=1，04 前綴 C1C3C2 hex）。
     """
     _load_dotenv()
 
     username = _clean(os.environ.get("HMI_USERNAME")) or _clean(os.environ.get("LOGIN_USERNAME"))
-    payload = _clean(os.environ.get("LOGIN_PASSWORD_PAYLOAD"))
     hmi_password = _clean(os.environ.get("HMI_PASSWORD"))
     sm2_public_key = _clean(os.environ.get("SM2_PUBLIC_KEY"))
-    source = "env" if payload else None
 
     if os.path.exists(LOGIN_CONFIG_FILE):
         try:
@@ -172,11 +192,6 @@ def load_login_config():
                 data = json.load(f)
             if isinstance(data, dict):
                 username = username or _clean(data.get("username"))
-                if payload is None:
-                    fv = _clean(data.get("password_payload"))
-                    if fv:
-                        payload = fv
-                        source = "config"
                 hmi_password = hmi_password or _clean(data.get("hmi_password"))
                 sm2_public_key = sm2_public_key or _clean(data.get("sm2_public_key"))
         except (ValueError, OSError):
@@ -184,11 +199,18 @@ def load_login_config():
 
     return {
         "username": username or DEFAULT_USERNAME,
-        "password_payload": payload,
         "hmi_password": hmi_password,
         "sm2_public_key": sm2_public_key,
-        "source": source,
     }
+
+
+def encrypt_password_sm2(password, public_key_hex):
+    """
+    SM2 加密登入密碼（獨立 helper）：驗證/正規化公鑰後，回傳前端相同格式的密文
+    （04 + C1C3C2 hex，對齊 sm-crypto doEncrypt cipherMode=1）。公鑰格式錯誤會 raise。
+    """
+    sm2_util.normalize_public_key(public_key_hex)   # 驗證 128/130/ASN.1-DER，錯則 raise
+    return sm2_util.sm2_encrypt(password, public_key_hex)
 
 
 def unwrap(payload):
@@ -254,23 +276,14 @@ class ApiClient:
 
     def login_hmi(self, username=None, password=None, return_debug=False, log=True):
         """
-        設備控制頁登入：依前端實際格式送出。
-        - POST /system/auth/login（JSON body，Content-Type application/json）
-        - body：{"username": ..., "password": ...(密文), "captchaVerification": ""}
-
-        【password 來源（雙模式，優先序高→低）】
-          1. 舊模式 payload：env/config 的 LOGIN_PASSWORD_PAYLOAD（DevTools 抓到的可重放 SM2 密文）
-             → 直接送出。
-          2. 新模式 SM2：env/config 同時有 HMI_PASSWORD（密碼原文）+ SM2_PUBLIC_KEY（公鑰）
-             → 以 sm2_util.sm2_encrypt() 每次即時 SM2 加密（對齊前端 sm-crypto doEncrypt cipherMode=1）。
-          3. fallback：呼叫端傳入的 password（相容 / 測試用）。
-          → device_control_scraper.py 的 client.login(USERNAME, PASSWORD) 不需修改，
-             只要設定好 config/env，就會自動採用對應模式。
-
-        - 成功時 accessToken 取自 resp["data"]["accessToken"]，並設定 Authorization: Bearer。
-        - tenant-id 不需要（VITE_GLOB_APP_TENANT_ENABLE=false）。
-
-        成功回傳 token；失敗回傳 None。return_debug=True 時回傳 (token, debug_dict)。
+        HMI 登入（SM2 即時加密）— 單一封裝函式。
+        - POST /system/auth/login，body={username, password(SM2 密文), captchaVerification:""}
+        - password 來源優先序：
+            1. env/config 的 HMI_PASSWORD + SM2_PUBLIC_KEY → encrypt_password_sm2() 即時加密
+            2. 呼叫端傳入的 password（相容 / 測試用）
+        - 成功設定 Authorization: Bearer；回傳 token（失敗回傳 None）。
+          return_debug=True 時回傳 (token, debug_dict)。
+        - log 不含機密：不印 password / token / 公鑰 / 密文。
         """
         url = self.base_url + self.LOGIN_PATH
 
@@ -278,88 +291,79 @@ class ApiClient:
             if log:
                 print(msg)
 
-        cfg = load_login_config()
-        resolved_user = username or cfg["username"]
+        provisional_user = username or DEFAULT_USERNAME
+        _log(f"嘗試登入（{provisional_user}）…")
+        cfg = load_login_config()   # 觸發 [ENV] loaded: <path>
+        user = username or cfg["username"]
 
-        # password 解析（雙模式，優先序：payload → sm2 → arg）
-        resolved_pw = None
-        pw_source = None
-        sm2_error = None
-        if cfg["password_payload"]:
-            resolved_pw = cfg["password_payload"]
-            pw_source = "env-payload" if cfg["source"] == "env" else "config-payload"
-        elif cfg["hmi_password"] and cfg["sm2_public_key"]:
+        # 決定 password：SM2 動態加密優先，其次呼叫端傳入值
+        enc_password, source, error = None, None, None
+        if cfg["hmi_password"] and cfg["sm2_public_key"]:
             try:
-                resolved_pw = sm2_util.sm2_encrypt(cfg["hmi_password"], cfg["sm2_public_key"])
-                pw_source = "sm2"
+                enc_password = encrypt_password_sm2(cfg["hmi_password"], cfg["sm2_public_key"])
+                source = "sm2"
             except Exception as e:
-                sm2_error = str(e)
-                pw_source = "sm2-error"
+                error, source = str(e), "sm2-error"
         elif password:
-            resolved_pw = password
-            pw_source = "arg"
+            enc_password, source = password, "arg"
 
-        _SOURCE_MSG = {
-            "env-payload": "Using LOGIN_PASSWORD_PAYLOAD from env (payload mode)",
-            "config-payload": "Using login_config password_payload (payload mode)",
-            "sm2": "Using SM2 dynamic encryption (HMI_PASSWORD + SM2_PUBLIC_KEY)",
-            "sm2-error": "SM2 encryption failed",
-            "arg": "Using plain password fallback",
-        }
-        _log(_SOURCE_MSG.get(pw_source, "No password source found"))
-
-        debug = {"url": url, "method": "POST", "content_type": "application/json",
-                 "username": resolved_user, "password_source": pw_source,
-                 "password_masked": mask_secret(resolved_pw),
-                 "password_len": len(resolved_pw) if resolved_pw else 0}
+        debug = {"url": url, "method": "POST", "username": user, "password_source": source}
         token = None
         self.token_info = {}
 
-        if not resolved_pw:
-            if pw_source == "sm2-error":
-                debug["error"] = f"SM2 加密失敗：{sm2_error}（請確認 SM2_PUBLIC_KEY 格式為 128/130 hex）"
-                _log(f"HMI login failed: SM2 加密失敗：{sm2_error}")
-            else:
-                debug["error"] = ("未取得 password：請設定 (A) LOGIN_PASSWORD_PAYLOAD（可重放密文），"
-                                  "或 (B) HMI_PASSWORD + SM2_PUBLIC_KEY（即時 SM2 加密）。")
-                _log("HMI login failed: 未設定 LOGIN_PASSWORD_PAYLOAD，也沒有 HMI_PASSWORD+SM2_PUBLIC_KEY")
+        if not enc_password:
+            reason = error or "未設定 HMI_PASSWORD + SM2_PUBLIC_KEY（或未傳入 password）"
+            debug["error"] = reason
+            _log("HMI login failed")
+            _log(f"msg: {reason}")
             return (None, debug) if return_debug else None
 
-        _log(f"HMI login: user={resolved_user} password={mask_secret(resolved_pw)}")
-        payload = {"username": resolved_user, "password": resolved_pw, "captchaVerification": ""}
-        debug["payload_keys"] = list(payload.keys())
+        _log(f"HMI login: user={user}")
+        payload = {"username": user, "password": enc_password, "captchaVerification": ""}
         try:
             resp = self.session.post(url, json=payload, timeout=self.timeout)
             debug["status"] = resp.status_code
+            debug["content_type"] = resp.headers.get("Content-Type")
             try:
                 body = resp.json()
             except ValueError:
-                body = {"_non_json": resp.text[:300]}
-            debug["response"] = body
+                body = {"_non_json": (resp.text or "")[:500]}
+            debug["response"] = _redact_login_body(body)   # 遮罩 accessToken/refreshToken
             debug["code"] = body.get("code") if isinstance(body, dict) else None
-            debug["msg"] = body.get("msg") if isinstance(body, dict) else None
+            debug["msg"] = (_extract_error_message(body)
+                            or (body.get("_non_json") if isinstance(body, dict) else None))
 
             data = body.get("data") if isinstance(body, dict) else None
             if isinstance(data, dict):
                 token = data.get("accessToken")
-                # 一併保留 refreshToken / expiresTime
-                self.token_info = {
-                    "accessToken": token,
-                    "refreshToken": data.get("refreshToken"),
-                    "expiresTime": data.get("expiresTime"),
-                }
-                debug["refreshToken"] = data.get("refreshToken")
+                # token_info 保留完整（供 Authorization 使用，僅存記憶體、不輸出）
+                self.token_info = {"accessToken": token,
+                                   "refreshToken": data.get("refreshToken"),
+                                   "expiresTime": data.get("expiresTime")}
+                debug["refreshToken"] = mask_secret(data.get("refreshToken"))  # 遮罩
                 debug["expiresTime"] = data.get("expiresTime")
-            debug["accessToken_field"] = "data.accessToken" if token else None
             if token:
                 self.session.headers["Authorization"] = f"Bearer {token}"
                 self.logged_in = True
-                _log(f"HMI login success (accessToken={mask_secret(token)})")
+                _log("HMI login success")
             else:
-                _log(f"HMI login failed: code={debug.get('code')} msg={debug.get('msg')}")
+                # 失敗診斷（皆為非機密）：狀態 / code / msg / Content-Type / 回應前 300 字
+                # response preview 取自「已遮罩」的 body，確保不外洩 token/密文。
+                preview = json.dumps(debug.get("response"), ensure_ascii=False)[:300]
+                _log("HMI login failed")
+                _log(f"HTTP: {resp.status_code}")
+                _log(f"code: {debug.get('code')}")
+                _log(f"msg: {debug.get('msg')}")
+                _log(f"Content-Type: {debug.get('content_type')}")
+                _log(f"response preview: {preview}")
         except requests.exceptions.RequestException as e:
-            debug["error"] = str(e)
-            _log(f"HMI login failed: {e}")
+            debug["error"] = f"{type(e).__name__}: {e}"
+            _log("HMI login failed")
+            _log("HTTP: -")
+            _log("code: -")
+            _log(f"msg: {e}")
+            _log(f"Content-Type: -")
+            _log(f"exception: {type(e).__name__}")
 
         return (token, debug) if return_debug else token
 
@@ -376,25 +380,16 @@ if __name__ == "__main__":
 
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-    # password 由 config/env 決定（LOGIN_PASSWORD_PAYLOAD / login_config.json）；不硬寫密文
+    # password 由 config/env 的 HMI_PASSWORD + SM2_PUBLIC_KEY 即時 SM2 加密；不硬寫密文
     c = ApiClient()
     tok, dbg = c.login_hmi(return_debug=True)
 
     print("== login_hmi 最小驗證 ==")
-    print("request URL   :", dbg.get("url"))
-    print("method        :", dbg.get("method"), "| Content-Type:", dbg.get("content_type"))
+    print("request URL    :", dbg.get("url"))
+    print("username       :", dbg.get("username"))
     print("password 來源  :", dbg.get("password_source"))
-    print("request body  :", {"username": dbg.get("username"),
-                              "password": dbg.get("password_masked"),
-                              "captchaVerification": ""})
-    print("response status:", dbg.get("status"))
-    print("response code  :", dbg.get("code"), "| msg:", dbg.get("msg"))
-    print("response(raw)  :", json.dumps(dbg.get("response"), ensure_ascii=False))
+    print("HTTP status    :", dbg.get("status"))
+    print("code           :", dbg.get("code"), "| msg:", dbg.get("msg"))
     if dbg.get("error"):
-        print("request error  :", dbg.get("error"))
-    if tok:
-        print("accessToken    : 取得成功（欄位 =", dbg.get("accessToken_field"), "）")
-        print("refreshToken   :", dbg.get("refreshToken"))
-        print("expiresTime    :", dbg.get("expiresTime"))
-    else:
-        print("accessToken    : 未取得")
+        print("error          :", dbg.get("error"))
+    print("accessToken    :", "取得成功" if tok else "未取得")

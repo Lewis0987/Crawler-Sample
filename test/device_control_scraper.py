@@ -18,7 +18,7 @@ from api_client import ApiClient
 from dashboard_scraper import _flatten_metrics, _fmt_metric  # 重用 envCon 攤平 + i18n 中文化
 
 USERNAME = "hmiUser"
-PASSWORD = "hmiUser123"  # 相容用；實際密碼/密文由 api_client 依 .env 決定（SM2 或 payload）
+# 密碼不寫在程式碼：由 api_client 依 .env 的 HMI_PASSWORD + SM2_PUBLIC_KEY 即時 SM2 加密。
 
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
@@ -66,18 +66,63 @@ _CONTROL_MODE_MAP = {"manual": "手動", "schedule": "智慧模式", "auto": "�
                      "smart": "智慧模式", "intelligent": "智慧模式"}
 # 屬「智慧模式」的 getRunMode 值（此時才顯示排程開關狀態）
 _SMART_RUNMODES = {"schedule", "auto", "smart", "intelligent"}
+# 電池「當前狀態」判斷閾值（|功率| ≤ 此值視為待機，kW）
+_BATTERY_IDLE_KW = 0.1
 
 
-def _battery_power_state(v):
-    """電池上下電狀態 mapping → 已上電 / 已下電 / 未知。"""
-    if isinstance(v, bool):
-        return "已上電" if v else "已下電"
-    s = str(v).strip().lower()
-    if s in ("開", "true", "1", "on", "poweron", "已上電"):
-        return "已上電"
-    if s in ("關", "false", "0", "off", "poweroff", "已下電"):
-        return "已下電"
-    return "未知"
+def battery_power_state_from_dodi(dodi):
+    """
+    ⚠️ 電池上下電狀態的『唯一正解』：依主正/主負接觸器**反饋**（getDOAndDIMsg）判斷。
+       實測：已上電時 main.positive/negative.contactor.feedback 皆=1（閉合）；
+             已下電時皆=0（斷開）。getManuallyPowerState / getBcuState 皆非此狀態（上電時仍為 False）。
+    回傳 (state, raw_dict)：state ∈ 已上電 / 已下電 / 切換中 / 未知。
+    scraper 顯示與 operator verify 共用此函式，確保同一套 mapping。
+    """
+    pos = neg = None
+    if isinstance(dodi, list):
+        for it in dodi:
+            if not isinstance(it, dict):
+                continue
+            name = it.get("name") or it.get("mark") or ""
+            if "main.positive.contactor.feedback" in name:
+                pos = it.get("value")
+            elif "main.negative.contactor.feedback" in name:
+                neg = it.get("value")
+    raw = {"main.positive.contactor.feedback": pos, "main.negative.contactor.feedback": neg}
+
+    def _on(x):
+        return x in (1, "1")
+
+    def _off(x):
+        return x in (0, "0")
+
+    if pos is None and neg is None:
+        return "未知", raw
+    if _on(pos) and _on(neg):
+        return "已上電", raw
+    if _off(pos) and _off(neg):
+        return "已下電", raw
+    return "切換中", raw
+
+
+def battery_flow_state(main):
+    """
+    電池充放電狀態（共用於顯示與 battery_power_off 前置檢查）：
+    依功率方向回傳 (state, power_kw)：<0 放電 / >0 充電 / ≈0 待機 / 無資料 未知。
+    main = overview/mainControlCollectsInformation dict。
+    """
+    if not isinstance(main, dict):
+        return "未知", None
+    v = main.get("rackTotalBatteryVoltage")
+    a = main.get("rackElectricCurrent")
+    if v is None or a is None:
+        return "未知", None
+    power_kw = v * a / 1000
+    if power_kw <= -_BATTERY_IDLE_KW:
+        return "放電", power_kw
+    if power_kw >= _BATTERY_IDLE_KW:
+        return "充電", power_kw
+    return "待機", power_kw
 # PCS 故障/告警類旗標（值非「正常」時列出）
 _PCS_ALARM_FLAGS = {"systemFaultStatus": "故障", "systemFailedStatus": "故障", "systemAlarmStatus": "告警"}
 # PCS 布林旗標（值為「是」時列出）
@@ -222,26 +267,36 @@ def parse_battery(main, manual_power, dodi):
       電池上下電狀態 → 當前狀態/SOC/電壓/電流/功率 → 主正反饋/主正/主負反饋/主負/環流。
     """
     out = {}
-    # 1) 電池上下電狀態 ← getManuallyPowerState（manuallyPowerOnAndPowerOff 的狀態回讀）
-    out["電池上下電狀態"] = _battery_power_state(manual_power)
+    # 1) 電池上下電狀態 ← 主正/主負接觸器反饋（getDOAndDIMsg）；非 getManuallyPowerState
+    power_state, power_raw = battery_power_state_from_dodi(dodi)
+    out["電池上下電狀態"] = power_state
     # 2) 電池系統指標 ← overview/mainControlCollectsInformation
+    power_kw = None
     if isinstance(main, dict):
         v = main.get("rackTotalBatteryVoltage")
         a = main.get("rackElectricCurrent")
         soc = main.get("rackSoc")
-        out["當前狀態"] = "暫無資料" if a is None else ("待機" if abs(a) < 0.5 else "運轉")
+        # 當前狀態：共用 battery_flow_state（<0 放電 / >0 充電 / ≈0 待機），不用固定「運轉」
+        flow_state, power_kw = battery_flow_state(main)
+        out["當前狀態"] = flow_state
         if soc is not None:
             out["當前SOC"] = f"{soc} {main.get('rackSocUnit', '%')}"
         if v is not None:
             out["當前電壓"] = f"{v} {main.get('rackTotalBatteryVoltageUnit', 'V')}"
         if a is not None:
             out["當前電流"] = f"{a} {main.get('rackElectricCurrentUnit', 'A')}"
-        if v is not None and a is not None:
-            out["當前功率"] = f"{v * a / 1000:.3f} kW"   # DC 功率 = 電壓×電流
+        if power_kw is not None:
+            out["當前功率"] = f"{power_kw:.3f} kW"
     else:
         out["當前狀態"] = "暫無資料"
     # 3) 反饋/接觸器（主正反饋/主正/主負反饋/主負/環流）← getDOAndDIMsg
     out.update(parse_feedback(dodi))
+    # 4) 暫時 Debug（確認 mapping 正確後可移除）
+    out["battery_power_field"] = "getDOAndDIMsg: main.positive/negative.contactor.feedback"
+    out["battery_power_raw"] = power_raw
+    out["battery_power_mapped"] = power_state
+    out["current_power"] = f"{power_kw:.3f} kW" if power_kw is not None else "unknown"
+    out["current_state"] = out.get("當前狀態")
     return out
 
 
@@ -381,13 +436,9 @@ def save_json(record, path=JSON_PATH):
 
 def main():
     client = ApiClient()
-    print(f"嘗試登入（{USERNAME}）…")
-    # log=False：抑制 api_client 內部的敏感登入輸出（密文 / accessToken / SM2 來源）
-    # [ENV] loaded 仍會由 _load_dotenv 印出；以下只印不含機密的最小登入結果
-    token, dbg = client.login_hmi(USERNAME, return_debug=True, log=False)
-    print(f"HMI login: user={USERNAME}")
-    print("HMI login success" if token
-          else f"HMI login failed: code={dbg.get('code')} msg={dbg.get('msg')}")
+    # 統一登入：由 api_client.login_hmi 印出 4 行登入 log（嘗試登入/[ENV] loaded/
+    # HMI login: user=/HMI login success），不含任何機密。失敗細節亦由其印出。
+    token = client.login_hmi(USERNAME)
 
     rd = _fetch(client, READONLY_ENDPOINTS)     # 狀態來源
     vd = _fetch(client, VERIFY_ENDPOINTS)       # 控制驗證端點（authed，可能 403）

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-env 檔動態搜尋測試（test_env_discovery.py）
+[DIAGNOSTIC 一次性診斷工具] env 檔動態搜尋測試（test_env_discovery.py）
 ==========================================
+⚠️ 一次性診斷 / 開發輔助用；不屬於正式流程，run_all.py 不會呼叫本檔。
 驗證 api_client.py 的 .env / *.env 動態搜尋與載入邏輯。
 
 測試案例：

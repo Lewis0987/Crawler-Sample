@@ -12,7 +12,7 @@ API（皆 GET，需登入；沿用 api_client 的 SM2 登入）：
 輸出：
   output/threshold_config.json          （原始 config + list）
   output/threshold_config_summary.json  （解析後可讀摘要）
-  output/threshold_config.csv           （解析後表格）
+  output/threshold_config_summary.csv   （解析後表格）
 執行：python threshold_config_scraper.py
 """
 
@@ -29,7 +29,7 @@ _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 RAW_PATH = os.path.join(_OUTPUT_DIR, "threshold_config.json")
 SUMMARY_PATH = os.path.join(_OUTPUT_DIR, "threshold_config_summary.json")
-CSV_PATH = os.path.join(_OUTPUT_DIR, "threshold_config.csv")
+CSV_PATH = os.path.join(_OUTPUT_DIR, "threshold_config_summary.csv")
 
 CONFIG_API = "/client/dynamic/threshold/config/config"
 # 需帶 pageSize 才會回全部（無參數預設只回第一頁 10 筆）
@@ -137,16 +137,13 @@ def print_summary(suppression, total, parsed):
     remaining = len(parsed) - DETAIL_PRINT_LIMIT
     if remaining > 0:
         print(f"\n…其餘 {remaining} 筆略過（完整資料請看 "
-              f"output/threshold_config.json 或 threshold_config.csv）")
+              f"output/threshold_config.json 或 threshold_config_summary.csv）")
 
 
 def main():
     client = ApiClient()
-    print(f"嘗試登入（{USERNAME}）…")
-    token, dbg = client.login_hmi(USERNAME, return_debug=True, log=False)
-    print(f"HMI login: user={USERNAME}")
-    print("HMI login success" if token
-          else f"HMI login failed: code={dbg.get('code')} msg={dbg.get('msg')}")
+    # 統一登入：由 api_client.login_hmi 印出 4 行登入 log（不含機密），失敗細節亦由其印出。
+    token = client.login_hmi(USERNAME)
 
     config = client.get(CONFIG_API)
     lst = client.get(LIST_API, params=LIST_PARAMS)   # 帶 pageSize 抓齊全部

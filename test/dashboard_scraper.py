@@ -136,6 +136,18 @@ PCS_GROUPS = {
     },
 }
 
+# ---- dashboard_data.csv 固定欄位（只保留 Dashboard 概覽卡片欄位；順序固定）----
+# 由 curated 定義自動組出：電池概覽 / PCS概覽(4組) / 環控空調概覽 / 告警摘要。
+# 未 curated 的通用區塊（Rack容量/極端值、環控_水系統/UPS/串口ttyS0、多功能傳感器、AC380電量儀）
+# 屬 API 原始攤平、非概覽卡片欄位 → 不寫入 CSV；完整原始資料仍在 dashboard_data.json。
+DASHBOARD_CSV_FIELDS = (
+    ["timestamp"]
+    + [f"電池_{k}" for k in BATTERY_FIELDS]
+    + [f"PCS_{g}_{k}" for g, fields in PCS_GROUPS.items() for k in fields]
+    + [f"環控空調_{k}" for k in ENV_FIELDS]
+    + ["告警_API總數", "告警_本批啟用數"]
+)
+
 # ---- i18n 狀態值中文對照（value 為 type.attr.* 這類 key 時翻譯；查不到就保留原字串）----
 STATUS_MAP = {
     "type.attr.desc.normal":      "正常",
@@ -464,16 +476,11 @@ def build_summary_row(record):
     data = record["data"]
     row = {"timestamp": record["timestamp"]}
 
+    # 只輸出概覽卡片（curated）欄位；未 curated 的通用區塊不寫入 CSV（仍在 JSON）。
     batt = summarize_battery(data.get("電池概覽"))
     if batt:
         for k, v in batt.items():
             row[f"電池_{k}"] = v
-
-    for block in ("Rack容量資訊", "Rack極端值資訊"):
-        g = summarize_generic(data.get(block))
-        if g:
-            for k, v in g.items():
-                row[f"{block}_{k}"] = v
 
     pcs = summarize_pcs(data.get("PCS概覽"))
     if pcs:
@@ -486,12 +493,6 @@ def build_summary_row(record):
         for k, v in env.items():
             row[f"環控空調_{k}"] = v
 
-    for block in ("環控_水系統", "環控_UPS", "環控_串口ttyS0", "多功能傳感器", "AC380電量儀"):
-        g = summarize_generic(data.get(block))
-        if g:
-            for k, v in g.items():
-                row[f"{block}_{k}"] = v
-
     total, active_in_batch, _ = summarize_alarm(data.get("告警資訊"))
     row["告警_API總數"] = total
     row["告警_本批啟用數"] = active_in_batch
@@ -500,8 +501,10 @@ def build_summary_row(record):
 
 def save_to_csv(row, path=CSV_PATH):
     """
-    逐輪把摘要附加一列到 CSV。欄位以聯集累積；新欄位出現時自動重寫表頭。
-    使用 utf-8-sig 讓 Excel 正確辨識中文。
+    逐輪把「概覽卡片欄位」附加一列到 CSV（固定欄位 DASHBOARD_CSV_FIELDS、順序固定）。
+    - 只寫入白名單欄位，未在清單內的欄位不輸出；缺值輸出空字串。
+    - 若既有檔案表頭與固定欄位不符（例如舊版全量欄位），改以固定欄位重新建立檔案，
+      保留仍符合新欄位的舊資料列。使用 utf-8-sig 讓 Excel 正確辨識中文。
     """
     try:
         existing_header = []
@@ -509,25 +512,21 @@ def save_to_csv(row, path=CSV_PATH):
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
                 existing_header = next(csv.reader(f), [])
 
-        header = list(existing_header)
-        for k in row:
-            if k not in header:
-                header.append(k)
-
-        rewrite = header != existing_header
+        fresh = existing_header != DASHBOARD_CSV_FIELDS  # 表頭不符（含舊版全量）→ 重建
         old_rows = []
-        if rewrite and os.path.exists(path):
+        if not fresh and os.path.exists(path):
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
                 old_rows = list(csv.DictReader(f))
 
-        mode = "w" if rewrite else "a"
+        mode = "w" if fresh else "a"
         with open(path, mode, encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=header)
-            if rewrite:
+            writer = csv.DictWriter(f, fieldnames=DASHBOARD_CSV_FIELDS,
+                                    extrasaction="ignore", restval="")
+            if fresh:
                 writer.writeheader()
                 for r in old_rows:
-                    writer.writerow(r)
-            writer.writerow({k: row.get(k, "") for k in header})
+                    writer.writerow({k: r.get(k, "") for k in DASHBOARD_CSV_FIELDS})
+            writer.writerow({k: row.get(k, "") for k in DASHBOARD_CSV_FIELDS})
     except OSError as e:
         print(f"  [警告] 寫入 CSV 失敗：{e}")
 

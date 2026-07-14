@@ -7,7 +7,7 @@
   - 查詢：device_control_scraper.py（唯讀）
 
 不修改 device_control_operator.py / device_control_scraper.py。
-token 與 LOGIN_PASSWORD_PAYLOAD 不完整輸出（僅遮罩，由被呼叫腳本負責）。
+登入與遮罩由 api_client 統一負責；本檔不輸出任何機密（token / 密碼 / 密文 / 公鑰）。
 
 使用方式：
     cd "D:\\Crawler Sample\\test"
@@ -17,6 +17,7 @@ token 與 LOGIN_PASSWORD_PAYLOAD 不完整輸出（僅遮罩，由被呼叫腳�
 import os
 import sys
 import json
+import time
 import subprocess
 
 try:
@@ -48,11 +49,30 @@ HIGH_RISK_ACTIONS = {
     "9": ("battery_power_on", "電池上電"),
     "10": ("battery_power_off", "電池下電"),
 }
-# PCS 功率控制（6/7 需功率；8 不需）
+# PCS 功率控制（6=放電 / 7=充電，皆需功率；8 不需）
+# ⚠️ 本站實測：activePowerSetPoint 正=放電、負=充電；operator 已對齊 action 名稱＝實際行為。
 PCS_POWER_ACTIONS = {
-    "6": ("pcs_charge", "PCS 充電", True),
-    "7": ("pcs_discharge", "PCS 放電", True),
+    "6": ("pcs_discharge", "PCS 放電", True),
+    "7": ("pcs_charge", "PCS 充電", True),
     "8": ("pcs_stop_power", "PCS 停止充放電", False),
+}
+
+# ---- 控制後等待驗證（設備約 0~60 秒才完成切換）----
+VERIFY_TIMEOUT = 60      # 最大等待秒數
+VERIFY_INTERVAL = 2      # 每幾秒 verify 一次
+# action → (status_summary 區塊, 欄位, 期望值需包含的字串)
+VERIFY_EXPECT = {
+    "pcs_manual_on":  ("PCS", "PCS手動模式開關", "已啟用"),
+    "pcs_manual_off": ("PCS", "PCS手動模式開關", "已停用"),
+    "battery_power_on":  ("電池", "電池上下電狀態", "已上電"),
+    "battery_power_off": ("電池", "電池上下電狀態", "已下電"),
+    "ac_on":  ("空調", "空調開關", "開"),
+    "ac_off": ("空調", "空調開關", "關"),
+    "vent_on":  ("進排風", "進排風執行狀態", "開啟"),
+    "vent_off": ("進排風", "進排風執行狀態", "停止"),
+    "cooling_on":  ("冷卻循環", "冷卻循環水泵狀態", "開啟"),
+    "cooling_off": ("冷卻循環", "冷卻循環水泵狀態", "關閉"),
+    # pcs_charge/discharge/stop：只讀來源無單一可靠回讀欄位（verify partial）→ 不做輪詢
 }
 
 MENU_TEXT = """
@@ -63,8 +83,8 @@ MENU_TEXT = """
 3. 空調開
 4. 空調關
 5. 查詢目前設備狀態
-6. PCS 充電
-7. PCS 放電
+6. PCS 放電
+7. PCS 充電
 8. PCS 停止充放電
 9. 電池上電
 10. 電池下電
@@ -77,14 +97,22 @@ MENU_TEXT = """
 """
 
 
-# ---- 顏色（開=藍 / 關=紅）----
+# ---- 顏色（開/開啟/已啟用/已上電=藍；關/關閉/已停用/已下電=紅）----
 BLUE = "\033[94m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
+# 只有在 TTY 且成功啟用 ANSI 時才上色；非 TTY / 不支援時退化成純文字。
+_USE_COLOR = False
+
 
 def _enable_ansi():
-    """Windows Terminal / CMD 啟用 ANSI 色碼。"""
+    """依 stdout 是否為 TTY 決定是否上色；Windows 另啟用 VT 色碼處理。"""
+    global _USE_COLOR
+    if not sys.stdout.isatty():
+        _USE_COLOR = False
+        return
+    _USE_COLOR = True
     if os.name == "nt":
         try:
             import ctypes
@@ -95,8 +123,10 @@ def _enable_ansi():
 
 
 def colorize(v):
-    """開/開啟/已啟用/已上電→藍；關/關閉/已停用/已下電→紅；其餘原色。"""
+    """開/開啟/已啟用/已上電→藍；關/關閉/已停用/已下電→紅；非 TTY 或其餘→純文字。"""
     s = str(v)
+    if not _USE_COLOR:
+        return s
     if s in ("開", "ON", "on", "true", "1") or "開啟" in s or "啟用" in s or "已上電" in s:
         return BLUE + s + RESET
     if s in ("關", "OFF", "off", "false", "0") or "關閉" in s or "已停用" in s or "已下電" in s:
@@ -187,6 +217,13 @@ def show_action_result():
     print("\n---------- 控制結果 ----------")
     print(f"action          = {data.get('action')}")
     print(f"dry_run         = {data.get('dry_run')}")
+    pc = data.get("precheck")
+    if pc:
+        state = pc.get("battery_power_state") or pc.get("battery_operation_state")
+        print(f"前置檢查        = 狀態={state} / "
+              f"allowed={pc.get('allowed')} / reason={pc.get('reason')}")
+    if data.get("blocked"):
+        print("狀態            = BLOCKED（前置檢查未通過，未送出控制）")
     if isinstance(cr, dict):
         if cr.get("error"):
             print(f"control_response= 例外 {cr.get('error')}")
@@ -229,6 +266,50 @@ def show_readonly_summary():
             print(f"  {label}：{value}")
 
 
+def refresh_status_silent():
+    """靜默執行唯讀 scraper 刷新狀態，回傳 status_summary（不印任何東西）。"""
+    try:
+        subprocess.run(
+            [sys.executable, "-X", "utf8", SCRAPER],
+            cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        return {}
+    return (_load_json(READONLY_RESULT) or {}).get("status_summary") or {}
+
+
+def wait_and_verify(action):
+    """
+    控制成功後等待設備完成（最多 VERIFY_TIMEOUT 秒），每 VERIFY_INTERVAL 秒 verify 一次；
+    成功立即結束，逾時印 Timeout 與最後狀態。保留 operator 既有 verify 判斷。
+    """
+    data = _load_json(ACTION_RESULT) or {}
+    if not data.get("control_success"):
+        print("（控制未成功送出，略過等待驗證）")
+        return
+    exp = VERIFY_EXPECT.get(action)
+    if not exp:
+        print("（控制已送出；此動作無明確狀態回讀欄位，略過輪詢，請參考上方 verify 結果）")
+        return
+    block, field, expected = exp
+    print("-" * 40)
+    print("控制指令已送出")
+    print("等待設備完成動作...")
+    print("-" * 40)
+    elapsed, last = 0, None
+    while elapsed < VERIFY_TIMEOUT:
+        time.sleep(VERIFY_INTERVAL)
+        elapsed += VERIFY_INTERVAL
+        status = refresh_status_silent()
+        val = (status.get(block) or {}).get(field)
+        last = val
+        if val is not None and expected in str(val):
+            print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 驗證成功 ✓ （{field}={val}）")
+            return
+        print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 驗證中...（目前 {field}={val}）")
+    print(f"Timeout：{VERIFY_TIMEOUT}s 內未達預期（{field} 應含「{expected}」，最後={last}）")
+
+
 def handle_choice(choice):
     """回傳 True 繼續、False 離開。"""
     if choice == "0":
@@ -240,6 +321,7 @@ def handle_choice(choice):
         action, label = MENU_ACTIONS[choice]
         rc = _run_script([OPERATOR, "--action", action, "--execute"], f"{label}（{action}）")
         show_action_result()
+        wait_and_verify(action)
         if rc != 0:
             print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
         return True
@@ -259,6 +341,7 @@ def handle_choice(choice):
             return True
         rc = _run_script([OPERATOR, "--action", action, "--execute", "--yes"], f"{label}（{action}）")
         show_action_result()
+        wait_and_verify(action)
         if rc != 0:
             print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
         return True
@@ -275,6 +358,7 @@ def handle_choice(choice):
             args += ["--power", str(p)]
         rc = _run_script(args, f"{label}（{action}）")
         show_action_result()
+        wait_and_verify(action)
         if rc != 0:
             print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
         return True
@@ -319,6 +403,8 @@ def _core_switch_fields(block, fields):
         if "排程開關狀態" in fields:                       # 僅智慧模式時 scraper 才會有此欄位
             out["PCS排程開關狀態"] = fields["排程開關狀態"]
     elif block == "電池":
+        # 依「最終格式」規範：儀表板電池區塊只顯示核心開關「電池上下電狀態」。
+        # （放電/充電/待機的「當前狀態」不在儀表板顯示，但仍用於 operator 的電池下電前置檢查。）
         out["電池上下電狀態"] = fields.get("電池上下電狀態", "暫無資料")
     elif block == "進排風":
         v = str(fields.get("進排風執行狀態", ""))

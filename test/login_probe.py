@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-一次性登入重放驗證（只做登入，不碰 device_control / 控制 API）。
+[DEPRECATED / DIAGNOSTIC 一次性工具] 密文重放登入驗證。
+⚠️ 正式流程已改為 SM2 即時加密（見 api_client.login_hmi）；本檔僅供舊版相容 / 緊急測試，
+   run_all.py 不會呼叫。password 由命令列原樣帶入（不加密），僅遮罩顯示、不打印完整值。
 用法：
     python login_probe.py "<前端實際送出的完整 password 長字串>"
-password 由命令列原樣帶入，程式不做任何加密 / encode / 截斷 / 替換。
 """
 import io
 import sys

@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+"""
+[DIAGNOSTIC 一次性診斷工具]（run_all.py 不會呼叫本檔）
+唯讀：讀取 output/device_control_readonly.json，摘要各唯讀端點是否有資料。
+"""
 import os
 import json
 
