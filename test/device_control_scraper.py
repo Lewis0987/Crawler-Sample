@@ -230,44 +230,74 @@ def parse_pcs_power_control_mode(raw):
     return "未知"
 
 
-def parse_pcs_current_status(pcs_raw):
+# PCS「當前狀態」badge 設定 —— 100% 複製前端 pcsMode_US.vue 的 He 陣列（本機為 US 品牌 shengHong）。
+# 固定順序；systemOnOrOffStatus 永遠顯示，其餘 5 個僅 oldValue=="1" 才顯示；顯示文字用該 mark 的中文 value。
+_PCS_STATUS_CONFIG = [
+    ("systemOnOrOffStatus", True),      # 永遠顯示（執行/停止…）
+    ("systemFaultStatus", False),       # 故障（oldValue=="1"）
+    ("systemGridTiedStatus", False),    # 併網（oldValue=="1"）
+    ("systemOffGridStatus", False),     # 離網（oldValue=="1"）
+    ("systemChargingStatus", False),    # 充電（oldValue=="1"）
+    ("systemDischargingStatus", False), # 放電（oldValue=="1"）
+]
+
+# guest PCS 端點（狀態 badge 來源），取中文 value 需帶 Accept-Language: zh-TW
+GUEST_PCS_PATH = READONLY_ENDPOINTS["guest_pcs"]
+PCS_STATUS_LANG_HEADER = {"Accept-Language": "zh-TW"}
+
+
+def parse_pcs_current_status(metrics):
     """
-    PCS 當前狀態：**直接對照 API 的 system*Status 狀態欄位值**（type.attr.desc.*），
-    對齊 HMI「當前狀態」；**不由 控制模式 / 功率 / 電流 / 電壓 / 排程 / 手動 推論**。
+    PCS 當前狀態 —— **100% 複製前端 pcsMode_US.vue 的渲染邏輯，不讀 systemStatus**。
 
-    來源（guest PCS `/hmiGuest/unauthorizedAccess/envCon/pcs`；欄位值本身即狀態描述）：
-      - systemFaultStatus / systemFailedStatus：非 normal/false → 故障
-      - systemChargingStatus    = ...charging     → 充電
-      - systemDischargingStatus = ...discharging  → 放電
-      - systemBootingStatus     = ...booting/true → 啟動中
-      - systemStandbyStatus     = ...standby      → 待機
-      - systemOnOrOffStatus     = ...stopping → 停止中；...stop/off/running → 待機
-        （對照 HMI：停機/運轉但無充放/故障/啟動時，HMI「當前狀態」顯示「待機」）
-    優先序：故障 > 充電 > 放電 > 啟動中 > 停止中 > 待機；皆無對應 → 未知。
-    （註：狀態欄位值為描述字（charging/standby…）而非 true/false，故直接依值對照。）
+    前端（US 品牌）以 He 設定陣列，依固定順序檢查 guest PCS 的 metricsDataVoList：
+      - systemOnOrOffStatus：alwaysDisplay，永遠顯示其 value
+      - systemFaultStatus / systemGridTiedStatus / systemOffGridStatus /
+        systemChargingStatus / systemDischargingStatus：oldValue=="1" 才顯示其 value
+    最後依上述順序用「 / 」串接。value 為中文（API 帶 Accept-Language: zh-TW）。
+    不補「正常」、不補「未知」、不固定段數、不改順序。
+
+    參數 metrics：guest PCS 的 metricsDataVoList（list[dict]，含 mark/value/oldValue）。
     """
-    raw = pcs_raw or {}
+    marks = {
+        item.get("mark"): item
+        for item in (metrics or [])
+        if isinstance(item, dict) and item.get("mark")
+    }
 
-    def suf(mark):
-        return str(raw.get(mark, "")).lower().rsplit(".", 1)[-1]
+    statuses = []
+    for mark, always_display in _PCS_STATUS_CONFIG:
+        item = marks.get(mark)
+        if not item:
+            continue
 
-    for mk in ("systemFaultStatus", "systemFailedStatus"):
-        s = suf(mk)
-        if s and s not in ("normal", "false"):
-            return "故障"
-    if suf("systemChargingStatus") == "charging":
-        return "充電"
-    if suf("systemDischargingStatus") == "discharging":
-        return "放電"
-    if suf("systemBootingStatus") in ("booting", "true"):
-        return "啟動中"
-    if suf("systemOnOrOffStatus") == "stopping":   # 明確「停止中」過渡態才顯示
-        return "停止中"
-    if suf("systemStandbyStatus") == "standby":
-        return "待機"
-    if suf("systemOnOrOffStatus") in ("stop", "off", "running", "run", "on"):
-        return "待機"   # 對照 HMI：停機/運轉且無充放/故障/啟動 → 待機
-    return "未知"
+        value = str(item.get("value") or "").strip()
+        old_value = str(item.get("oldValue") or "").strip()
+
+        if not value:
+            continue
+
+        if always_display or old_value == "1":
+            statuses.append(value)
+
+    return " / ".join(statuses)
+
+
+def _pcs_metrics_list(pcs_data):
+    """從 guest PCS 回傳（list[dev]）取第一台的 metricsDataVoList（list[dict]）。"""
+    if isinstance(pcs_data, list) and pcs_data and isinstance(pcs_data[0], dict):
+        return pcs_data[0].get("metricsDataVoList", []) or []
+    return []
+
+
+def fetch_pcs_status_data(client):
+    """以 Accept-Language: zh-TW 取 guest PCS（value 為中文），供 PCS當前狀態 badge 使用。回傳原始 list。"""
+    return client.get(GUEST_PCS_PATH, headers=PCS_STATUS_LANG_HEADER)
+
+
+def get_pcs_current_status(client):
+    """**唯一共用來源**：抓 zh-TW guest PCS → 以 parse_pcs_current_status 組出 PCS當前狀態字串。"""
+    return parse_pcs_current_status(_pcs_metrics_list(fetch_pcs_status_data(client)))
 
 
 def parse_pcs_grid_mode(pcs_raw):
@@ -326,8 +356,12 @@ def parse_pcs_modes(runmode, schedule, pcs_raw=None):
     }
 
 
-def parse_pcs(pcs_data, schedule, runmode):
-    """HMI 左側 [PCS] 區塊：狀態 / 控制模式 / 排程 / 電網模式 / 功率控制模式（各自獨立解析）。"""
+def parse_pcs(pcs_data, schedule, runmode, pcs_status_data=None):
+    """
+    HMI 左側 [PCS] 區塊：狀態 / 控制模式 / 排程 / 電網模式 / 功率控制模式（各自獨立解析）。
+    pcs_status_data：以 zh-TW 取得的 guest PCS 原始 list（供 PCS當前狀態 badge 用中文 value）；
+                     未提供時退回 pcs_data（值可能為 enum，非中文）。
+    """
     flat = _flatten_metrics(pcs_data) if pcs_data else {}
     raw = _pcs_raw(pcs_data)
     out = {}
@@ -345,8 +379,8 @@ def parse_pcs(pcs_data, schedule, runmode):
             parts.append(label)
     out["PCS狀態"] = " / ".join(parts) if parts else "暫無資料"
 
-    # PCS當前狀態：直接對照 API system*Status 狀態欄位（非由功率/模式推論）
-    out["PCS當前狀態"] = parse_pcs_current_status(raw)
+    # PCS當前狀態：100% 複製前端 pcsMode_US.vue，依 _PCS_STATUS_CONFIG 順序組 badge（中文 value）
+    out["PCS當前狀態"] = parse_pcs_current_status(_pcs_metrics_list(pcs_status_data or pcs_data))
 
     # 各狀態獨立解析（互不推導）；電網模式與功率控制模式為唯讀狀態，永遠顯示
     modes = parse_pcs_modes(runmode, schedule, raw)
@@ -489,7 +523,8 @@ def parse_others(bcu, manual_power, dodi):
 def summarize_status(rd):
     """整合各區塊為結構化狀態摘要。"""
     return {
-        "PCS": parse_pcs(rd.get("guest_pcs"), rd.get("getScheduleSwitch"), rd.get("getRunMode")),
+        "PCS": parse_pcs(rd.get("guest_pcs"), rd.get("getScheduleSwitch"), rd.get("getRunMode"),
+                         rd.get("guest_pcs_tw")),
         "電池": parse_battery(rd.get("overview_mainControl"), rd.get("getManuallyPowerState"),
                              rd.get("getDOAndDIMsg")),
         "空調": parse_air(rd.get("guest_air")),
@@ -516,28 +551,42 @@ def summarize_verify(vd):
     return out
 
 
-# console 不印出的欄位（僅影響顯示；JSON/解析完全不變）：
-#   - PCS狀態：與 PCS當前狀態 重複，console 只留 PCS當前狀態。
-#   - 電池內部 Debug 欄位（battery_power_* / current_power / current_state）：
-#     為除錯用原始值，與正式欄位（電池上下電狀態 / 當前狀態 / 當前功率）重複，正式畫面不顯示。
-_CONSOLE_HIDE_LABELS = {
-    "PCS狀態",
-    "battery_power_field", "battery_power_raw", "battery_power_mapped",
-    "current_power", "current_state",
+# ---- UI 顯示層（formatter）：console 只印 HMI UI 有的欄位；parser / JSON / CSV 不受影響 ----
+# 每區塊只保留 HMI 實際顯示欄位；raw/debug/parser 欄位（如 battery_power_* / current_*）不印，JSON 仍完整。
+_UI_FIELDS = {
+    "PCS": ["PCS當前狀態", "PCS控制模式", "PCS排程開關狀態", "PCS工作模式",
+            "PCS功率控制模式", "PCS手動模式開關"],
+    "電池": ["電池上下電狀態", "當前狀態", "當前SOC", "當前電壓", "當前電流", "當前功率",
+             "主正反饋", "主正", "主負反饋", "主負", "環流"],
+    "空調": ["空調開關", "空調目前狀態", "空調製冷設定", "空調製熱設定", "空調濕度設定",
+             "空調櫃內溫度", "空調櫃內濕度", "空調故障"],
+    # 進排風 / 冷卻循環：HMI 只顯示「開關」；由 parser 欄位導出（不印執行狀態/水泵/故障）
 }
 
 
+def _ui_view(section, fields):
+    """UI 顯示層：回傳該區塊 console 要印的欄位（依 HMI）；parser/JSON 原欄位不變。"""
+    fields = fields or {}
+    if section in _UI_FIELDS:
+        return {k: fields[k] for k in _UI_FIELDS[section] if k in fields}
+    if section == "進排風":                      # HMI 只有「進排風開關」（由執行狀態導出）
+        v = str(fields.get("進排風執行狀態", ""))
+        sw = "開啟" if ("開啟" in v or "運轉" in v) else ("關閉" if v else "暫無資料")
+        return {"進排風開關": sw}
+    if section == "冷卻循環":                     # HMI 只有「冷卻循環開關」
+        return {"冷卻循環開關": fields.get("冷卻循環水泵狀態")
+                or fields.get("冷卻循環執行狀態") or "暫無資料"}
+    return {k: v for k, v in fields.items() if not str(k).startswith("_")}
+
+
 def print_summary(logged_in, status):
-    """console 只印 [PCS][電池][空調][進排風][冷卻循環]；
-    【其他】(DO/DI 原始) 與【控制驗證端點】(verify 403) 僅存於 output JSON，不印。
-    另隱藏重複顯示欄位（_CONSOLE_HIDE_LABELS）；JSON 仍保留完整欄位。"""
+    """console 只印 [PCS][電池][空調][進排風][冷卻循環] 的「HMI UI 欄位」（經 _ui_view formatter）；
+    raw/debug 與【其他】(DO/DI) 與【控制驗證端點】(403) 僅存於 output JSON，不印。"""
     print("=" * 56)
     print(f"設備控制（只讀）｜登入：{'成功' if logged_in else '失敗/未登入'}")
     for section in ("PCS", "電池", "空調", "進排風", "冷卻循環"):
         print(f"\n[{section}]")
-        for label, value in status.get(section, {}).items():
-            if label.startswith("_") or label in _CONSOLE_HIDE_LABELS:
-                continue
+        for label, value in _ui_view(section, status.get(section, {})).items():
             print(f"  {label}：{value}")
 
 
@@ -557,6 +606,8 @@ def main():
     token = client.login_hmi(USERNAME)
 
     rd = _fetch(client, READONLY_ENDPOINTS)     # 狀態來源
+    # PCS當前狀態 badge 需中文 value → 另以 Accept-Language: zh-TW 再取一次 guest PCS
+    rd["guest_pcs_tw"] = fetch_pcs_status_data(client)
     vd = _fetch(client, VERIFY_ENDPOINTS)       # 控制驗證端點（authed，可能 403）
 
     status = summarize_status(rd)

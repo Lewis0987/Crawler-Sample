@@ -22,6 +22,8 @@ from device_control_scraper import (
 
 _F = "type.attr.desc.false"
 _NORMAL = "type.attr.desc.normal"
+_GT = {"systemGridTiedStatus": "type.attr.desc.gridTied", "systemOffGridStatus": _F}  # 併網
+_OFF = {"systemOffGridStatus": "type.attr.desc.true"}                                  # 離網
 
 
 def display(modes):
@@ -120,36 +122,50 @@ def main():
         results.append(got == exp)
         print(f"  {mark} {str(raw):70s} → {got}（expect {exp}）")
 
-    # parse_pcs_current_status（直接對照 API system*Status 欄位值，不推論）
+    # parse_pcs_current_status（100% 複製前端 pcsMode_US.vue 的 He 組合邏輯）
+    #   固定順序：systemOnOrOffStatus[永遠] / systemFaultStatus / systemGridTiedStatus /
+    #             systemOffGridStatus / systemChargingStatus / systemDischargingStatus[oldValue=="1"]
+    #   顯示文字用該 mark 的中文 value，以「 / 」串接。
     print("=" * 60)
-    print("parse_pcs_current_status 欄位級（直接對照 API 狀態欄位值）：")
-    _base = {"systemStandbyStatus": _F, "systemChargingStatus": _F, "systemDischargingStatus": _F,
-             "systemBootingStatus": _F, "systemFaultStatus": _NORMAL, "systemFailedStatus": _NORMAL}
+    print("parse_pcs_current_status（前端 pcsMode_US He 組合：value + oldValue）：")
+
+    def M(mark, value, old="0"):
+        return {"mark": mark, "value": value, "oldValue": old}
+
     cs_cases = [
-        ({**_base, "systemStandbyStatus": "type.attr.desc.standby"}, "待機"),
-        ({**_base, "systemChargingStatus": "type.attr.desc.charging"}, "充電"),
-        ({**_base, "systemDischargingStatus": "type.attr.desc.discharging"}, "放電"),
-        ({**_base, "systemBootingStatus": "type.attr.desc.booting"}, "啟動中"),
-        ({**_base, "systemFaultStatus": "type.attr.desc.fault"}, "故障"),
-        ({**_base, "systemOnOrOffStatus": "type.attr.desc.stopping"}, "停止中"),
-        ({**_base, "systemOnOrOffStatus": "type.attr.desc.stop"}, "待機"),      # 停機/在網待命 → 對照 HMI 待機
-        ({**_base, "systemOnOrOffStatus": "type.attr.desc.running"}, "待機"),
-        # 實機實測：充電中（systemChargingStatus=charging、systemOnOrOffStatus=running）→ 充電（非停止中）
-        ({**_base, "systemChargingStatus": "type.attr.desc.charging",
-          "systemOnOrOffStatus": "type.attr.desc.running"}, "充電"),
-        ({}, "未知"),
-        # 關鍵：工作模式=併網、功率控制模式=交流有功，但狀態欄位為 standby → 待機（不推論成充電）
-        ({**_base, "systemStandbyStatus": "type.attr.desc.standby",
-          "systemGridTiedStatus": "type.attr.desc.gridTied",
-          "energyDispatchingMode": "type.attr.desc.ac"}, "待機"),
+        # 執行 + 併網 + 充電（gridTied/charging oldValue=1）
+        ([M("systemOnOrOffStatus", "執行"), M("systemGridTiedStatus", "併網", "1"),
+          M("systemChargingStatus", "充電", "1")], "執行 / 併網 / 充電"),
+        # 停止 + 故障 + 離網
+        ([M("systemOnOrOffStatus", "停止"), M("systemFaultStatus", "故障", "1"),
+          M("systemOffGridStatus", "離網", "1")], "停止 / 故障 / 離網"),
+        # 待機 + 離網（只有 onOff 與 offGrid）
+        ([M("systemOnOrOffStatus", "待機"), M("systemOffGridStatus", "離網", "1")], "待機 / 離網"),
+        # 目前實機：停止 + 併網（onOff always；grid oldValue=1；其餘 0）
+        ([M("systemOnOrOffStatus", "停止"), M("systemFaultStatus", "正常", "0"),
+          M("systemGridTiedStatus", "併網", "1"), M("systemOffGridStatus", "否", "0"),
+          M("systemChargingStatus", "否", "0"), M("systemDischargingStatus", "否", "0")], "停止 / 併網"),
+        # systemOnOrOffStatus 永遠顯示（即使 oldValue!=1）
+        ([M("systemOnOrOffStatus", "執行", "0")], "執行"),
+        # 其餘 5 欄 oldValue!=1 一律不顯示（不補「正常/未知」）
+        ([M("systemOnOrOffStatus", "停止"), M("systemFaultStatus", "正常", "0"),
+          M("systemGridTiedStatus", "併網", "0")], "停止"),
+        # 順序固定：charging(第5) 在 discharging(第6) 前，且 gridTied(第3) 在 charging 前
+        ([M("systemDischargingStatus", "放電", "1"), M("systemChargingStatus", "充電", "1"),
+          M("systemGridTiedStatus", "併網", "1"), M("systemOnOrOffStatus", "執行")],
+         "執行 / 併網 / 充電 / 放電"),
+        # onOff 缺失則略過該段（不補預設），只顯示其餘符合者
+        ([M("systemGridTiedStatus", "併網", "1")], "併網"),
+        # value 空字串 → 該段略過
+        ([M("systemOnOrOffStatus", "  ", "0"), M("systemGridTiedStatus", "併網", "1")], "併網"),
+        # 完全無資料 → 空字串
+        ([], ""),
     ]
-    for raw, exp in cs_cases:
-        got = parse_pcs_current_status(raw)
+    for metrics, exp in cs_cases:
+        got = parse_pcs_current_status(metrics)
         mark = "✓" if got == exp else "✗"
         results.append(got == exp)
-        active = ",".join(f"{k}={str(v).rsplit('.',1)[-1]}" for k, v in raw.items()
-                          if str(v).rsplit('.', 1)[-1] not in ("false", "normal")) or "(全空/false)"
-        print(f"  {mark} {active:66s} → {got}（expect {exp}）")
+        print(f"  {mark} → {got!r}（expect {exp!r}）")
 
     print("=" * 60)
     print(f"結果：{sum(1 for r in results if r)}/{len(results)} PASS")

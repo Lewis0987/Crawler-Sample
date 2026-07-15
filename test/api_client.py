@@ -242,14 +242,15 @@ class ApiClient:
         self.logged_in = False
 
     # ---------- 只讀 GET ----------
-    def get(self, path, params=None, unwrap_envelope=True):
+    def get(self, path, params=None, unwrap_envelope=True, headers=None):
         """
         GET 一支 API。成功回傳（預設解封包後的）資料；失敗回傳 None 並印警告。
         path 可為 "/hmiGuest/..." 或 "/system/..."（會接在 base_url 後）。
+        headers：本次請求額外標頭（如 {"Accept-Language": "zh-TW"} 取中文化 value），不影響其他請求。
         """
         url = self.base_url + path
         try:
-            resp = self.session.get(url, params=params, timeout=self.timeout)
+            resp = self.session.get(url, params=params, timeout=self.timeout, headers=headers)
             resp.raise_for_status()
             data = resp.json()
         except requests.exceptions.RequestException as e:

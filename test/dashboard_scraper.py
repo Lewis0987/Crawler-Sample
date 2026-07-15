@@ -32,6 +32,8 @@ from datetime import datetime
 
 import requests
 
+from api_client import ApiClient  # PCS控制模式(手動/智慧) 需 getRunMode（authed）→ 需登入
+
 
 # ======================================================================
 # 設定區
@@ -69,6 +71,9 @@ ENDPOINTS = {
     "環控_串口ttyS0": "/hmiGuest/unauthorizedAccess/envCon/ttyS0",
     "多功能傳感器":   "/hmiGuest/unauthorizedAccess/envCon/multifunction",
     "AC380電量儀":    "/hmiGuest/unauthorizedAccess/envCon/voltameter",
+    # 二b、PCS 控制模式（手動/智慧）與排程狀態（需登入的 /client、/schedule 端點）
+    "getRunMode":       "/client/dynamic/dataOrControl/pcs/getRunMode",
+    "getScheduleSwitch": "/schedule/config/getScheduleSwitch",
     # 四、告警資訊
     "告警資訊":       ("/hmiGuest/unauthorizedAccess/alarm/list", {"pageNo": 1, "pageSize": ALARM_PAGE_SIZE}),
 }
@@ -135,6 +140,33 @@ PCS_GROUPS = {
         "母線頻率":  "acBusFrequency",         # Hz
     },
 }
+
+# ---- AC380 電量儀（envCon/voltameter）mark → 中文欄位（對齊 HMI「AC 380 電量儀」）----
+# 依 mark 對照，不用 index；未列於此表的 mark 仍以原名保留（不遺漏）。
+AC380_FIELDS = {
+    "phaseVoltageAB": "相電壓AB", "phaseVoltageBC": "相電壓BC", "phaseVoltageCA": "相電壓CA",
+    "phaseCurrentA": "相電流A", "phaseCurrentB": "相電流B", "phaseCurrentC": "相電流C",
+    "activePowerA": "A相有功功率", "activePowerB": "B相有功功率", "activePowerC": "C相有功功率",
+    "totalActivePower": "總有功功率",
+    "reactivePowerA": "A相無功功率", "reactivePowerB": "B相無功功率", "reactivePowerC": "C相無功功率",
+    "totalReactivePower": "總無功功率",
+    "apparentPowerA": "A相視在功率", "apparentPowerB": "B相視在功率", "apparentPowerC": "C相視在功率",
+    "totalApparentPower": "總視在功率",
+    "powerFactorA": "A相功率因數", "powerFactorB": "B相功率因數", "powerFactorC": "C相功率因數",
+    "totalPowerFactor": "總功率因數",
+}
+
+# ---- UI 顯示層（formatter）：console 只印 UI 有的欄位；parser 與 JSON 保留完整 ----
+# AC380 電量儀 UI 只顯示相電壓/相電流（HMI 卡片欄位）；功率/功率因數保留在 parser/JSON、console 不印。
+AC380_UI_FIELDS = ["相電壓AB", "相電壓BC", "相電壓CA", "相電流A", "相電流B", "相電流C"]
+
+
+def ui_filter(summary, whitelist):
+    """UI formatter：只保留 whitelist 內且存在的欄位（保序）。parser/JSON 不受影響。"""
+    if not isinstance(summary, dict):
+        return summary
+    return {k: summary[k] for k in whitelist if k in summary}
+
 
 # ---- dashboard_data.csv 固定欄位（只保留 Dashboard 概覽卡片欄位；順序固定）----
 # 由 curated 定義自動組出：電池概覽 / PCS概覽(4組) / 環控空調概覽 / 告警摘要。
@@ -267,25 +299,28 @@ def _fmt_metric(md, decimals=None):
     return f"{value} {unit}" if unit else f"{value}"
 
 
-# ---------------- 抓取（requests / 只用 GET）----------------
-def get_data_by_api():
-    """逐一 GET 所有 Data Overview 區塊，單支失敗不中斷，回傳 dict。"""
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json, text/plain, */*"})
+# ---------------- 抓取（api_client / 只用 GET）----------------
+USERNAME = "hmiUser"
+_client = None
 
+
+def _get_client():
+    """建立並快取已登入的 ApiClient（輪詢時只登入一次）。"""
+    global _client
+    if _client is None:
+        _client = ApiClient()
+        _client.login_hmi(USERNAME)   # getRunMode/getScheduleSwitch 需登入
+    return _client
+
+
+def get_data_by_api():
+    """逐一 GET 所有 Data Overview 區塊（含 authed getRunMode/getScheduleSwitch）；
+    共用 api_client 的登入與封包解封（code 0/200 → data），單支失敗回 None。"""
+    client = _get_client()
     result = {}
     for name, spec in ENDPOINTS.items():
         path, params = spec if isinstance(spec, tuple) else (spec, None)
-        try:
-            resp = session.get(BASE_URL + path, params=params, timeout=TIMEOUT)
-            resp.raise_for_status()
-            result[name] = _unwrap(resp.json())
-        except requests.exceptions.RequestException as e:
-            print(f"  [警告] 抓取「{name}」失敗：{e}")
-            result[name] = None
-        except ValueError:
-            print(f"  [警告]「{name}」回傳非 JSON")
-            result[name] = None
+        result[name] = client.get(path, params=params)   # client.get 已解封包、失敗回 None
     return result
 
 
@@ -324,6 +359,32 @@ def summarize_pcs(data):
     return grouped
 
 
+def pcs_mode_view(pcs_data, runmode, schedule):
+    """
+    PCS 概覽（UI 顯示層）：只回 HMI 有的 4 個模式欄位，與 dashboard_min 完全一致。
+    共用 device_control_scraper 的解析（延遲 import 以避開模組循環），故兩支 dashboard 結果相同。
+      PCS當前狀態（100% 複製前端 pcsMode_US.vue：依 systemOnOrOffStatus[永遠]/fault/gridTied/offGrid/
+                   charging/discharging[oldValue=="1"] 順序，用中文 value 以「 / 」串接）
+      PCS控制模式（手動/智慧）  PCS工作模式（併網/離網）  PCS功率控制模式
+    無資料回傳 None。
+    """
+    if pcs_data is None or (isinstance(pcs_data, dict) and pcs_data.get("_error")):
+        return None
+    from device_control_scraper import (
+        parse_pcs_modes, get_pcs_current_status, _pcs_raw,
+        _CONTROL_MODE_DISPLAY, _GRID_MODE_DISPLAY,
+    )
+    raw = _pcs_raw(pcs_data)
+    modes = parse_pcs_modes(runmode, schedule, raw)
+    return {
+        # PCS當前狀態走唯一共用來源（zh-TW guest PCS → parse_pcs_current_status）
+        "PCS當前狀態":     get_pcs_current_status(_get_client()),
+        "PCS控制模式":     _CONTROL_MODE_DISPLAY[modes["control_mode"]],
+        "PCS工作模式":     _GRID_MODE_DISPLAY[modes["grid_mode"]],
+        "PCS功率控制模式": modes["power_control_mode"],
+    }
+
+
 def summarize_env(data):
     """整理環控-空調重要欄位（curated）；無資料回傳 None。"""
     if data is None or (isinstance(data, dict) and data.get("_error")):
@@ -360,6 +421,28 @@ def summarize_generic(data):
             out[k] = f"{v} {unit}" if unit else v
         return out or None
     return None
+
+
+def summarize_voltameter(data):
+    """
+    AC380 電量儀（envCon/voltameter）共用解析：依 mark 對照中文欄位（AC380_FIELDS，對齊 HMI），
+    **依 mark 取值、非 index**；未列於對照表的 mark 以原名保留（不遺漏）。
+    缺值不誤轉 0：欄位不存在就不輸出該行（_flatten_metrics 只帶回實際回傳的 mark）。
+    只有 1 台電量儀（deviceId 固定），_flatten_metrics 取其 metricsDataVoList。
+    """
+    if data is None or (isinstance(data, dict) and data.get("_error")):
+        return None
+    metrics = _flatten_metrics(data)
+    if not metrics:
+        return None
+    out = {}
+    for mark, label in AC380_FIELDS.items():      # 先照 HMI 欄位順序（依 mark）
+        if mark in metrics:
+            out[label] = _fmt_metric(metrics[mark])
+    for mark, md in metrics.items():              # 其餘未對照的 mark 保留原名，避免遺漏
+        if mark not in AC380_FIELDS:
+            out[mark] = _fmt_metric(md)
+    return out or None
 
 
 def summarize_alarm(data):
@@ -415,34 +498,26 @@ def print_summary(record):
     print("=" * 56)
     print(f"時間：{record['timestamp']}")
 
+    # UI 顯示層（formatter）：console 只印 HMI UI 有的區塊/欄位；完整資料仍在 dashboard_data.json。
+    # Rack容量/Rack極端值、水系統、UPS、串口ttyS0、多功能傳感器 為 raw mark（非 HMI UI 格式）→ console 不印。
+
     # 一、電池概覽
     print("\n【一、電池概覽】")
     print("  ● 主資訊")
     _print_kv(summarize_battery(data.get("電池概覽")), indent="      ")
-    print("  ● Rack 容量資訊")
-    _print_kv(summarize_generic(data.get("Rack容量資訊")), indent="      ")
-    print("  ● Rack 極端值資訊")
-    _print_kv(summarize_generic(data.get("Rack極端值資訊")), indent="      ")
 
-    # 二、PCS 概覽
+    # 二、PCS 概覽（UI：當前狀態/控制模式/工作模式/功率控制模式；不印 4 群組 raw、不印故障狀態）
     print("\n【二、PCS概覽】")
-    pcs = summarize_pcs(data.get("PCS概覽"))
-    if not pcs:
-        print("    無資料")
-    else:
-        for group, fields in pcs.items():
-            print(f"  ● {group}")
-            _print_kv(fields, indent="      ")
+    _print_kv(pcs_mode_view(data.get("PCS概覽"), data.get("getRunMode"), data.get("getScheduleSwitch")),
+              indent="  ")
 
-    # 三、環控概覽
+    # 三、環控概覽（空調 + AC380 電量儀；其餘 raw 區塊 console 不印，JSON 保留）
     print("\n【三、環控概覽】")
     print("  ● 空調")
     _print_kv(summarize_env(data.get("環控_空調")), indent="      ")
-    for card, block in (("水冷/水系統", "環控_水系統"), ("UPS", "環控_UPS"),
-                        ("串口 ttyS0", "環控_串口ttyS0"), ("多功能傳感器", "多功能傳感器"),
-                        ("AC380 電量儀", "AC380電量儀")):
-        print(f"  ● {card}")
-        _print_kv(summarize_generic(data.get(block)), indent="      ")
+    # AC380 電量儀：UI 只印相電壓/相電流（formatter）；完整資料仍在 parser/JSON
+    print("  ● AC380 電量儀")
+    _print_kv(ui_filter(summarize_voltameter(data.get("AC380電量儀")), AC380_UI_FIELDS), indent="      ")
 
     # 四、告警資訊
     print("\n【四、告警資訊】")

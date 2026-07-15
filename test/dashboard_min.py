@@ -23,10 +23,19 @@ from datetime import datetime
 
 import requests
 
+from api_client import ApiClient
+# 與 dashboard_scraper 共用同一組 formatter / parser（避免兩支 dashboard 顯示不同）：
+#   - PCS 概覽（4 個 UI 模式欄位）：dashboard_scraper.pcs_mode_view
+#   - AC380 電量儀：dashboard_scraper.summarize_voltameter + ui_filter + AC380_UI_FIELDS
+from dashboard_scraper import summarize_voltameter, ui_filter, AC380_UI_FIELDS, pcs_mode_view
+
 
 # ============ 設定區（要改就改這裡） ============
 BASE_URL = "http://192.168.128.110:8080/admin-api"   # 如 8853 有代理可改成 :8853
 TIMEOUT = 8                  # 單支逾時秒數
+USERNAME = "hmiUser"
+# 註：PCS控制模式（手動/智慧）來自 getRunMode（需登入的 /client/dynamic 端點），
+#     故本版改用 api_client 登入後抓取；其餘 guest 端點仍可讀。
 # 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
@@ -36,7 +45,11 @@ JSON_PATH = os.path.join(_OUTPUT_DIR, "dashboard_min.json")  # 把 API 回傳資
 ENDPOINTS = {
     "電池概覽": "/hmiGuest/unauthorizedAccess/overview/mainControlCollectsInformation",
     "PCS概覽":  "/hmiGuest/unauthorizedAccess/envCon/pcs",
+    "AC380電量儀": "/hmiGuest/unauthorizedAccess/envCon/voltameter",   # AC380 電量儀（相電壓/相電流/功率）
     "環控概覽": "/hmiGuest/unauthorizedAccess/envCon/air",   # TODO: 環控可能還含 water/ups/ttyS0，待確認哪個對應畫面主區塊
+    # 以下為 PCS 控制模式（手動/智慧）與排程狀態，屬需登入的 /client、/schedule 端點
+    "getRunMode": "/client/dynamic/dataOrControl/pcs/getRunMode",
+    "getScheduleSwitch": "/schedule/config/getScheduleSwitch",
     # 告警先只抓 3 筆。TODO: 分頁參數名稱尚未 100% 確認，先用 yudao 常見的 pageNo/pageSize
     "告警資訊": ("/hmiGuest/unauthorizedAccess/alarm/list", {"pageNo": 1, "pageSize": 3}),
 }
@@ -58,23 +71,9 @@ ENV_FIELDS = {
     "櫃內溫度": "cabinetTemperature",
     "櫃內濕度": "cabinetHumidity",
 }
-# PCS 概覽欄位（envCon/pcs 回傳 list，內含 metricsDataVoList，以 mark 對應；皆依實際 JSON 確認）
-# 顯示順序即 dict 順序；標題為畫面用中文，值取自對應 mark。
-PCS_FIELDS = {
-    "啟停狀態":       "systemOnOrOffStatus",       # 值 running/stop
-    "併網/離網模式":  "systemGridTiedStatus",       # 值 gridTied/false（併網/否）
-    "工作模式":       "controlMode",                # 最接近：控制模式 remote/local/auto
-    "故障狀態":       "systemFaultStatus",
-    "告警狀態":       "systemAlarmStatus",
-    "交流總有功功率": "totalActivePowerOfAcBus",     # 單位 kW
-    "母線頻率":       "acBusFrequency",             # 單位 Hz
-    "櫃內溫度":       "cabinetTemperature",         # 單位 ℃
-}
-# 指定欄位固定小數位（其餘保留原值）
-PCS_DECIMALS = {
-    "交流總有功功率": 2,     # 例：-1.20 kW
-    "母線頻率":       2,     # 例：60.00 Hz
-}
+# PCS 其餘量測欄位（envCon/pcs 的 metricsDataVoList，以 mark 對應）。
+# PCS 概覽改用共用 dashboard_scraper.pcs_mode_view（只印 4 個 HMI 模式欄位）；
+# 故障狀態/告警/功率/頻率/溫度等不在 HMI PCS 卡片 → console 不印（JSON 仍完整）。
 
 # i18n 狀態值中文對照（value 為 type.attr.* 這類 key 時翻譯；查不到就保留原字串）
 STATUS_MAP = {
@@ -148,23 +147,14 @@ def _zh(value):
 
 
 def get_data_by_api():
-    """逐一 GET 四大區塊，單支失敗不中斷，回傳 dict。"""
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json, text/plain, */*"})
-
+    """登入後逐一 GET 各區塊（含需登入的 getRunMode/getScheduleSwitch），單支失敗不中斷。
+    共用 api_client 的登入與封包解封（code 0/200 → data）。"""
+    client = ApiClient()
+    client.login_hmi(USERNAME)   # getRunMode/getScheduleSwitch 屬 authed 端點，需登入
     result = {}
     for name, spec in ENDPOINTS.items():
         path, params = spec if isinstance(spec, tuple) else (spec, None)
-        try:
-            resp = session.get(BASE_URL + path, params=params, timeout=TIMEOUT)
-            resp.raise_for_status()
-            result[name] = _unwrap(resp.json())
-        except requests.exceptions.RequestException as e:
-            print(f"  [警告] 抓取「{name}」失敗：{e}")
-            result[name] = None
-        except ValueError:
-            print(f"  [警告]「{name}」回傳非 JSON")
-            result[name] = None
+        result[name] = client.get(path, params=params)   # client.get 已解封包、失敗回 None
     return result
 
 
@@ -236,15 +226,7 @@ def summarize_env(data):
     return {label: _fmt_metric(metrics.get(mark)) for label, mark in ENV_FIELDS.items()}
 
 
-def summarize_pcs(data):
-    """整理 PCS 概覽重要欄位（與環控共用 metricsDataVoList 攤平）；無資料回傳 None。"""
-    if data is None or (isinstance(data, dict) and data.get("_error")):
-        return None
-    metrics = _flatten_metrics(data)
-    if not metrics:
-        return None
-    return {label: _fmt_metric(metrics.get(mark), PCS_DECIMALS.get(label))
-            for label, mark in PCS_FIELDS.items()}
+# PCS 概覽改用共用 dashboard_scraper.pcs_mode_view（見 print_summary），此處不再自訂 summarize_pcs。
 
 
 def summarize_alarm(data):
@@ -307,12 +289,20 @@ def print_summary(record):
     else:
         print("  無資料")
 
-    # PCS 概覽
+    # PCS 概覽（控制/工作/功率控制模式用共用 parse_pcs_modes）
     print("\n【PCS概覽】")
-    pcs = summarize_pcs(data.get("PCS概覽"))
+    pcs = pcs_mode_view(data.get("PCS概覽"), data.get("getRunMode"), data.get("getScheduleSwitch"))
     if pcs:
-        print("  有資料")
         for k, v in pcs.items():
+            print(f"    {k}: {v}")
+    else:
+        print("  無資料")
+
+    # AC380 電量儀（共用 summarize_voltameter；UI formatter 只印相電壓/相電流）
+    print("\n【AC380電量儀】")
+    vm = ui_filter(summarize_voltameter(data.get("AC380電量儀")), AC380_UI_FIELDS)
+    if vm:
+        for k, v in vm.items():
             print(f"    {k}: {v}")
     else:
         print("  無資料")
