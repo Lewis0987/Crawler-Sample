@@ -278,7 +278,8 @@ def _flatten_metrics(data):
             mark = m.get("mark")
             if not mark:
                 continue
-            flat[mark] = {"value": _zh(m.get("value", "")), "unit": m.get("unit")}
+            flat[mark] = {"value": _zh(m.get("value", "")), "unit": m.get("unit"),
+                          "oldValue": m.get("oldValue")}   # oldValue 保留原樣（開關/旗標判斷用）
     return flat
 
 

@@ -443,9 +443,14 @@ def parse_air(air_data):
     if not flat:
         return {"空調狀態": "暫無資料"}
     out = {}
-    ews = _v(flat, "equipmentWorkingStatus")
-    if ews is not None:
-        out["空調開關"] = "開" if ews in ("運轉中", "type.attr.run", "run") else "關"
+
+    # 空調開關：唯一以 indoorFanStatus.oldValue 判定（0→關 / 非0→開），對齊前端 airMode.vue 開關 d.value。
+    # 實測確認：關/開時 indoorFanStatus 會確實翻轉（OFF≈5s、ON≈9s）；equipmentWorkingStatus/compressorStatus
+    # 在開關當下不變動，故不可用（此為先前「關機後仍判定開」誤判的根因）。
+    fan_old = (flat.get("indoorFanStatus") or {}).get("oldValue")
+    if fan_old is not None:
+        out["空調開關"] = "關" if str(fan_old) == "0" else "開"
+
     if _v(flat, "workingMode") is not None:
         out["空調目前狀態"] = str(_v(flat, "workingMode"))
     for label, mk in (("空調製冷設定", "coolingSetTemperature"),

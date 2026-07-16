@@ -79,10 +79,12 @@ _POLL_INTERVAL_SEC = 4
 
 # ---- action 定義（payload 皆由前端 DevTools 實抓；未列出的一律不支援）----
 ACTIONS = {
+    # 前端 airMode.vue：開機 → {command:1, commandValue:1}；關機 → {command:1, commandValue:0}
+    # （原本兩者寫反，導致「空調開」實際送關、「空調關」實際送開）
     "ac_on":  {"method": "POST", "endpoint": _AC_EP,
-               "payload": {"command": 1, "commandValue": 0}, "kind": "ac"},
-    "ac_off": {"method": "POST", "endpoint": _AC_EP,
                "payload": {"command": 1, "commandValue": 1}, "kind": "ac"},
+    "ac_off": {"method": "POST", "endpoint": _AC_EP,
+               "payload": {"command": 1, "commandValue": 0}, "kind": "ac"},
 
     "pcs_manual_on":  {"method": "PUT", "endpoint": _MANUAL_EP,
                        "payload": {"schedulePlanSwitchId": 1, "schedulePlanSwitch": 0, "manualModeSwitch": 1},
@@ -266,18 +268,6 @@ def _read(client, path):
     return client.get(path)
 
 
-def _flatten_air(data):
-    """空調 guest/air 回傳 list → {mark: value(+unit)}。"""
-    out = {}
-    if isinstance(data, list) and data:
-        for it in data[0].get("metricsDataVoList", []):
-            mk = it.get("mark")
-            if mk:
-                v, u = it.get("value"), it.get("unit")
-                out[mk] = f"{v} {u}".strip() if v is not None else None
-    return out
-
-
 def _poll_battery(client, expect_bool):
     """
     電池上下電：對『主正/主負接觸器反饋』(getDOAndDIMsg) 輪詢，最多 60 秒、每 ~4 秒一次。
@@ -362,18 +352,22 @@ def build_verify(client, action, spec, executed, power=None):
         air = _read(client, _V_AIR)
         verify["raw"] = {"air": air}
         if isinstance(air, dict) and air.get("_error"):
-            verify["values"] = {"equipmentWorkingStatus": "unknown", "workingMode": "unknown",
-                                "coolingSetTemperature": "unknown", "heatingSetTemperature": "unknown",
-                                "setHumidity": "unknown"}
+            verify["values"] = {"空調開關": "unknown"}
             verify["final_verify_status"] = "partial"
             warnings.append(f"空調 verify({_V_AIR}) 回 {air.get('_error')} {air.get('msg')}，無法確認實際狀態")
             return verify, "partial", warnings
-        flat = _flatten_air(air)
-        verify["values"] = {k: flat.get(k, "unknown") for k in
-                            ("equipmentWorkingStatus", "workingMode", "coolingSetTemperature",
-                             "heatingSetTemperature", "setHumidity", "cabinetTemperature", "cabinetHumidity")}
+        # 空調開關唯一依 indoorFanStatus.oldValue（與 device_control_scraper.parse_air 同一套 mapping）
+        fan_old = None
+        if isinstance(air, list) and air:
+            for it in air[0].get("metricsDataVoList", []):
+                if it.get("mark") == "indoorFanStatus":
+                    fan_old = str(it.get("oldValue"))
+                    break
+        switch = ("關" if fan_old == "0" else "開") if fan_old is not None else "unknown"
+        verify["values"] = {"空調開關": switch, "indoorFanStatus.oldValue": fan_old}
         verify["final_verify_status"] = "readable"
-        return verify, "partial", warnings  # 可讀但未主張 on/off，視為 partial
+        # 單次讀取、未輪詢（空調翻轉約 5~9s），不主張成敗；由 device_control_menu 即時輪詢驗證
+        return verify, "partial", warnings
 
     if kind == "vent":
         # 目前無明確 verify API，狀態顯示 unknown/partial，不讓程式失敗
@@ -519,22 +513,13 @@ def _battery_off_precheck(client, logged_in, action):
     return {"battery_operation_state": "unknown", "allowed": False, "reason": "battery_state_unknown"}
 
 
-def run(action, execute, power=None, assume_yes=False):
+def run(action, execute, power=None, assume_yes=False, no_verify=False):
     spec = ACTIONS[action]
     endpoint, method, kind = spec["endpoint"], spec["method"], spec["kind"]
     payload = _resolve_payload(action, spec, power)
     _assert_control_allowed(endpoint)
 
     warnings = []
-
-    print("=" * 60)
-    print(f"action      : {action}  (kind={kind})")
-    print(f"mode        : {'EXECUTE（真的送出）' if execute else 'DRY-RUN（不送出）'}")
-    print(f"control_req : {method} {endpoint}")
-    print(f"payload     : {json.dumps(payload, ensure_ascii=False)}")
-    if power is not None:
-        _u = PCS_CONTROL_MODES[spec["pcs_mode"]]["unit"] if spec.get("pcs_mode") else "kW"
-        print(f"value       : {power} {_u}")
 
     client = ApiClient()
     token = client.login_hmi(USERNAME)
@@ -602,7 +587,10 @@ def run(action, execute, power=None, assume_yes=False):
             print(f"control_resp: 例外 {e}（不重試）")
 
     # 回讀驗證（executed=是否真的送出控制）
-    if logged_in:
+    if no_verify:
+        # 送出即返回，不做內部回讀輪詢（由呼叫端如 device_control_menu 即時輪詢驗證）
+        verify, verify_success = {"kind": kind, "values": {}, "note": "verify skipped (--no-verify)"}, None
+    elif logged_in:
         verify, verify_success, vwarn = build_verify(
             client, action, spec, executed=do_send and control_success is True, power=power)
         warnings.extend(vwarn)
@@ -637,27 +625,48 @@ def run(action, execute, power=None, assume_yes=False):
         "auth": {"token_masked": mask_secret(token) if token else None},
     }
 
+    write_err = None
     try:
         with open(RESULT_PATH, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
-        print(f"\n結果已寫入：{RESULT_PATH}")
     except OSError as e:
-        print(f"[警告] 寫入結果失敗：{e}")
+        write_err = str(e)
 
-    # 摘要
-    print("-" * 60)
-    print("[verify]")
+    # 控制詳細資訊：一律置於「活動（登入/送出/回讀）」之後才顯示，維持「動作在上、細節在下」。
+    print("\n================ 控制詳細資訊 ================")
+    print(f"action          : {action}  (kind={kind})")
+    print(f"mode            : {'EXECUTE（真的送出）' if execute else 'DRY-RUN（不送出）'}")
+    print(f"control_req     : {method} {endpoint}")
+    print(f"payload         : {json.dumps(payload, ensure_ascii=False)}")
+    if power is not None:
+        _u = PCS_CONTROL_MODES[spec["pcs_mode"]]["unit"] if spec.get("pcs_mode") else "kW"
+        print(f"value           : {power} {_u}")
+    if precheck:
+        state = precheck.get("battery_power_state") or precheck.get("battery_operation_state")
+        print(f"precheck        : 狀態={state} / allowed={precheck.get('allowed')} / reason={precheck.get('reason')}")
+    if blocked:
+        print("control_resp    : BLOCKED（前置檢查未通過，未送出控制）")
+    elif isinstance(control_response, dict) and control_response:
+        if control_response.get("error"):
+            print(f"control_resp    : 例外 {control_response.get('error')}")
+        else:
+            print(f"control_resp    : http={control_response.get('http_status')} "
+                  f"code={control_response.get('code')} msg={control_response.get('msg')}")
+    # verify 明細（--no-verify 時為空）
     for k, v in (verify.get("values") or {}).items():
-        print(f"  {k} = {v}")
+        print(f"verify.{k:<9}: {v}")
     if verify.get("expected") is not None:
-        print(f"  expected={verify.get('expected')} matched={verify.get('matched')} "
+        print(f"verify.expected : {verify.get('expected')} matched={verify.get('matched')} "
               f"status={verify.get('final_verify_status')}")
-    if verify.get("verify_attempts"):
-        print(f"  verify_attempts={len(verify['verify_attempts'])} "
-              f"timeout={verify.get('verify_timeout_sec')}s interval={verify.get('verify_interval_sec')}s")
-    print(f"control_success={control_success} | verify_success={verify_success} | success={success}")
+    print(f"control_success : {control_success}")
+    print(f"verify_success  : {verify_success}")
+    print(f"success         : {success}")
     for w in warnings:
         print(f"  [warn] {w}")
+    if write_err:
+        print(f"[警告] 寫入結果失敗：{write_err}")
+    else:
+        print(f"結果已寫入：{RESULT_PATH}")
     return record
 
 
@@ -682,10 +691,12 @@ def main():
                     help="功率 kW（0~150），供需要功率的 action 使用")
     ap.add_argument("--yes", action="store_true",
                     help="高風險 action 略過互動確認（呼叫端已確認 YES）")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="送出後不做內部回讀輪詢（送完即返回，由呼叫端即時輪詢驗證）")
     args = ap.parse_args()
     if args.action in REQUIRES_POWER and args.power is None:
         ap.error(f"--power 為 {args.action} 的必填參數（0~150）")
-    run(args.action, args.execute, power=args.power, assume_yes=args.yes)
+    run(args.action, args.execute, power=args.power, assume_yes=args.yes, no_verify=args.no_verify)
 
 
 if __name__ == "__main__":

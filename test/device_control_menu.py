@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import time
+import threading
 import subprocess
 
 try:
@@ -349,36 +350,198 @@ def refresh_status_silent():
     return (_load_json(READONLY_RESULT) or {}).get("status_summary") or {}
 
 
-def wait_and_verify(action):
+# ---- 動態進度行（同一行覆寫，不逐行新增）----
+_PROGRESS_LINE_ACTIVE = False
+_PROGRESS_LINE_LENGTH = 0
+
+
+def print_progress_line(message):
+    """在同一行覆寫等待進度，不新增換行。"""
+    global _PROGRESS_LINE_ACTIVE, _PROGRESS_LINE_LENGTH
+    text = str(message)
+    padded = text.ljust(_PROGRESS_LINE_LENGTH)   # 新內容較短時補空白清掉舊字元
+    print("\r" + padded, end="", flush=True)
+    _PROGRESS_LINE_LENGTH = len(text)
+    _PROGRESS_LINE_ACTIVE = True
+
+
+def finish_progress_line(message=None):
+    """結束動態行，必要時先覆寫最終文字，再換行。"""
+    global _PROGRESS_LINE_ACTIVE, _PROGRESS_LINE_LENGTH
+    if message is not None:
+        text = str(message)
+        padded = text.ljust(_PROGRESS_LINE_LENGTH)
+        print("\r" + padded, end="", flush=True)
+    if _PROGRESS_LINE_ACTIVE or message is not None:
+        print(flush=True)
+    _PROGRESS_LINE_ACTIVE = False
+    _PROGRESS_LINE_LENGTH = 0
+
+
+def wait_and_verify(action, start=None):
     """
-    控制成功後等待設備完成（最多 VERIFY_TIMEOUT 秒），每 VERIFY_INTERVAL 秒 verify 一次；
-    成功立即結束，逾時印 Timeout 與最後狀態。保留 operator 既有 verify 判斷。
+    控制送出後即時輪詢驗證（最多 VERIFY_TIMEOUT 秒）。
+    秒數每秒在「同一行」覆寫更新；狀態改變 / 驗證成功 / 逾時才結束該行、換行顯示下一行。
+    背景執行緒負責向設備輪詢（子行程耗時數秒），主迴圈每秒更新秒數，兩者解耦。
+    start：連續計時起點；由 _execute_live 傳入時涵蓋「送出階段」（[NN/60] 連續）。
+           為 None（獨立呼叫，如 PCS 模式）時自建起點並先做 control_success 檢查與表頭。
     """
-    data = _load_json(ACTION_RESULT) or {}
-    if not data.get("control_success"):
-        print("（控制未成功送出，略過等待驗證）")
-        return
+    live = start is not None
+    if not live:
+        data = _load_json(ACTION_RESULT) or {}
+        if not data.get("control_success"):
+            print("（控制未成功送出，略過等待驗證）", flush=True)
+            return None
     exp = VERIFY_EXPECT.get(action)
     if not exp:
-        print("（控制已送出；此動作無明確狀態回讀欄位，略過輪詢，請參考上方 verify 結果）")
-        return
+        el = 0 if start is None else int(time.monotonic() - start)
+        print(f"[{el:02d}/{VERIFY_TIMEOUT}] 此動作無明確狀態回讀欄位，略過輪詢（請參考控制結果）", flush=True)
+        return None
     block, field, expected = exp
-    print("-" * 40)
-    print("控制指令已送出")
-    print("等待設備完成動作...")
-    print("-" * 40)
-    elapsed, last = 0, None
-    while elapsed < VERIFY_TIMEOUT:
-        time.sleep(VERIFY_INTERVAL)
-        elapsed += VERIFY_INTERVAL
-        status = refresh_status_silent()
-        val = (status.get(block) or {}).get(field)
-        last = val
-        if val is not None and expected in str(val):
-            print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 驗證成功 ✓ （{field}={val}）")
-            return
-        print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 驗證中...（目前 {field}={val}）")
-    print(f"Timeout：{VERIFY_TIMEOUT}s 內未達預期（{field} 應含「{expected}」，最後={last}）")
+    if not live:
+        print("-" * 40, flush=True)
+        print("控制指令已送出", flush=True)
+        print("等待設備完成動作...", flush=True)
+        print("-" * 40, flush=True)
+        start = time.monotonic()
+
+    # 背景執行緒輪詢設備狀態（子行程耗時數秒），主迴圈每秒在同一行更新秒數。
+    latest = {"val": None}
+    stop = threading.Event()
+
+    def _poller():
+        while not stop.is_set():
+            status = refresh_status_silent()
+            latest["val"] = (status.get(block) or {}).get(field)
+            if stop.wait(VERIFY_INTERVAL):
+                break
+
+    th = threading.Thread(target=_poller, daemon=True)
+    th.start()
+
+    result, line_val = False, None
+    try:
+        while True:
+            elapsed = int(time.monotonic() - start)
+            val = latest["val"]
+            # 驗證成功：結束目前動態行，換行顯示最終狀態與成功訊息
+            if val is not None and expected in str(val):
+                finish_progress_line()
+                print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] {field}：{val}", flush=True)
+                print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 驗證成功 ✓（{field}={val}）", flush=True)
+                result = True
+                break
+            # 逾時：結束目前動態行，換行顯示 Timeout
+            if elapsed >= VERIFY_TIMEOUT:
+                finish_progress_line()
+                print(f"[{VERIFY_TIMEOUT:02d}/{VERIFY_TIMEOUT}] Timeout：{VERIFY_TIMEOUT}s 內未達預期"
+                      f"（{field} 應含「{expected}」，最後={val}）", flush=True)
+                result = False
+                break
+            # 狀態改變：先結束（保留）目前動態行，於新行重新開始動態更新
+            if line_val is not None and val != line_val:
+                finish_progress_line()
+            if val is None:
+                print_progress_line(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 等待設備回應...")
+            else:
+                print_progress_line(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] {field}：{val}，繼續等待...")
+            line_val = val
+            time.sleep(1)
+    finally:
+        stop.set()
+    return result
+
+
+def _execute_live(operator_args, action, label):
+    """
+    送出控制並「即時」顯示等待計時（單一連續計時、逐行 flush）：
+      YES → >>> 執行 → [00/60] 正在送出控制指令... → 送出（operator 帶 --no-verify，送完即返回）
+          → [NN/60] 控制指令已送出，等待設備完成動作... → 即時輪詢驗證。
+    operator 以 --no-verify 送出（不做內部輪詢），故按下 YES 後立刻開始計時，不必等子程式跑完。
+    """
+    print(f"\n>>> 執行：{label}（{action}）", flush=True)
+    start = time.monotonic()
+
+    # 送出階段：operator 以子行程非阻塞執行，主迴圈每秒在同一行覆寫秒數（不逐行新增）。
+    print_progress_line(f"[{0:02d}/{VERIFY_TIMEOUT}] 正在送出控制指令...")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", *operator_args, "--no-verify"],
+            cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        finish_progress_line()
+        print(f"[錯誤] 無法啟動控制腳本：{e}", flush=True)
+        return 1
+    while proc.poll() is None:
+        print_progress_line(f"[{int(time.monotonic() - start):02d}/{VERIFY_TIMEOUT}] 正在送出控制指令...")
+        time.sleep(1)
+    rc = proc.returncode
+
+    data = _load_json(ACTION_RESULT) or {}
+    sent = max(1, int(time.monotonic() - start))
+    if data.get("blocked"):
+        finish_progress_line(f"[{sent:02d}/{VERIFY_TIMEOUT}] 前置檢查未通過，未送出控制")
+        _print_control_detail(data, None)
+        return rc
+    if not data.get("control_success"):
+        finish_progress_line(f"[{sent:02d}/{VERIFY_TIMEOUT}] 控制指令送出失敗")
+        _print_control_detail(data, None)
+        if rc != 0:
+            print("（注意：控制腳本回傳非 0，請檢視上方訊息）", flush=True)
+        return rc
+
+    # 送出成功：結束「正在送出」動態行，換行顯示「已送出」
+    finish_progress_line(f"[{sent:02d}/{VERIFY_TIMEOUT}] 控制指令已送出，等待設備完成動作...")
+    verify_result = wait_and_verify(action, start=start)     # 連續計時、即時輪詢（同一行覆寫）
+    # 詳細資訊（action/mode/payload/response/verify/JSON）一律延後到計時與驗證之後才顯示
+    _print_control_detail(data, verify_result)
+    if rc != 0:
+        print("（注意：控制腳本回傳非 0，請檢視上方訊息）", flush=True)
+    return rc
+
+
+def _print_control_detail(data, verify_result):
+    """控制詳細資訊（延後顯示於等待計時與驗證結果之下）。verify_result 為選單即時輪詢結果。"""
+    req = data.get("control_request") or {}
+    cr = data.get("control_response") or {}
+    control_success = data.get("control_success")
+    # verify_success 以「選單即時輪詢」結果為準（operator --no-verify 未做內部驗證）
+    if verify_result is True:
+        vs = True
+    elif verify_result is False:
+        vs = "timeout"
+    else:
+        vs = data.get("verify_success")          # None：無需/略過驗證
+    if control_success is False:
+        success = False
+    elif vs in (True, None):
+        success = bool(control_success)
+    else:
+        success = False
+
+    print("\n================ 控制詳細資訊 ================", flush=True)
+    print(f"action          : {data.get('action')}", flush=True)
+    print(f"mode            : {'DRY-RUN（不送出）' if data.get('dry_run') else 'EXECUTE（真的送出）'}", flush=True)
+    print(f"control_req     : {req.get('method')} {req.get('endpoint')}", flush=True)
+    print(f"payload         : {json.dumps(req.get('payload'), ensure_ascii=False)}", flush=True)
+    pc = data.get("precheck")
+    if pc:
+        state = pc.get("battery_power_state") or pc.get("battery_operation_state")
+        print(f"precheck        : 狀態={state} / allowed={pc.get('allowed')} / reason={pc.get('reason')}", flush=True)
+    if data.get("blocked"):
+        print("control_resp    : BLOCKED（前置檢查未通過，未送出控制）", flush=True)
+    elif isinstance(cr, dict) and cr:
+        if cr.get("error"):
+            print(f"control_resp    : 例外 {cr.get('error')}", flush=True)
+        else:
+            print(f"control_resp    : http={cr.get('http_status')} code={cr.get('code')} msg={cr.get('msg')}", flush=True)
+    print(f"control_success : {control_success}", flush=True)
+    print(f"verify_success  : {vs}", flush=True)
+    print(f"success         : {success}", flush=True)
+    for w in (data.get("warnings") or []):
+        print(f"  [warn] {w}", flush=True)
+    print(f"結果已寫入：{ACTION_RESULT}", flush=True)
 
 
 def handle_choice(choice):
@@ -390,11 +553,7 @@ def handle_choice(choice):
     # 一般控制
     if choice in MENU_ACTIONS:
         action, label = MENU_ACTIONS[choice]
-        rc = _run_script([OPERATOR, "--action", action, "--execute"], f"{label}（{action}）")
-        show_action_result()
-        wait_and_verify(action)
-        if rc != 0:
-            print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
+        _execute_live([OPERATOR, "--action", action, "--execute"], action, label)
         return True
 
     # 高風險控制（電池上下電）：先 YES 二次確認，再帶 --yes
@@ -410,11 +569,7 @@ def handle_choice(choice):
         if ans != "YES":
             print("已取消，未送出。")
             return True
-        rc = _run_script([OPERATOR, "--action", action, "--execute", "--yes"], f"{label}（{action}）")
-        show_action_result()
-        wait_and_verify(action)
-        if rc != 0:
-            print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
+        _execute_live([OPERATOR, "--action", action, "--execute", "--yes"], action, label)
         return True
 
     # PCS 功率控制（6 交流有功 / 7 直流恆流 / 8 直流恆功率）→ 進入第二層
