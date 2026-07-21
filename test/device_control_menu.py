@@ -23,8 +23,8 @@ import subprocess
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+except (AttributeError, ValueError, OSError):
+    pass    # 舊環境無 reconfigure 或 stdout 已包裝：沿用現有編碼（非報告錯誤）
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(os.path.dirname(HERE), "output")
@@ -33,6 +33,18 @@ READONLY_RESULT = os.path.join(OUTPUT_DIR, "device_control_readonly.json")
 
 OPERATOR = os.path.join(HERE, "device_control_operator.py")
 SCRAPER = os.path.join(HERE, "device_control_scraper.py")
+
+# 充放電報告（獨立唯讀模組，以 import 呼叫；本檔不修改該模組、不送任何控制 API）
+try:
+    import charge_discharge_report as CDR
+    import charge_discharge_report_config as CDR_CFG
+    _REPORT_AVAILABLE = True
+    _REPORT_IMPORT_ERR = None
+except Exception as _e:            # 匯入失敗不影響既有控制選單
+    CDR = None
+    CDR_CFG = None
+    _REPORT_AVAILABLE = False
+    _REPORT_IMPORT_ERR = str(_e)
 
 # 查詢目前設備狀態
 QUERY_CHOICE = "1"
@@ -64,9 +76,30 @@ PCS_MODE_MENU = {
 }
 PCS_STOP_CHOICE = "7"  # PCS 停止充放電（安全停止，維持可執行）
 
-# ---- 控制後等待驗證（設備約 0~60 秒才完成切換）----
-VERIFY_TIMEOUT = 60      # 最大等待秒數
+# ---- 控制後等待驗證 ----
+# 每種設備的翻轉時間不同（實測：空調風機停/啟受壓縮機保護影響，可達 ~120s），故 timeout 各自獨立設定。
+VERIFY_TIMEOUT = {
+    "battery": 60,
+    "pcs": 60,
+    "fan": 60,       # 進排風
+    "water": 60,     # 冷卻循環
+    "ac_on": 180,    # 空調開（風機翻轉可能 >60s）
+    "ac_off": 180,   # 空調關
+}
+VERIFY_TIMEOUT_DEFAULT = 60
 VERIFY_INTERVAL = 2      # 每幾秒 verify 一次
+
+
+def _verify_timeout(action):
+    """依 action 取對應設備的 verify timeout（秒）。"""
+    if action in ("ac_on", "ac_off"):
+        return VERIFY_TIMEOUT.get(action, VERIFY_TIMEOUT_DEFAULT)
+    key = ("battery" if action.startswith("battery")
+           else "pcs" if action.startswith("pcs")
+           else "fan" if action.startswith("vent")
+           else "water" if action.startswith("cooling")
+           else None)
+    return VERIFY_TIMEOUT.get(key, VERIFY_TIMEOUT_DEFAULT)
 # action → (status_summary 區塊, 欄位, 期望值需包含的字串)
 VERIFY_EXPECT = {
     "pcs_manual_on":  ("PCS", "PCS手動模式開關", "已啟用"),
@@ -109,6 +142,10 @@ MENU_TEXT = """
 14. 冷卻循環開
 15. 冷卻循環關
 
+16. 手動開始合併充放電報告（備用）
+17. 手動結束合併充放電報告（備用）
+18. 查看最近報告
+
 0. 離開
 ==============================
 """
@@ -136,7 +173,7 @@ def _enable_ansi():
             k = ctypes.windll.kernel32
             k.SetConsoleMode(k.GetStdHandle(-11), 7)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
         except Exception:
-            pass
+            _USE_COLOR = False        # 無法啟用 VT 色碼 → 退化為純文字（不靜默忽略）
 
 
 def colorize(v):
@@ -279,6 +316,9 @@ def _pcs_mode_submenu(cfg):
                          f"{label}{dir_label}（{action}）execute")
         show_action_result()
         wait_and_verify(action)      # 送出後回讀驗證
+        # 控制成功 → 自動跟隨：輪詢實際方向並自動建立/切換報告 Session（唯讀，不送任何控制）
+        if _REPORT_AVAILABLE and _control_succeeded():
+            report_on_charge_discharge_control(direction, label, v)
     else:
         # 未確認模式（安全網）→ 僅 dry-run
         print("\n此模式未確認 payload，僅產生 dry-run 預覽（不會送出控制 API）。")
@@ -386,6 +426,7 @@ def wait_and_verify(action, start=None):
     start：連續計時起點；由 _execute_live 傳入時涵蓋「送出階段」（[NN/60] 連續）。
            為 None（獨立呼叫，如 PCS 模式）時自建起點並先做 control_success 檢查與表頭。
     """
+    to = _verify_timeout(action)      # 每種設備獨立 timeout
     live = start is not None
     if not live:
         data = _load_json(ACTION_RESULT) or {}
@@ -395,14 +436,14 @@ def wait_and_verify(action, start=None):
     exp = VERIFY_EXPECT.get(action)
     if not exp:
         el = 0 if start is None else int(time.monotonic() - start)
-        print(f"[{el:02d}/{VERIFY_TIMEOUT}] 此動作無明確狀態回讀欄位，略過輪詢（請參考控制結果）", flush=True)
+        print(f"[{el:02d}/{to}] 此動作無明確狀態回讀欄位，略過輪詢（請參考控制結果）", flush=True)
         return None
     block, field, expected = exp
     if not live:
-        print("-" * 40, flush=True)
+        print("-" * 90, flush=True)
         print("控制指令已送出", flush=True)
         print("等待設備完成動作...", flush=True)
-        print("-" * 40, flush=True)
+        print("-" * 90, flush=True)
         start = time.monotonic()
 
     # 背景執行緒輪詢設備狀態（子行程耗時數秒），主迴圈每秒在同一行更新秒數。
@@ -424,27 +465,27 @@ def wait_and_verify(action, start=None):
         while True:
             elapsed = int(time.monotonic() - start)
             val = latest["val"]
-            # 驗證成功：結束目前動態行，換行顯示最終狀態與成功訊息
+            # 設備完成（verify_success）：唯一以 verify 欄位翻轉判定（如空調＝indoorFanStatus）
             if val is not None and expected in str(val):
                 finish_progress_line()
-                print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] {field}：{val}", flush=True)
-                print(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 驗證成功 ✓（{field}={val}）", flush=True)
+                print(f"[{elapsed:02d}/{to}] {field}：{val}", flush=True)
+                print(f"[{elapsed:02d}/{to}] 驗證成功 ✓（設備完成：{field}={val}）", flush=True)
                 result = True
                 break
             # 逾時：結束目前動態行，換行顯示 Timeout
-            if elapsed >= VERIFY_TIMEOUT:
+            if elapsed >= to:
                 finish_progress_line()
-                print(f"[{VERIFY_TIMEOUT:02d}/{VERIFY_TIMEOUT}] Timeout：{VERIFY_TIMEOUT}s 內未達預期"
-                      f"（{field} 應含「{expected}」，最後={val}）", flush=True)
+                print(f"[{to:02d}/{to}] Timeout：{to}s 內未達預期"
+                      f"（{field} 應含「{expected}」，最後={val}；控制已送出成功，設備可能仍在動作中）", flush=True)
                 result = False
                 break
             # 狀態改變：先結束（保留）目前動態行，於新行重新開始動態更新
             if line_val is not None and val != line_val:
                 finish_progress_line()
             if val is None:
-                print_progress_line(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] 等待設備回應...")
+                print_progress_line(f"[{elapsed:02d}/{to}] 等待設備完成... 目前 {field}=（讀取中）")
             else:
-                print_progress_line(f"[{elapsed:02d}/{VERIFY_TIMEOUT}] {field}：{val}，繼續等待...")
+                print_progress_line(f"[{elapsed:02d}/{to}] 等待設備完成... 目前 {field}：{val}")
             line_val = val
             time.sleep(1)
     finally:
@@ -460,10 +501,11 @@ def _execute_live(operator_args, action, label):
     operator 以 --no-verify 送出（不做內部輪詢），故按下 YES 後立刻開始計時，不必等子程式跑完。
     """
     print(f"\n>>> 執行：{label}（{action}）", flush=True)
+    to = _verify_timeout(action)      # 每種設備獨立 timeout
     start = time.monotonic()
 
     # 送出階段：operator 以子行程非阻塞執行，主迴圈每秒在同一行覆寫秒數（不逐行新增）。
-    print_progress_line(f"[{0:02d}/{VERIFY_TIMEOUT}] 正在送出控制指令...")
+    print_progress_line(f"[{0:02d}/{to}] 正在送出控制指令...")
     try:
         proc = subprocess.Popen(
             [sys.executable, "-X", "utf8", *operator_args, "--no-verify"],
@@ -474,25 +516,27 @@ def _execute_live(operator_args, action, label):
         print(f"[錯誤] 無法啟動控制腳本：{e}", flush=True)
         return 1
     while proc.poll() is None:
-        print_progress_line(f"[{int(time.monotonic() - start):02d}/{VERIFY_TIMEOUT}] 正在送出控制指令...")
+        print_progress_line(f"[{int(time.monotonic() - start):02d}/{to}] 正在送出控制指令...")
         time.sleep(1)
     rc = proc.returncode
 
     data = _load_json(ACTION_RESULT) or {}
     sent = max(1, int(time.monotonic() - start))
     if data.get("blocked"):
-        finish_progress_line(f"[{sent:02d}/{VERIFY_TIMEOUT}] 前置檢查未通過，未送出控制")
+        finish_progress_line(f"[{sent:02d}/{to}] 前置檢查未通過，未送出控制")
         _print_control_detail(data, None)
         return rc
     if not data.get("control_success"):
-        finish_progress_line(f"[{sent:02d}/{VERIFY_TIMEOUT}] 控制指令送出失敗")
+        finish_progress_line(f"[{sent:02d}/{to}] 控制指令送出失敗")
         _print_control_detail(data, None)
         if rc != 0:
             print("（注意：控制腳本回傳非 0，請檢視上方訊息）", flush=True)
         return rc
 
-    # 送出成功：結束「正在送出」動態行，換行顯示「已送出」
-    finish_progress_line(f"[{sent:02d}/{VERIFY_TIMEOUT}] 控制指令已送出，等待設備完成動作...")
+    # 第一階段「控制已接受」：POST http200（control_success）→ 設備已接受命令
+    finish_progress_line(f"[{sent:02d}/{to}] 控制已送出 ✓（設備已接受命令）")
+    print(f"[{sent:02d}/{to}] 等待設備完成動作...", flush=True)
+    # 第二階段「設備完成」：等待 verify 欄位（如 indoorFanStatus）真正翻轉 → 驗證成功 ✓
     verify_result = wait_and_verify(action, start=start)     # 連續計時、即時輪詢（同一行覆寫）
     # 詳細資訊（action/mode/payload/response/verify/JSON）一律延後到計時與驗證之後才顯示
     _print_control_detail(data, verify_result)
@@ -544,11 +588,458 @@ def _print_control_detail(data, verify_result):
     print(f"結果已寫入：{ACTION_RESULT}", flush=True)
 
 
+# ======================================================================
+# 充放電報告控制器（Menu 16/17/18）
+# 以獨立模組 charge_discharge_report 的 ReportSession 在背景執行緒取樣；
+# 本檔僅 orchestration：不修改報告模組、不送任何控制 API、全程唯讀 GET。
+# ======================================================================
+_report = {"session": None, "thread": None, "stop": None,
+           "lock": threading.Lock(), "finalized": False,
+           "pending_end_reason": None, "client": None}
+
+# 自動跟隨控制流程的輪詢設定（純 GET 唯讀）
+AUTO_POLL_TIMEOUT_SEC = 90      # 送控制後最長等待實際狀態改變（畫面訊息一律動態引用此值）
+AUTO_POLL_INTERVAL_SEC = 3
+
+
+def _report_output_root():
+    return os.path.join(OUTPUT_DIR, CDR_CFG.OUTPUT_SUBDIR)
+
+
+def _report_client():
+    """共用已登入的 ApiClient（只登入一次；供輪詢與報告 Session 共用）。失敗回 None。"""
+    if _report["client"] is None:
+        c = CDR.ApiClient()
+        tok = c.login_hmi(CDR.USERNAME)
+        if not tok:
+            print("[REPORT] 登入失敗，無法進行報告相關作業")
+            return None
+        _report["client"] = c
+    return _report["client"]
+
+
+def _read_device_state(client):
+    """一次唯讀取樣（供輪詢方向/狀態）。錯誤印出、不靜默；回傳 reading dict 或 None。"""
+    try:
+        return CDR.read_all(client)
+    except Exception as e:
+        print(f"[REPORT] 讀取設備狀態失敗：{e}")
+        return None
+
+
+def _actual_direction(r):
+    """回傳 (direction, fault)：direction ∈ charge/discharge/idle/unknown；fault=PCS 是否故障。"""
+    if not isinstance(r, dict):
+        return "unknown", False
+    d, _src = CDR.resolve_direction(r.get("pcs_charging_flag"),
+                                    r.get("pcs_discharging_flag"),
+                                    r.get("actual_active_power_kw"))
+    fault = "故障" in str(r.get("pcs_status", ""))
+    return d, fault
+
+
+def _poll_state(client, want):
+    """輪詢設備直到 want(direction, fault) 為真或逾時。回傳 (成功?, 最後 reading)。"""
+    start = time.monotonic()
+    last = None
+    while time.monotonic() - start < AUTO_POLL_TIMEOUT_SEC:
+        last = _read_device_state(client)
+        d, f = _actual_direction(last)
+        if want(d, f):
+            return True, last
+        time.sleep(AUTO_POLL_INTERVAL_SEC)
+    return False, last
+
+
+def _report_finalize(end_reason):
+    """
+    idempotent finalize：整個 session 只會產生一次報告（避免背景自動結束與手動 17 併發重複產檔）。
+    回傳 (sess, stats)；若已結束/無 session → (None, None)。finalize 僅讀取狀態與寫本地檔，不送任何控制。
+    """
+    with _report["lock"]:
+        sess = _report["session"]
+        if sess is None or _report["finalized"]:
+            return None, None
+        _report["finalized"] = True
+    try:
+        return sess, sess.finalize(end_reason)
+    except Exception as e:
+        print(f"[錯誤] 產生報告失敗：{e}")
+        return sess, None
+
+
+def report_start():
+    """Menu 16：開始/續接充放電報告（背景記錄；方向由 PCS 旗標自動判定）。
+    若磁碟上有未完成 Session（recording/paused）→ 續接同一資料夾累積；否則建立新 Session。"""
+    if not _REPORT_AVAILABLE:
+        print(f"[錯誤] 無法載入報告模組：{_REPORT_IMPORT_ERR}")
+        return
+    if _report["session"] is not None:
+        print("已有進行中的充放電報告，請先選 17 停止並產生報告。")
+        return
+
+    active = CDR.find_active_session(_report_output_root())
+    client = _report_client()
+    if client is None:
+        return
+
+    if active:
+        # 續接既有未完成 Session（不建新資料夾、從既有累積值續加）
+        try:
+            sess = CDR.ReportSession.resume(active, client)
+            sess.start()
+        except Exception as e:
+            print(f"[REPORT] 續接既有 Session 失敗：{e}")
+            return
+        print("\n【充放電報告】續接既有 Session（recording_resume）")
+    else:
+        # 建立新 Session（僅新建時詢問控制方式/設定值）
+        try:
+            mode = input("控制方式（交流有功/直流恆流/直流恆功率，Enter=交流有功）：").strip() or "交流有功"
+        except (EOFError, KeyboardInterrupt):
+            mode = "交流有功"
+        try:
+            sp_raw = input("設定值（選填，Enter 略過）：").strip()
+        except (EOFError, KeyboardInterrupt):
+            sp_raw = ""
+        setpoint = None
+        if sp_raw:
+            try:
+                setpoint = float(sp_raw)
+            except ValueError:
+                print("設定值格式錯誤，改為不記錄設定值。")
+        try:
+            sess = CDR.ReportSession("auto", setpoint, mode, client, _report_output_root())
+            sess.start()
+        except Exception as e:
+            print(f"[REPORT] 開始報告失敗：{e}")
+            return
+        print("\n【充放電報告】開始記錄（新 Session）")
+
+    _report_bg_start(sess)
+    print(f"  Session ID：{sess.session_id}")
+    print(f"  資料夾：{sess.folder}")
+    print(f"  取樣間隔：{CDR_CFG.SAMPLE_INTERVAL_SEC}s（背景記錄中）")
+
+
+def _report_bg_start(sess):
+    """
+    啟動背景取樣執行緒：持續取樣（合併 Session）。
+      - charge/idle/discharge 皆為同一 Session 內的有效狀態 → **idle 不結束 Session**
+        （充↔放切換之間可能經過 idle，屬正常流程；結束一律由 Menu 7 或程式離開決定）。
+      - 僅在「PCS 故障」或「連續通訊失敗」時才自動結束（安全）；正常停止由 Menu 7 觸發。
+      - 方向於相鄰取樣間改變時，由 ReportSession.sample_once 記錄 charge/idle/discharge_start 事件。
+    """
+    stop = threading.Event()
+    _report.update(session=sess, thread=None, stop=stop, finalized=False)
+
+    def _loop():
+        while not stop.is_set():
+            r = None
+            try:
+                r, _critical = sess.sample_once()
+            except Exception as e:
+                print(f"[REPORT] 背景取樣例外：{e}")
+            reason = None
+            if r is not None and _actual_direction(r)[1]:      # PCS 故障
+                reason = "fault_stop"
+            if reason is None and "communication_error" in sess.stop_reasons:
+                reason = "communication_error"
+            if reason:
+                s, stats = _report_finalize(reason)
+                if s is not None:
+                    print(f"\n[REPORT] 已自動結束並產生報告"
+                          f"（{reason} / {CDR_CFG.END_REASON.get(reason, reason)}）")
+                    if stats is not None:
+                        _print_report_result(s, stats)
+                _report.update(session=None, thread=None, stop=None, pending_end_reason=None)
+                break
+            stop.wait(CDR_CFG.SAMPLE_INTERVAL_SEC)
+
+    th = threading.Thread(target=_loop, daemon=True)
+    _report["thread"] = th
+    th.start()
+
+
+def _stop_and_finalize(reason, write_final=True):
+    """停止背景執行緒 →（選擇性）寫最後一筆即時資料 → finalize（idempotent）。回傳 (sess, stats)。"""
+    if _report["session"] is None:
+        return None, None
+    if _report["stop"] is not None:
+        _report["stop"].set()
+    if _report["thread"] is not None:
+        _report["thread"].join(timeout=CDR_CFG.SAMPLE_INTERVAL_SEC + 10)
+    sess = _report["session"]
+    if write_final and sess is not None and not _report["finalized"]:
+        try:
+            sess.sample_once()               # 寫入最後一筆即時資料
+        except Exception as e:
+            print(f"[REPORT] 最後取樣失敗：{e}")
+    res = _report_finalize(reason)
+    _report.update(session=None, thread=None, stop=None, pending_end_reason=None)
+    return res
+
+
+def report_pause():
+    """離開程式時：停止背景取樣但保留 Session 為 paused（下次可續接），不標記 completed。"""
+    sess = _report["session"]
+    if sess is None:
+        return
+    if _report["stop"] is not None:
+        _report["stop"].set()
+    if _report["thread"] is not None:
+        _report["thread"].join(timeout=CDR_CFG.SAMPLE_INTERVAL_SEC + 10)
+    if _report["finalized"]:                  # 背景已 finalize（completed）→ 不覆蓋
+        _report.update(session=None, thread=None, stop=None, pending_end_reason=None)
+        return
+    try:
+        sess.pause()
+        print(f"充放電報告已暫停（下次可續接）：{sess.session_id}")
+    except Exception as e:
+        print(f"[REPORT] 暫停報告失敗：{e}")
+    _report.update(session=None, thread=None, stop=None, pending_end_reason=None)
+
+
+def report_stop(end_reason="user_stop"):
+    """Menu 17（備用）：手動停止並 finalize（status=completed；end_reason 預設 user_stop）。"""
+    if _report["session"] is None:
+        print("目前沒有進行中的充放電報告（請先選 16 開始，或由控制流程自動建立）。")
+        return
+    print("正在停止並產生報告…")
+    sess, stats = _stop_and_finalize(end_reason)
+    if sess is None:
+        print("報告已結束（可能已自動結束）。")
+    elif stats is not None:
+        print("[REPORT] 已手動結束並產生報告")
+        _print_report_result(sess, stats)
+
+
+# ======================================================================
+# 自動跟隨控制流程（Menu 4/5/6/7 成功後自動開始/結束報告）
+# ======================================================================
+def _control_succeeded():
+    """讀 device_control_action_result.json 判斷最近一次控制是否成功。"""
+    data = _load_json(ACTION_RESULT) or {}
+    return bool(data.get("control_success"))
+
+
+def report_on_charge_discharge_control(direction, mode_label, setpoint=None):
+    """
+    Menu 4/5/6 充/放電控制成功後：輪詢實際 PCS 狀態，確認進入該方向。
+    合併 Session 模型：
+      - 無 active Session → 建立單一「{timestamp}_auto」Session（不分充/放電資料夾）。
+      - 已有 active Session（充↔放切換）→ **沿用同一 Session**，只記錄 direction_change 事件，
+        不建新資料夾、不結束 Session；samples.csv 持續累加，方向依實際寫入。
+      - 未偵測到實際充/放電 → 明確提示、不動作。
+    """
+    if not _REPORT_AVAILABLE:
+        print(f"[REPORT] 報告模組未載入：{_REPORT_IMPORT_ERR}")
+        return
+    client = _report_client()
+    if client is None:
+        return
+    zh = "充電" if direction == "charge" else "放電"
+    print(f"[REPORT] 偵測實際{zh}狀態中…（最長 {AUTO_POLL_TIMEOUT_SEC}s）")
+    ok, _r = _poll_state(client, lambda d, f: d == direction and not f)
+    if not ok:
+        print("[REPORT] 尚未偵測到實際充/放電狀態")
+        return
+    cur = _report["session"]
+    if cur is not None:
+        # 沿用現有合併 Session，僅記錄方向切換（不結束、不建新資料夾）
+        try:
+            cur.log_event("direction_change", "info", f"方向切換為 {direction}（{zh}）")
+        except Exception as e:
+            print(f"[REPORT] 記錄方向切換失敗：{e}")
+        print(f"[REPORT] 沿用現有 Session，方向切換為 {direction}")
+        return
+    # 建立單一合併 Session（action='auto' → 資料夾為 {timestamp}_auto）
+    try:
+        sess = CDR.ReportSession("auto", setpoint, mode_label, client, _report_output_root())
+        sess.start()
+    except Exception as e:
+        print(f"[REPORT] 自動開始失敗：{e}")
+        return
+    _report_bg_start(sess)
+    print("[REPORT] 已自動建立充放電 Session")
+    print(f"  Session ID：{sess.session_id}｜初始方向：{direction}｜控制方式：{mode_label}")
+
+
+def report_on_stop_control():
+    """Menu 7 停止充放電成功後：輪詢回到停止/待機 → 寫最後一筆 → 自動結束（control_stop；故障則 fault_stop）。"""
+    if not _REPORT_AVAILABLE:
+        print(f"[REPORT] 報告模組未載入：{_REPORT_IMPORT_ERR}")
+        return
+    if _report["session"] is None:
+        print("[REPORT] 無進行中的報告 Session（略過自動結束）")
+        return
+    _report["pending_end_reason"] = "control_stop"
+    reason = "control_stop"
+    client = _report_client()
+    if client is not None:
+        print(f"[REPORT] 確認 PCS 回到停止/待機中…（最長 {AUTO_POLL_TIMEOUT_SEC}s）")
+        ok, r = _poll_state(client, lambda d, f: d == "idle" or f)
+        if r is not None and _actual_direction(r)[1]:
+            reason = "fault_stop"
+    try:
+        sess, stats = _stop_and_finalize(reason)
+        if sess is not None and stats is not None:
+            print("[REPORT] 已結束合併充放電報告")
+            _print_report_result(sess, stats)
+        elif sess is None:
+            print("[REPORT] 報告已結束（可能已自動結束）")
+    except Exception as e:
+        print(f"[REPORT] 自動結束失敗：{e}")
+
+
+def report_resume_on_launch():
+    """程式啟動時：若磁碟有未完成 Session（recording/paused）→ 恢復並繼續背景取樣（不重複建立）。"""
+    if not _REPORT_AVAILABLE:
+        return
+    active = CDR.find_active_session(_report_output_root())
+    if not active:
+        return
+    client = _report_client()
+    if client is None:
+        return
+    try:
+        sess = CDR.ReportSession.resume(active, client)
+        sess.start()
+    except Exception as e:
+        print(f"[REPORT] 恢復未完成 Session 失敗：{e}")
+        return
+    _report_bg_start(sess)
+    print(f"[REPORT] 已恢復未完成 Session：{sess.session_id}（方向 {sess.action}，背景繼續記錄）")
+
+
+def report_status_line():
+    """主選單顯示用：進行中報告的一行摘要；無則回 None。"""
+    sess = _report["session"]
+    if sess is None:
+        return None
+    last = sess.samples[-1] if sess.samples else {}
+    return ("【充放電報告｜記錄中】"
+            f"{sess.session_id}｜經過 {sess._elapsed():.0f}s｜"
+            f"方向 {last.get('charge_discharge_direction', '-')}｜"
+            f"SOC {last.get('soc_percent', '-')}%｜"
+            f"P {last.get('actual_active_power_kw', '-')}kW｜"
+            f"累積 {last.get('cumulative_energy_kwh', '-')}kWh｜"
+            f"告警 {last.get('alarm_count', '-')}")
+
+
+def report_view_latest():
+    """
+    Menu 18：查看最近一次『已完成』報告。
+    規則：優先 status=completed（最新）；若最新為 recording/paused → 提示尚未完成；
+          皆無則明確顯示「尚無已完成報告」。任何情況都不會無聲 return。
+    """
+    print("[REPORT] 執行查看最近報告")
+    if not _REPORT_AVAILABLE:
+        print(f"[錯誤] 無法載入報告模組：{_REPORT_IMPORT_ERR}")
+        return
+    root = _report_output_root()            # 由程式檔位置建立的絕對路徑，不依賴目前工作目錄
+    print(f"[REPORT] 搜尋路徑：{root}")
+    try:
+        if not os.path.isdir(root):
+            print("尚無已完成報告（輸出資料夾尚未建立）。")
+            return
+        sessions = []
+        for name in os.listdir(root):
+            folder = os.path.join(root, name)
+            if not os.path.isdir(folder):
+                continue
+            state = _load_json(os.path.join(folder, CDR_CFG.FILE_SESSION_STATE)) or {}
+            sessions.append({
+                "folder": folder,
+                "mtime": os.path.getmtime(folder),
+                "status": state.get("status"),
+                "has_summary": os.path.exists(os.path.join(folder, CDR_CFG.FILE_SUMMARY)),
+            })
+        if not sessions:
+            print("尚無任何充放電報告。")
+            return
+        sessions.sort(key=lambda s: s["mtime"], reverse=True)     # 由新到舊
+
+        # 1) 優先：最近一個 status=completed 且有 summary.json
+        completed = [s for s in sessions
+                     if s["status"] == CDR_CFG.SESSION_COMPLETED and s["has_summary"]]
+        if completed:
+            _show_report_folder(completed[0]["folder"])
+            return
+        # 2) 無 completed：若最新為 recording/paused → 明確提示尚未完成
+        if sessions[0]["status"] in (CDR_CFG.SESSION_RECORDING, CDR_CFG.SESSION_PAUSED):
+            print("目前報告尚未完成，請先選 17 停止並產生報告。")
+            return
+        # 3) 舊版無 session_state 但有 summary → 顯示最近一個含 summary 的報告
+        with_summary = [s for s in sessions if s["has_summary"]]
+        if with_summary:
+            print("（找不到 status=completed 的 Session，顯示最近一個含 summary 的報告）")
+            _show_report_folder(with_summary[0]["folder"])
+            return
+        print("尚無已完成報告。")
+    except Exception as e:
+        print(f"[錯誤] 查看最近報告失敗：{e}")
+
+
+def _show_report_folder(folder):
+    data = _load_json(os.path.join(folder, CDR_CFG.FILE_SUMMARY))
+    if not data:
+        print(f"[錯誤] 無法讀取 summary.json：{folder}")
+        return
+    _print_summary_json(data, folder)
+
+
+def _print_report_result(sess, stats):
+    data = _load_json(os.path.join(sess.folder, CDR_CFG.FILE_SUMMARY))
+    if data:
+        _print_summary_json(data, sess.folder)
+    else:
+        print(f"報告已產生於：{sess.folder}（無法讀回 summary.json）")
+
+
+def _print_summary_json(data, path):
+    sess = data.get("session", {}) or {}
+    st = data.get("statistics", {}) or {}
+    val = data.get("validation", {}) or {}
+    # 簡易結果指標（依既有 summary 欄位；正式 PASS/FAIL 自動判定屬 V2，本處不臆造）
+    result = "PASS" if (val.get("data_complete") and not val.get("stop_recommended")) else "REVIEW"
+    print("\n============ 最近充放電報告 ============")
+    print(f"Session ID     : {sess.get('session_id')}")
+    print(f"方向(Direction) : {sess.get('action')}")
+    print(f"控制方式        : {sess.get('control_mode')}")
+    print(f"開始時間       : {sess.get('start_time')}")
+    print(f"結束時間       : {sess.get('end_time')}")
+    print(f"總時長(秒)     : {sess.get('duration_seconds')}")
+    print(f"SOC            : {st.get('start_soc_percent')} → {st.get('end_soc_percent')} "
+          f"（最高 {st.get('max_soc_percent')} / 最低 {st.get('min_soc_percent')}）")
+    print(f"最大充/放電功率 : {st.get('max_charge_power_kw')} / {st.get('max_discharge_power_kw')} kW")
+    print(f"累積充/放電    : {st.get('charged_energy_kwh')} / {st.get('discharged_energy_kwh')} kWh")
+    print(f"Net Energy     : {st.get('net_energy_kwh')} kWh")
+    print(f"往返效率       : {st.get('round_trip_efficiency_percent')}")
+    print(f"告警數(新增)   : {st.get('alarm_count')}（追蹤 {st.get('alarm_total_tracked')}）")
+    print(f"結束原因       : {sess.get('end_reason')}（{sess.get('end_reason_text')}）")
+    print(f"資料完整/建議停止: {val.get('data_complete')} / {val.get('stop_recommended')} "
+          f"{val.get('stop_reasons') or ''}")
+    print(f"結果           : {result}")
+    print(f"資料夾         : {path}")
+
+
 def handle_choice(choice):
     """回傳 True 繼續、False 離開。"""
     if choice == "0":
         print("結束程式。")
         return False
+
+    # 充放電報告（Menu 16/17/18）：獨立唯讀報告模組，不送任何控制
+    if choice == "16":
+        report_start()
+        return True
+    if choice == "17":
+        report_stop()
+        return True
+    if choice == "18":
+        report_view_latest()
+        return True
 
     # 一般控制
     if choice in MENU_ACTIONS:
@@ -581,6 +1072,9 @@ def handle_choice(choice):
     if choice == PCS_STOP_CHOICE:
         rc = _run_script([OPERATOR, "--action", "pcs_stop_power", "--execute"], "PCS 停止充放電")
         show_action_result()
+        # 控制成功 → 自動跟隨：輪詢回停止/待機並自動結束報告（唯讀，不送任何控制）
+        if _REPORT_AVAILABLE and _control_succeeded():
+            report_on_stop_control()
         if rc != 0:
             print("（注意：控制腳本回傳非 0，請檢視上方訊息）")
         return True
@@ -664,6 +1158,9 @@ def _exec_menu():
     """實際執行控制的子選單（沿用既有 handle_choice 邏輯）。"""
     while True:
         print(MENU_TEXT)
+        sl = report_status_line() if _REPORT_AVAILABLE else None
+        if sl:
+            print(sl)
         try:
             choice = input("請輸入選項：").strip()
         except (EOFError, KeyboardInterrupt):
@@ -679,20 +1176,39 @@ def _exec_menu():
 def main():
     _enable_ansi()
     print("設備控制總覽（狀態為顯示用，不會自動執行控制）")
-    while True:
-        status = refresh_status()
-        render_dashboard(status)
-        try:
-            choice = input("\n[r] 重新整理　[e] 進入控制執行選單　[0] 離開：").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n結束程式。")
-            break
-        if choice == "0":
-            print("結束程式。")
-            break
-        if choice == "e":
-            _exec_menu()
-        # 其他（含 r / 空白）→ 迴圈頂端重新刷新
+    report_resume_on_launch()      # 啟動時恢復未完成的充放電報告 Session（若有）
+    try:
+        while True:
+            status = refresh_status()
+            render_dashboard(status)
+            sl = report_status_line() if _REPORT_AVAILABLE else None
+            if sl:
+                print(f"\n{sl}")
+            try:
+                choice = input("\n[r] 重新整理　[e] 進入控制執行選單　[0] 離開：").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n結束程式。")
+                break
+            if choice == "0":
+                print("結束程式。")
+                break
+            if choice == "e":
+                _exec_menu()
+            elif choice in ("16", "17", "18"):
+                # 便利：儀表板層直接輸入 16/17/18 也可操作充放電報告（等同進控制選單後選同項）
+                try:
+                    handle_choice(choice)
+                except Exception as e:
+                    print(f"[錯誤] 執行報告選項 {choice} 時發生例外：{e}")
+            elif choice in ("r", ""):
+                pass                       # 重新整理
+            else:
+                print(f"（'{choice}' 非本層選項；請按 e 進入控制執行選單，或直接輸入 16/17/18 操作報告）")
+    finally:
+        # 離開程式時，若仍有進行中的報告 → 暫停（paused，保留可續接），不強制 completed。
+        if _REPORT_AVAILABLE and _report.get("session") is not None:
+            print("\n偵測到進行中的充放電報告，離開前自動暫停（下次選 16 可續接）…")
+            report_pause()
 
 
 if __name__ == "__main__":
