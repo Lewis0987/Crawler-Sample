@@ -74,6 +74,53 @@ EP_ALARM = "/hmiGuest/unauthorizedAccess/alarm/list"
 EP_RACKEXT = "/hmiGuest/unauthorizedAccess/overview/rackExtremeValueInformation"  # Rack 最高/最低溫度
 _PCS_LANG_HEADER = {"Accept-Language": "zh-TW"}
 
+# ======================================================================
+# 報表版本識別（偵測背景程式是否載入到舊模組）
+#   REPORT_BUILD 烤進程式碼：執行中的舊程序會回報啟動當下載入的舊值，
+#   對照 source_mtime（產生當下讀磁碟）即可看出「記憶體舊模組 vs 磁碟新程式」。
+# ======================================================================
+REPORT_BUILD = "20260722_01"
+_MODULE_LOAD_TIME = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # 本程序載入模組的時間
+
+
+def _git_commit():
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL, timeout=3)
+        return out.decode("utf-8", "ignore").strip() or None
+    except Exception:
+        return None
+
+
+def module_version_info():
+    """本模組（實際載入中）的版本識別；auto 流程與 --regen 共用同一份。"""
+    src = os.path.abspath(__file__)
+    try:
+        src_mtime = datetime.fromtimestamp(os.path.getmtime(src)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        src_mtime = "unknown"
+    return {
+        "REPORT_VERSION": REPORT_BUILD,
+        "schema_version": CFG.SCHEMA_VERSION,
+        "report_version": CFG.REPORT_VERSION,
+        "source": src,
+        "build_time": _MODULE_LOAD_TIME,
+        "source_mtime": src_mtime,
+        "git_commit": _git_commit() or "(none)",
+    }
+
+
+def print_module_banner():
+    """啟動時印出模組版本橫幅，避免背景程式載入舊模組卻無法察覺。"""
+    v = module_version_info()
+    print("[Report Module]")
+    print(f"  Version: {v['REPORT_VERSION']}  (schema {v['schema_version']} / report {v['report_version']})")
+    print(f"  Source : {v['source']}")
+    print(f"  Build  : load={v['build_time']}  mtime={v['source_mtime']}  git={v['git_commit']}")
+
 # 告警代碼→中文（沿用 alarm scraper 的最小對照；查不到保留原字串）
 try:
     from alarm_records_scraper import _code_text, _level_text, _alarm_status_text, _epoch_ms_to_text
@@ -123,6 +170,37 @@ def _col_floats(rows, field):
         except (TypeError, ValueError):
             pass
     return out
+
+
+def _y_axis_scale(vals):
+    """
+    共用 Y 軸 (min, max, major_unit)：
+      - Major Unit 固定 5（不因範圍變大而自動改成 10/20/25）。
+      - 上下限依資料最大/最小值取整到 5 的倍數並含 0；不裁切任何資料。
+      - 整數刻度；正/負對稱皆每 5 一格（…-10,-5,0,5,10…）。
+    """
+    mu = 5
+    if not vals:
+        return -mu, mu, mu
+    dmin = min(0.0, min(vals))       # 一定含 0
+    dmax = max(0.0, max(vals))
+    lo = int((dmin // mu) * mu)               # 向下取到 5 的倍數（dmin<=0）
+    hi = int(-((-dmax) // mu) * mu)           # 向上取到 5 的倍數
+    if hi - lo < mu:                          # 退化（全為 0）→ 至少一格
+        hi = lo + mu
+    return lo, hi, mu
+
+
+def _chart_width_cm(label_count):
+    """
+    依 X 軸 Label 數量決定圖表寬度（cm）；三個紀錄頁共用同一邏輯、高度固定。
+      - 非自適應（CHART_ADAPTIVE_SIZE=False）→ 固定 CHART_WIDTH_CM。
+      - 自適應：width = 基準 + Label數×每Label寬，夾在 [MIN, MAX]。
+    """
+    if not getattr(CFG, "CHART_ADAPTIVE_SIZE", True):
+        return CFG.CHART_WIDTH_CM
+    w = CFG.CHART_BASE_WIDTH_CM + max(0, int(label_count)) * CFG.CHART_WIDTH_PER_LABEL_CM
+    return max(CFG.CHART_MIN_WIDTH_CM, min(CFG.CHART_MAX_WIDTH_CM, w))
 
 
 def _fmt_hms(seconds):
@@ -719,7 +797,10 @@ class ReportSession:
 
     # ---------- 生命週期 ----------
     def start(self):
+        new_folder = not os.path.isdir(self.folder)
         os.makedirs(self.folder, exist_ok=True)
+        if new_folder and not self._resumed:
+            _log_session_create(self)     # 建立來源 Log（追出是哪個入口/函式建立資料夾）
         if self._resumed:
             return self._start_resume()
         return self._start_new()
@@ -1277,17 +1358,20 @@ class ReportSession:
     def _write_xlsx(self, stats):
         try:
             from openpyxl import Workbook
-            from openpyxl.chart import LineChart, Reference
+            from openpyxl.chart import LineChart, ScatterChart, Series, Reference
             from openpyxl.chart.axis import ChartLines
+            from openpyxl.chart.marker import Marker
             from openpyxl.chart.legend import Legend
             from openpyxl.chart.layout import Layout, ManualLayout
             from openpyxl.chart.shapes import GraphicalProperties
             from openpyxl.drawing.line import LineProperties
-            from openpyxl.chart.text import RichText
+            from openpyxl.chart.text import RichText, Text
+            from openpyxl.chart.title import Title
             from openpyxl.chart.data_source import AxDataSource, StrRef
             from openpyxl.chart.series import SeriesLabel
             from openpyxl.drawing.text import (Paragraph, ParagraphProperties,
-                                               CharacterProperties, RichTextProperties)
+                                               CharacterProperties, RichTextProperties,
+                                               RegularTextRun)
             from openpyxl.utils import get_column_letter
             from openpyxl.worksheet.table import Table, TableStyleInfo
             from openpyxl.worksheet.properties import PageSetupProperties
@@ -1369,43 +1453,36 @@ class ReportSession:
             med = diffs[len(diffs) // 2]
             return max(1, int(round(60.0 / med))) if med > 0 else 1
 
-        def _combined_chart(ws_data, title, colidx, n, has_temp, cat_col, y_lo, y_hi):
+        def _combined_chart(ws_data, title, colidx, n, has_temp, cat_col, y_lo, y_hi, major_unit,
+                            label_count):
             """
-            整合折線圖（每個紀錄頁只此一張，三頁規格一致）：
-              - 固定尺寸（24×13 cm），不隨資料筆數放大。
-              - Plot Area 手動放大填滿 Chart（左右 Margin 縮小、上下留適當空間）。
-              - X 軸分類：使用「稀疏標籤欄」cat_col（以第一筆為基準每 30 秒挑最接近的一筆標 HH:MM:SS，
-                其餘為空字串）；折線仍以完整資料繪製，不降採樣。標籤垂直(-90°)、Plot Area 下方。
-              - 電流 Current(A) + Rack 最大/最小溫度(°C) 共用「同一組」左側 Y 軸（無副軸）。
-              - Y 軸：以 0 為基準、Major Unit=5、上下限為 5 的倍數（含 0）、整數刻度（無小數）。
-                溫度值落在共用刻度上（例如 22°C 落在接近 25、19°C 落在接近 20），不另設溫度刻度。
-              - 主要水平格線（淡灰色，橫跨整個繪圖區）；無垂直格線。
-              - 底部 Legend（電流(A)/Rack最大溫度/Rack最小溫度）；無 X/Y 軸標題（只保留刻度數值），保留圖表標題。
-              - 若該 Session 無 Rack 溫度資料（has_temp=False）→ 只畫電流並於標題註記「無 Rack 溫度資料」。
-            y_lo/y_hi：共用 Y 軸上下限（電流＋溫度整體），已四捨五入到 5 的倍數並含 0。
+            整合圖（LineChart 類別軸，每個紀錄頁只此一張，三頁規格一致）：
+              - X 類別軸：cat_col 存「稀疏 Label 欄」（±3s 演算法手選的實際時間，其餘空）；
+                tickLblSkip=1（逐格，但欄本身多為空→只顯示手選 Label）；標籤垂直(-90°)、tickLblPos=low。
+              - 折線用完整資料（不降採樣）。電流 + Rack 最大/最小溫度 共用左側 Y 軸（無副軸）。
+              - Y 軸：以 0 為基準、Major Unit 固定 5、上下限為 5 的倍數（含 0）、整數。
+              - 主要水平格線（淡灰）；無垂直格線；底部精簡 Legend；無 X/Y 軸標題；保留圖表標題。
+              - has_temp=False → 只畫電流並於標題註記「無 Rack 溫度資料」。
             """
             cat = Reference(ws_data, min_col=cat_col, min_row=2, max_row=n + 1)
             cat_f = str(cat)
-            # 類別以「文字參照(strRef)」寫入，稀疏標籤欄為純文字字串（非 Excel 時間值），
-            # 避免 Excel 把 X 軸判定為時間刻度軸而套用自動間隔省略標籤。每個 series 給獨立實例。
             def _catsrc():
                 return AxDataSource(strRef=StrRef(f=cat_f))
             left = LineChart()
-            left.title = title if has_temp else f"{title}（無 Rack 溫度資料）"
-            left.x_axis.title = None                     # 移除 X 軸標題
-            left.y_axis.title = None                     # 移除左 Y 軸標題（保留刻度）
-            # 固定尺寸（不隨筆數放大）
-            left.width = 24
-            left.height = 13
-            # Plot Area 手動填滿：左右 Margin 小、頂部留標題、底部只留 X 標籤（無 Legend）
-            # 註：openpyxl 於序列化時取 chart.layout（非 plot_area.layout）建構 PlotArea。
-            # Plot Area 最大化：layoutTarget="inner" → x/y/w/h 直接界定「內部資料矩形」，
-            # 座標軸標籤畫在矩形外的邊界內（Excel 手動拖曳的行為）。資料矩形寬≈94%、高≈83%，
-            # 左留 Y 刻度、頂留標題、底部留垂直時間標籤+Legend。
+            # 標題 12pt 粗體、水平置中（Excel 標題預設置中）；overlay=False 置於繪圖區上方
+            _title_text = title if has_temp else f"{title}（無 Rack 溫度資料）"
+            _tcp = CharacterProperties(sz=1200, b=True)   # 12pt 粗體
+            _tpara = Paragraph(pPr=ParagraphProperties(defRPr=_tcp),
+                               r=[RegularTextRun(rPr=_tcp, t=_title_text)])
+            left.title = Title(tx=Text(rich=RichText(bodyPr=RichTextProperties(), p=[_tpara])))
+            left.title.overlay = False
+            left.x_axis.title = None
+            left.y_axis.title = None
+            left.width = _chart_width_cm(label_count)    # 尺寸（固定或自適應，依 config）
+            left.height = CFG.CHART_HEIGHT_CM
             left.layout = Layout(manualLayout=ManualLayout(
                 layoutTarget="inner", xMode="edge", yMode="edge",
-                x=0.05, y=0.045, w=0.94, h=0.83))
-            # 電流 + Rack 最大/最小溫度，全部加到同一張 chart → 共用「同一組」左側 Y 軸（無副軸）
+                x=0.045, y=0.045, w=0.95, h=0.84))
             left.add_data(Reference(ws_data, min_col=colidx["Current(A)"], min_row=1, max_row=n + 1),
                           titles_from_data=True)
             if has_temp:
@@ -1414,44 +1491,47 @@ class ReportSession:
                                   titles_from_data=True)
             for s in left.series:
                 s.cat = _catsrc()
-            left.series[0].tx = SeriesLabel(v="電流")     # 圖例：Current(A) → 電流（僅圖例，表頭不變）
+            left.series[0].tx = SeriesLabel(v="電流")     # 圖例：Current(A) → 電流
 
-            # 單一共用 Y 軸（左）；X 分類軸置於底部
+            # X 類別軸（底部）：稀疏 Label、垂直、tickLblPos=low（不隨 Y=0 crossing 跑到中間）
             left.x_axis.axId = 10
-            left.x_axis.axPos = "b"                      # 時間軸在底部
+            left.x_axis.axPos = "b"
             left.x_axis.crossAx = 100
+            left.x_axis.auto = False
+            left.x_axis.delete = False
+            left.x_axis.tickLblSkip = 1
+            left.x_axis.tickMarkSkip = 1
+            left.x_axis.tickLblPos = "low"
+            left.x_axis.majorGridlines = None            # 無垂直格線
+
+            # 共用左 Y 軸：Major Unit 固定 5、取整到 5 倍數含 0、整數；關閉左右 Margin（首尾貼邊）
             left.y_axis.axId = 100
-            left.y_axis.axPos = "l"                      # 唯一 Y 軸在左側
+            left.y_axis.axPos = "l"
             left.y_axis.crossAx = 10
-            # Y 軸刻度：以 0 為基準、固定 Major Unit=5、上下限為 5 的倍數（含 0）、整數（無小數）
             left.y_axis.scaling.min = y_lo
             left.y_axis.scaling.max = y_hi
-            left.y_axis.majorUnit = 5
+            left.y_axis.majorUnit = major_unit
             left.y_axis.number_format = "0"
             left.y_axis.crosses = "autoZero"
-            left.y_axis.crossBetween = "midCat"          # 關閉 X 軸左右 Margin：首/尾點貼齊繪圖區邊界
-            # 主要水平格線：淡灰色、橫跨整個繪圖區（Excel 預設淺灰 D9D9D9）
+            left.y_axis.crossBetween = "midCat"
+            left.y_axis.delete = False
             grid_gp = GraphicalProperties()
-            grid_gp.line = LineProperties(solidFill="D9D9D9", w=9525)   # ~0.75pt 淡灰
+            grid_gp.line = LineProperties(solidFill="D9D9D9", w=9525)   # 淡灰水平格線
             left.y_axis.majorGridlines = ChartLines(spPr=grid_gp)
-            left.x_axis.majorGridlines = None            # 不畫垂直格線
 
-            # X 軸：文字類別軸，逐格顯示（稀疏標籤欄本身已只在每 10 秒放字，其餘為空）
-            # → 視覺上等同「每 10 秒一個 HH:MM:SS」，文字垂直(-90°)、位於 Plot Area 下方
-            left.x_axis.auto = False                     # 關閉自動判定（勿轉為時間軸）
-            left.x_axis.tickLblSkip = 1                  # 逐格顯示（空字串不佔位）
-            left.x_axis.tickMarkSkip = 1
-            left.x_axis.tickLblPos = "low"               # 標籤置於 Plot Area 下方（非圖表外）
-            left.x_axis.delete = False
-            left.y_axis.delete = False                   # 左 Y 軸完整顯示
-            left.legend = Legend()                       # 底部 Legend：電流/Rack最大溫度/Rack最小溫度
-            left.legend.position = "b"                   # X 軸時間為 strRef 分類、不會進 Legend
+            # Legend 精簡、底部置中、貼近 X 標籤（h 小、y 近底部）
+            left.legend = Legend()                       # 電流/Rack最大溫度/Rack最小溫度（同一列）
+            left.legend.position = "b"
             left.legend.overlay = False
-            # Legend 置最底、水平置中、緊接垂直時間標籤下方（靠近 X 軸、底部僅留極小邊距）
             left.legend.layout = Layout(manualLayout=ManualLayout(
-                xMode="edge", yMode="edge", x=0.15, y=0.965, w=0.70, h=0.03))
-            _axis_font(left.x_axis, sz=800, rot=-5400000)   # X 軸標籤旋轉 -90°、字級縮小(8pt) → 佔高更少
-            _axis_font(left.y_axis)
+                xMode="edge", yMode="edge", x=0.20, y=0.95, w=0.60, h=0.04))
+            # Legend 文字 10pt、水平（vert=horz，維持一列不直排）
+            _lcp = CharacterProperties(sz=1000)
+            left.legend.txPr = RichText(bodyPr=RichTextProperties(rot=0, vert="horz"),
+                                        p=[Paragraph(pPr=ParagraphProperties(defRPr=_lcp),
+                                                     endParaRPr=_lcp)])
+            _axis_font(left.x_axis, sz=800, rot=-5400000)   # X 標籤 8pt、垂直 -90°
+            _axis_font(left.y_axis, sz=900)                  # Y 刻度 9pt
             return left
 
         def _hms(ts):
@@ -1461,13 +1541,16 @@ class ReportSession:
                 return s[11:19]
             return s
 
-        def _axis_time_labels(rows, step_sec=30):
+        def _axis_time_labels(rows, step_sec=CFG.X_AXIS_LABEL_INTERVAL_SEC, window_sec=3):
             """
-            回傳與 rows 等長的 X 軸稀疏標籤（純文字 'HH:MM:SS'）：
-              - 第一筆與最後一筆「一定」標記（不因自動避讓被隱藏）。
-              - 中間以「第一筆時間」為基準，目標時間 = t0+step, t0+2*step, …（相對，非整點），
-                每個目標從實際資料挑「最接近」的一筆，標上該筆的實際 'HH:MM:SS'。
-              - 其餘筆為 ''（空字串）；折線仍以完整資料繪製，不降採樣。
+            以「表單原始時間戳」產生稀疏 X 軸 Label（回傳 (labels, log)）：
+              1) 以第一筆時間 t0 為基準，目標時間 = t0+N, t0+2N, …（N=step_sec）。
+              2) 每個目標取 ±window_sec 秒區間內、最接近目標的一筆「實際紀錄時間」為 Label。
+              3) 區間內無資料 → 該目標略過（不顯示、不占位、不抓區間外）。
+              4) 同一筆不可被兩個目標重複選中（去重）。
+              5) 第一筆與最後一筆一定強制顯示（即使不合 N±window 規則）。
+              6) 其餘筆為 ''；折線仍用完整資料（不降採樣）。
+            log：[(target_sec, win_lo, win_hi, selected_sec 或 None)]，供列印驗證（§9）。
             """
             def _to_sec(t):
                 try:
@@ -1478,21 +1561,30 @@ class ReportSession:
             secs = [_to_sec(_hms(s.get("timestamp"))) for s in rows]
             valid = [(i, sv) for i, sv in enumerate(secs) if sv is not None]
             labels = [""] * len(rows)
+            log = []
             if not valid:
-                return labels
+                return labels, log
             t0, tlast = valid[0][1], valid[-1][1]
             first_idx, last_idx = valid[0][0], valid[-1][0]
+            used = set()
             k = 1
-            while t0 + step_sec * k < tlast:          # 中間目標（最後一筆另外強制）
+            while t0 + step_sec * k < tlast:          # 中間目標（首尾另外強制）
                 target = t0 + step_sec * k
-                # 最接近的樣本（距離相同取較早者）；不覆蓋強制的首/尾
-                idx = min(valid, key=lambda p: (abs(p[1] - target), p[1]))[0]
-                if idx not in (first_idx, last_idx):
+                lo, hi = target - window_sec, target + window_sec
+                cands = [(i, sv) for (i, sv) in valid
+                         if lo <= sv <= hi and i not in used and i not in (first_idx, last_idx)]
+                if cands:
+                    idx, sv = min(cands, key=lambda p: (abs(p[1] - target), p[1]))  # 最近；同距取較早
                     labels[idx] = _hms(rows[idx].get("timestamp"))
+                    used.add(idx)
+                    log.append((target, lo, hi, sv))
+                else:
+                    log.append((target, lo, hi, None))     # 略過（區間內無可用資料）
                 k += 1
-            labels[first_idx] = _hms(rows[first_idx].get("timestamp"))   # 第一筆一定顯示
-            labels[last_idx] = _hms(rows[last_idx].get("timestamp"))     # 最後一筆一定顯示
-            return labels
+            # 強制首尾（實際時間）
+            labels[first_idx] = _hms(rows[first_idx].get("timestamp"))
+            labels[last_idx] = _hms(rows[last_idx].get("timestamp"))
+            return labels, log
 
         wb = Workbook()
 
@@ -1619,35 +1711,41 @@ class ReportSession:
                     rr += 1
             wr.column_dimensions[get_column_letter(scol)].width = 26
             wr.column_dimensions[get_column_letter(scol + 1)].width = 22
-            # 單一整合折線圖（此頁唯一圖表；X=每10秒稀疏標籤、電流+Rack溫度共用同一組 Y 軸、無 Legend）
+            # 單一整合折線圖（此頁唯一圖表；X=±3s 演算法稀疏標籤、電流+Rack溫度共用 Y 軸、底部精簡 Legend）
             if n >= 1:
                 has_temp = bool(_col_floats(rows, "rack_max_temperature_c")
                                 or _col_floats(rows, "rack_min_temperature_c"))
-                # 稀疏標籤放到「工作表最右側」且「隱藏」的輔助欄（AN 欄，遠離 Summary 區、不顯示給使用者）。
-                # 隱藏欄的類別標籤靠存檔後設定 plotVisOnly=0（見 _write_xlsx）維持 X 軸顯示。
-                lbl_col = 40                                 # AN 欄（在 AA/AB 之後）
+                # 稀疏 Label 欄（AN，隱藏、遠離 Summary）：±3s 演算法手選的實際時間，其餘空。
+                lbl_col = 40                                 # AN 欄
                 lbl_letter = get_column_letter(lbl_col)
-                wr.cell(row=1, column=lbl_col, value="X軸標籤(每30秒)")
-                for i, lab in enumerate(_axis_time_labels(rows, step_sec=30)):
+                lbl_step = CFG.X_AXIS_LABEL_INTERVAL_SEC     # 統一由 config 控制（不硬編碼）
+                x_labels, x_log = _axis_time_labels(rows, step_sec=lbl_step, window_sec=3)
+                wr.cell(row=1, column=lbl_col, value=f"X軸標籤(每{lbl_step}秒±3s)")
+                for i, lab in enumerate(x_labels):
                     c = wr.cell(row=2 + i, column=lbl_col, value=lab)
                     c.number_format = "@"
-                wr.column_dimensions[lbl_letter].width = 10
+                wr.column_dimensions[lbl_letter].width = 12
                 wr.column_dimensions[lbl_letter].hidden = True   # 隱藏整欄（不顯示給使用者）
-                # 共用 Y 軸上下限：取「電流 + Rack 最大/最小溫度」整體最大/最小，
-                # 四捨五入到 5 的倍數並含 0（Major Unit=5）。
+                label_count = sum(1 for l in x_labels if l)
+                # §9 驗證列印：第一/最後時間、N、每個目標±3s區間、選中實際時間 / 略過
+                def _fs(sec):
+                    sec = int(sec) % 86400
+                    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+                _hms_rows = [_hms(s.get("timestamp")) for s in rows]
+                print(f"[X-LABEL 驗證] {title}｜第一筆={_hms_rows[0]} 最後={_hms_rows[-1]} "
+                      f"N={lbl_step}s ±3s｜目標數={len(x_log)} 顯示={label_count}")
+                for (tg, lo, hi, sel) in x_log:
+                    print(f"    目標 {_fs(tg)}  區間[{_fs(lo)}~{_fs(hi)}] → "
+                          + (f"選中 {_fs(sel)}" if sel is not None else "略過(無資料)"))
+                # 共用 Y 軸：取「電流 + Rack 最大/最小溫度」整體，含 0；Major Unit 固定 5、取整到 5 的倍數。
                 hf = dict(CFG.RECORD_COLUMNS)
                 yvals = list(_col_floats(rows, hf["Current(A)"]))
                 if has_temp:
                     yvals += _col_floats(rows, hf["Rack最大溫度(°C)"])
                     yvals += _col_floats(rows, hf["Rack最小溫度(°C)"])
-                if yvals:
-                    y_lo = min(0, int((min(yvals) // 5) * 5))       # 向下取到 5 的倍數（含 0）
-                    y_hi = max(0, int(-((-max(yvals)) // 5) * 5))   # 向上取到 5 的倍數（含 0）
-                else:
-                    y_lo, y_hi = -5, 5
-                if y_hi - y_lo < 10:                                # 至少保留幾格刻度
-                    y_hi = y_lo + 10
-                ch = _combined_chart(wr, chart_title, rec_colidx, n, has_temp, lbl_col, y_lo, y_hi)
+                y_lo, y_hi, y_mu = _y_axis_scale(yvals)
+                ch = _combined_chart(wr, chart_title, rec_colidx, n, has_temp, lbl_col,
+                                     y_lo, y_hi, y_mu, label_count)
                 wr.add_chart(ch, f"{get_column_letter(scol)}{rr + 2}")
             return wr
 
@@ -1729,6 +1827,28 @@ class ReportSession:
         wa.auto_filter.ref = wa.dimensions
         _autofit(wa, len(CFG.ALARM_FIELDS))
 
+        # ---- 隱藏工作表：報表版本識別（auto 流程與 --regen 共用 module_version_info）----
+        vinfo = module_version_info()
+        wsm = wb.create_sheet("_ReportMeta")
+        wsm["A1"] = "報表版本識別 (Report Version Identity)"
+        for i, (k, val) in enumerate([
+            ("REPORT_VERSION", vinfo["REPORT_VERSION"]),
+            ("schema_version", vinfo["schema_version"]),
+            ("report_version", vinfo["report_version"]),
+            ("Source (__file__)", vinfo["source"]),
+            ("Build Time (module load)", vinfo["build_time"]),
+            ("Source MTime", vinfo["source_mtime"]),
+            ("Git Commit", vinfo["git_commit"]),
+            ("Generated At", _now_str()),
+        ], start=3):
+            wsm.cell(row=i, column=1, value=k)
+            wsm.cell(row=i, column=2, value=str(val))
+        wsm.column_dimensions["A"].width = 26
+        wsm.column_dimensions["B"].width = 60
+        wsm.sheet_state = "hidden"
+        print(f"  [Report Module] {vinfo['REPORT_VERSION']} src={vinfo['source']} "
+              f"load={vinfo['build_time']} mtime={vinfo['source_mtime']} git={vinfo['git_commit']}")
+
         # ---- 版面：A4 橫式、fit-to-width、分頁標籤顏色（tabColor 取自 config）----
         for wsx in wb.worksheets:
             wsx.page_setup.orientation = "landscape"
@@ -1773,9 +1893,77 @@ def _force_plot_visible_all(xlsx_path):
     os.replace(tmp, xlsx_path)
 
 
+def _log_session_create(sess):
+    """
+    建立新 Session 資料夾時印出來源（呼叫者/模組/thread/pid），
+    便於日後直接看出是哪個入口（run_all / device_control_menu / 背景 thread / 其他）建立資料夾。
+    """
+    import inspect
+    import threading
+    caller = "?"
+    try:
+        me = os.path.basename(__file__)
+        for fr in inspect.stack()[1:]:
+            if os.path.basename(fr.filename) != me:
+                caller = f"{os.path.basename(fr.filename)}:{fr.lineno} {fr.function}()"
+                break
+        else:
+            top = inspect.stack()[-1]
+            caller = f"{os.path.basename(top.filename)}:{top.lineno} {top.function}()"
+    except Exception:
+        pass
+    print("[REPORT SESSION CREATE]")
+    print(f"  session_id: {sess.session_id}")
+    print(f"  folder    : {sess.folder}")
+    print(f"  caller    : {caller}")
+    print(f"  module    : {os.path.abspath(__file__)}  (build {REPORT_BUILD})")
+    print(f"  thread    : {threading.current_thread().name}   pid: {os.getpid()}")
+    print(f"  action    : {sess.action}")
+    print(f"  timestamp : {_now_str()}")
+
+
 # ======================================================================
 # 執行模式
 # ======================================================================
+def _arm_for_charge_discharge(client, interval, duration):
+    """
+    Arming 監測（**不建立任何 Session/資料夾**）：等待設備真正進入充/放電。
+    需連續 START_CONFIRM_SAMPLES 次同時滿足：
+      - 方向為 charge / discharge（PCS 旗標優先，退回功率符號）
+      - |battery_current_a| >= START_CURRENT_THRESHOLD_A（排除 0A / 小幅漂移 / API 缺值）
+    回傳 True=已確認進入充/放電（可建立 Session）；False=idle/逾時/中斷（不建立）。
+    離開條件：Ctrl+C、達 duration（>0）、或達 SESSION_TIMEOUT_SEC。
+    """
+    thr = CFG.START_CURRENT_THRESHOLD_A
+    need = CFG.START_CONFIRM_SAMPLES
+    streak = 0
+    t0 = time.monotonic()
+    deadline = t0 + duration if duration else None
+    print(f"[ARM] 監測中，等待實際充/放電（門檻 |I|≥{thr}A、連續 {need} 次；idle/0A/待機不建立 Session）…")
+    try:
+        while True:
+            r = read_all(client)
+            power = (r.get("actual_active_power_kw") if CFG.POWER_SOURCE == "pcs"
+                     else r.get("calculated_power_kw"))
+            direction, _src = resolve_direction(
+                r.get("pcs_charging_flag"), r.get("pcs_discharging_flag"), power)
+            cur = r.get("battery_current_a")
+            ok = (direction in ("charge", "discharge")
+                  and cur is not None and abs(cur) >= thr)
+            streak = streak + 1 if ok else 0
+            print(f"  [ARM {time.monotonic() - t0:6.1f}s] 方向={direction} I={cur}A P={power}kW "
+                  f"確認={streak}/{need}{'  ✓進入充/放電' if streak >= need else ''}")
+            if streak >= need:
+                return True
+            now = time.monotonic()
+            if (deadline and now >= deadline) or (now - t0 >= CFG.SESSION_TIMEOUT_SEC):
+                return False
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n  [ARM] 使用者中斷（Ctrl+C）→ 未建立 Session。")
+        return False
+
+
 def run_live(action, power, mode_label, duration, interval, ignore_stop=False):
     client = ApiClient()
     token = client.login_hmi(USERNAME)
@@ -1785,11 +1973,21 @@ def run_live(action, power, mode_label, duration, interval, ignore_stop=False):
 
     output_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                "output", CFG.OUTPUT_SUBDIR)
+
+    # === 狀態機（所有模式共用）：Idle → Arming → Recording → Stopping ===
+    # Arming：先唯讀監測、確認真正進入充/放電，才建立 Session（idle/0A/待機 → 不建任何資料夾）。
+    # --ignore-stop 不影響 Arming（仍需確認充/放電才建立）；它只在 Recording 階段決定是否
+    # 忽略 stop_recommended 自動結束（跑滿指定時長）。
+    armed = _arm_for_charge_discharge(client, interval, duration)
+    if not armed:
+        print("[ARM] 監測結束：未偵測到實際充/放電（idle/0A）→ 未建立任何 Session 或資料夾。")
+        return
+    if ignore_stop:
+        print("（--ignore-stop：Recording 階段不因 stop_recommended 提早結束，跑滿指定時長；仍只做唯讀取樣）")
+
     sess = ReportSession(action, power, mode_label, client, output_root)
     print(f"\n【充放電報告】Session：{sess.session_id}")
     print(f"資料夾：{sess.folder}")
-    if ignore_stop:
-        print("（--ignore-stop：驗證模式，跑滿指定時長，不因 stop_recommended 提早結束；仍只做唯讀取樣）")
     sess.start()
 
     end_reason = "completed"
@@ -1995,18 +2193,19 @@ def selftest():
                 an1 = wbx2[sname]["AN1"].value
                 s1 = wbx2[sname]["S1"].value
                 an_hidden = getattr(wbx2[sname].column_dimensions.get("AN"), "hidden", None)
-                check(f"{sname}: X 軸輔助欄在最右側 AN 且已隱藏（AN1={an1!r} hidden={an_hidden}）",
-                      bool(an1) and "X軸標籤" in str(an1) and an_hidden is True)
-                check(f"{sname}: Summary 區旁(S1)無輔助標籤（{s1!r}）",
-                      not (s1 and "X軸標籤" in str(s1)))
-                # 第一筆(AN2)與最後一筆一定有標籤；資料末列以 A 欄(時間)最後非空列為準
+                _exp_hdr = f"X軸標籤(每{CFG.X_AXIS_LABEL_INTERVAL_SEC}秒±3s)"
+                check(f"{sname}: X 稀疏標籤欄在 AN、隱藏、標題依 config 間隔（AN1={an1!r} hidden={an_hidden}）",
+                      an1 == _exp_hdr and an_hidden is True)
+                check(f"{sname}: Summary 區旁(S1)無輔助欄（{s1!r}）",
+                      not (s1 and ("X軸標籤" in str(s1) or "X時間序值" in str(s1))))
+                # 第一筆(AN2)與最後一筆一定有 Label（強制首尾）；資料末列以 A 欄(時間)最後非空列為準
                 wsr = wbx2[sname]
                 a_rows = [c.row for c in wsr["A"] if c.value is not None and c.row >= 2]
                 lastrow = max(a_rows) if a_rows else 2
                 an_first = wsr["AN2"].value
                 an_last = wsr.cell(row=lastrow, column=40).value
-                check(f"{sname}: X 軸第一筆有標籤（AN2={an_first!r}）", bool(an_first))
-                check(f"{sname}: X 軸最後一筆有標籤（AN{lastrow}={an_last!r}）", bool(an_last))
+                check(f"{sname}: X 軸第一筆有 Label（AN2={an_first!r}）", bool(an_first))
+                check(f"{sname}: X 軸最後一筆有 Label（AN{lastrow}={an_last!r}）", bool(an_last))
             check("Raw Data 圖表=0", per_sheet.get("Raw Data") == 0)
             check("Alarm 圖表=0", per_sheet.get("Alarm") == 0)
             total = sum(per_sheet.values())
@@ -2021,84 +2220,165 @@ def selftest():
                 xml = z.read(cx).decode("utf-8")
                 nser = len(_re.findall(r"</(?:c:)?ser>", xml))                        # 系列數
                 title_refs = _re.findall(r"<(?:c:)?tx>.*?<(?:c:)?f>([^<]*)</(?:c:)?f>", xml, _re.S)
-                cat_refs = _re.findall(r"<(?:c:)?cat>.*?<(?:c:)?f>([^<]*)</(?:c:)?f>", xml, _re.S)
-                m = _re.search(r'<(?:c:)?legendPos val="(\w+)"', xml)
-                legend = m.group(1) if m else None
                 tcols = set(_re.findall(r"!\$?([A-Z]+)\$?1\b", " ".join(title_refs)))
                 ts_in_title = any(_re.search(r"\d{2}:\d{2}:\d{2}", t or "") for t in title_refs)
-                naxis = len(_re.findall(r"</(?:c:)?valAx>", xml))
-                skips = _re.findall(r'<(?:c:)?tickLblSkip val="(\d+)"', xml)
+                # LineChart 類別軸：cat 以 strRef 參照隱藏 AN 稀疏標籤欄
+                cat_refs = _re.findall(r'<(?:c:)?cat>.*?<(?:c:)?f>([^<]*)</(?:c:)?f>', xml, _re.S)
+                is_line = bool(_re.search(r'<(?:c:)?lineChart>', xml)) and not _re.search(r'<(?:c:)?scatterChart>', xml)
                 rotated = 'rot="-5400000"' in xml                     # X 軸標籤 -90° 垂直
-                has_legend = bool(_re.search(r'<(?:c:)?legend>', xml))
-                catseg = _re.search(r'<(?:c:)?catAx>.*?</(?:c:)?catAx>', xml, _re.S)
+                m = _re.search(r'<(?:c:)?legendPos val="(\w+)"', xml)
+                legend = m.group(1) if m else None
                 valsegs = _re.findall(r'<(?:c:)?valAx>.*?</(?:c:)?valAx>', xml, _re.S)
-                _has_title = lambda seg: bool(_re.search(r'<(?:c:)?title>', seg))
-                axis_has_title = (_has_title(catseg.group(0)) if catseg else False) \
-                    or any(_has_title(v) for v in valsegs)
-                mp = _re.search(r'<(?:c:)?tickLblPos val="(\w+)"', catseg.group(0)) if catseg else None
-                catpos = mp.group(1) if mp else None
-                cat_has_grid = bool(_re.search(r'<(?:c:)?majorGridlines', catseg.group(0))) if catseg else False
-                val_has_grid = any(_re.search(r'<(?:c:)?majorGridlines', v) for v in valsegs)
+                catsegs = _re.findall(r'<(?:c:)?catAx>.*?</(?:c:)?catAx>', xml, _re.S)
+                catseg = catsegs[0] if catsegs else None
+                yax = valsegs[0] if valsegs else None                 # 單一共用 Y 軸
+                _has_title = lambda seg: bool(seg) and bool(_re.search(r'<(?:c:)?title>', seg))
+                axis_has_title = any(_has_title(v) for v in valsegs) or (bool(catseg) and _has_title(catseg))
                 has_manual_layout = bool(_re.search(r'<(?:c:)?manualLayout>', xml))
-                _axpos = lambda seg: (_re.search(r'<(?:c:)?axPos val="(\w+)"', seg) or [None, None])[1] \
-                    if _re.search(r'<(?:c:)?axPos val="(\w+)"', seg) else None
-                val_positions = sorted(p for p in (_axpos(v) for v in valsegs) if p)
-                cat_all = _re.findall(r'<(?:c:)?catAx>.*?</(?:c:)?catAx>', xml, _re.S)
-                cat_positions = [_axpos(c) for c in cat_all]
-                mju = _re.search(r'<(?:c:)?majorUnit val="([\d.]+)"', xml)
-                major_unit = float(mju.group(1)) if mju else None
-                # 主軸（電流）= 唯一設定 min/max 的 valAx
-                prim = next((v for v in valsegs if _re.search(r'<(?:c:)?min val=', v)), None)
-                ymin = _re.search(r'<(?:c:)?min val="([-\d.]+)"', prim) if prim else None
-                ymax = _re.search(r'<(?:c:)?max val="([-\d.]+)"', prim) if prim else None
-                yminv = float(ymin.group(1)) if ymin else None
-                ymaxv = float(ymax.group(1)) if ymax else None
-                # 主要水平格線顏色（淡灰 D9D9D9）
+                skips = _re.findall(r'<(?:c:)?tickLblSkip val="(\d+)"', xml)
+                catpos = (_re.search(r'<(?:c:)?tickLblPos val="(\w+)"', catseg).group(1)
+                          if catseg and _re.search(r'<(?:c:)?tickLblPos', catseg) else None)
+                y_mu = _re.search(r'<(?:c:)?majorUnit val="([\d.]+)"', yax) if yax else None
+                major_unit = float(y_mu.group(1)) if y_mu else None
+                yminv = float(_re.search(r'<(?:c:)?min val="([-\d.]+)"', yax).group(1)) if yax and _re.search(r'<(?:c:)?min val=', yax) else None
+                ymaxv = float(_re.search(r'<(?:c:)?max val="([-\d.]+)"', yax).group(1)) if yax and _re.search(r'<(?:c:)?max val=', yax) else None
+                _ysz = _re.search(r'sz="(\d+)"', yax) if yax else None
                 grid_color = None
-                for v in valsegs:
-                    mg = _re.search(r'<(?:c:)?majorGridlines>(.*?)</(?:c:)?majorGridlines>', v, _re.S)
+                if yax:
+                    mg = _re.search(r'<(?:c:)?majorGridlines>(.*?)</(?:c:)?majorGridlines>', yax, _re.S)
                     if mg:
                         cm = _re.search(r'srgbClr val="([0-9A-Fa-f]{6})"', mg.group(1))
-                        if cm:
-                            grid_color = cm.group(1).upper()
+                        grid_color = cm.group(1).upper() if cm else None
                 cur_literal = bool(_re.search(r'<(?:c:)?tx>\s*<(?:c:)?v>電流</(?:c:)?v>', xml))
+                check(f"{base}: LineChart（類別軸）", is_line)
                 check(f"{base}: 3 series（{nser}）", nser == 3)
                 check(f"{base}: 電流圖例名稱=「電流」（文字標題）", cur_literal)
                 check(f"{base}: 溫度序列標題參照 M/N（{sorted(tcols)}）", tcols == {"M", "N"})
                 check(f"{base}: series 標題不含 timestamp/SOC/Voltage/Power", not ts_in_title)
-                check(f"{base}: X 分類=最右側隱藏輔助欄 AN（{set(cat_refs)}）",
+                check(f"{base}: X 類別軸參照隱藏 AN 稀疏標籤欄（{set(cat_refs)}）",
                       bool(cat_refs) and all("$AN$" in c for c in cat_refs))
-                check(f"{base}: plotVisOnly=0（隱藏欄類別仍顯示）",
+                check(f"{base}: plotVisOnly=0（隱藏欄類別仍繪出）",
                       bool(_re.search(r'<(?:c:)?plotVisOnly val="0"', xml)))
-                check(f"{base}: 電流與溫度共用同一組 Y 軸 valAx=1（{naxis}）", naxis == 1)
-                check(f"{base}: 唯一 Y 軸在左、時間軸在底部（val={val_positions} cat={cat_positions}）",
-                      val_positions == ["l"] and cat_positions == ["b"])
-                check(f"{base}: Y 軸 Major Unit=5（{major_unit}）", major_unit == 5)
-                check(f"{base}: 關閉 X 軸左右 Margin（crossBetween=midCat）",
+                check(f"{base}: 單一共用 Y 軸 + 一條類別軸（valAx={len(valsegs)} catAx={len(catsegs)}）",
+                      len(valsegs) == 1 and len(catsegs) == 1)
+                check(f"{base}: X 每格顯示 tickLblSkip=1（{skips}）",
+                      bool(skips) and all(s == "1" for s in skips))
+                check(f"{base}: X 時間 Label 固定底部 tickLblPos=low（{catpos}）", catpos == "low")
+                check(f"{base}: 關閉 X 左右 Margin crossBetween=midCat",
                       bool(_re.search(r'<(?:c:)?crossBetween val="midCat"', xml)))
+                check(f"{base}: Y 軸 Major Unit 固定=5（{major_unit}）", major_unit == 5)
+                check(f"{base}: Y 軸刻度字級 9pt（{(int(_ysz.group(1))/100) if _ysz else None}）",
+                      bool(_ysz) and _ysz.group(1) == "900")
                 check(f"{base}: Y 軸上下限為 5 的倍數且含 0（min={yminv} max={ymaxv}）",
                       yminv is not None and ymaxv is not None
                       and yminv % 5 == 0 and ymaxv % 5 == 0 and yminv <= 0 <= ymaxv)
+                _legseg = _re.search(r'<(?:c:)?legend>.*?</(?:c:)?legend>', xml, _re.S)
+                _leg_manual = bool(_legseg) and bool(_re.search(r'<(?:c:)?manualLayout>', _legseg.group(0)))
+                _leg_overlay0 = bool(_legseg) and bool(_re.search(r'<(?:c:)?overlay val="0"', _legseg.group(0)))
+                _leg_y = _re.search(r'<(?:c:)?y val="([\d.]+)"', _legseg.group(0)) if _legseg else None
+                _leg_yv = float(_leg_y.group(1)) if _leg_y else None
+                _leg_h = _re.search(r'<(?:c:)?h val="([\d.]+)"', _legseg.group(0)) if _legseg else None
+                _leg_hv = float(_leg_h.group(1)) if _leg_h else None
+                _leg_sz = _re.search(r'sz="(\d+)"', _legseg.group(0)) if _legseg else None
+                _titleseg = _re.search(r'<(?:c:)?title>.*?</(?:c:)?title>', xml, _re.S)
+                _title_sz = _re.search(r'sz="(\d+)"', _titleseg.group(0)) if _titleseg else None
+                _title_bold = bool(_titleseg) and bool(_re.search(r'\bb="1"', _titleseg.group(0)))
                 check(f"{base}: 底部 Legend（{legend}）", legend == "b")
+                check(f"{base}: Legend 精簡貼底（overlay=0、y={_leg_yv} 貼底、h={_leg_hv} 精簡）",
+                      _leg_manual and _leg_overlay0 and _leg_yv is not None and _leg_yv >= 0.90
+                      and _leg_hv is not None and _leg_hv <= 0.05)
+                check(f"{base}: 標題字級 12pt 粗體（sz={_title_sz.group(1) if _title_sz else None} b={_title_bold}）",
+                      bool(_title_sz) and _title_sz.group(1) == "1200" and _title_bold)
+                check(f"{base}: Legend 字級 10pt（sz={_leg_sz.group(1) if _leg_sz else None}）",
+                      bool(_leg_sz) and _leg_sz.group(1) == "1000")
                 check(f"{base}: 水平格線淡灰 D9D9D9（{grid_color}）", grid_color == "D9D9D9")
-                check(f"{base}: 有水平格線、無垂直格線", val_has_grid and not cat_has_grid)
+                check(f"{base}: 有水平格線（Y valAx）、無垂直格線（X catAx）",
+                      bool(yax) and bool(_re.search(r'<(?:c:)?majorGridlines', yax))
+                      and not (catseg and _re.search(r'<(?:c:)?majorGridlines', catseg)))
                 check(f"{base}: Plot Area 手動填滿(manualLayout)", has_manual_layout)
                 check(f"{base}: Plot Area 用內部矩形(layoutTarget=inner)",
                       bool(_re.search(r'<(?:c:)?layoutTarget val="inner"', xml)))
                 check(f"{base}: 無 X/Y 軸標題（僅保留圖表標題）", not axis_has_title)
-                check(f"{base}: X 軸標籤置於 Plot Area 下方 tickLblPos=low（{catpos}）", catpos == "low")
-                check(f"{base}: X 軸每格顯示 tickLblSkip=1（{skips}）",
-                      bool(skips) and all(s == "1" for s in skips))
                 check(f"{base}: X 軸標籤垂直(-90°)", rotated)
-            # 固定尺寸 24×13 cm（EMU 8640000×4680000），不隨資料筆數放大
+            # 固定尺寸 32×22 cm（EMU 11520000×7920000），不隨資料筆數放大
             draws = [nm for nm in z.namelist() if _re.match(r'xl/drawings/drawing\d+\.xml', nm)]
             exts = []
             for d in draws:
                 exts += _re.findall(r'ext cx="(\d+)" cy="(\d+)"', z.read(d).decode("utf-8"))
-            fixed_ok = bool(exts) and all(cx == "8640000" and cy == "4680000" for cx, cy in exts)
-            check(f"圖表固定尺寸 24×13cm（{set(exts)}）", fixed_ok)
+            h_emu = int(round(CFG.CHART_HEIGHT_CM * 360000))
+            check(f"圖表高度固定 {CFG.CHART_HEIGHT_CM}cm（cy={set(cy for _cx, cy in exts)}）",
+                  bool(exts) and all(int(cy) == h_emu for _cx, cy in exts))
+            if CFG.CHART_ADAPTIVE_SIZE:
+                min_emu = int(round(CFG.CHART_MIN_WIDTH_CM * 360000))
+                max_emu = int(round(CFG.CHART_MAX_WIDTH_CM * 360000))
+                check(f"圖表寬度自適應且在 [{CFG.CHART_MIN_WIDTH_CM},{CFG.CHART_MAX_WIDTH_CM}]cm 內"
+                      f"（cx={set(cx for cx, _cy in exts)}）",
+                      bool(exts) and all(min_emu <= int(cx) <= max_emu for cx, _cy in exts))
+            else:
+                w_emu = int(round(CFG.CHART_WIDTH_CM * 360000))
+                check(f"圖表固定寬度 {CFG.CHART_WIDTH_CM}cm、三頁同尺寸（cx={set(cx for cx, _cy in exts)}）",
+                      bool(exts) and all(int(cx) == w_emu for cx, _cy in exts))
         except Exception as e:
             check(f"圖表結構驗證發生例外：{e}", False)
+
+        # ---- Y 軸固定 Major Unit=5：大範圍也不改間距，上下限取整到 5 的倍數、含 0、不裁切 ----
+        print("\n[驗證：Y 軸固定每 5 一格]")
+        try:
+            def _ck_scale(vals, exp_lo, exp_hi):
+                lo, hi, mu = _y_axis_scale(vals)
+                check(f"_y_axis_scale({min(vals)}~{max(vals)}) → mu={mu} lo={lo} hi={hi}"
+                      f"（期望 mu=5 lo={exp_lo} hi={exp_hi}）",
+                      mu == 5 and lo == exp_lo and hi == exp_hi and lo <= 0 <= hi)
+            _ck_scale([-185.0, 160.0], -185, 160)     # 大電流：仍每 5、不跳成 25（-185~160）
+            _ck_scale([0.0, 22.0], 0, 25)             # 正值：0~25
+            _ck_scale([-60.0, 55.0], -60, 55)         # -60~55
+            _ck_scale([-183.0, 158.0], -185, 160)     # 需求範例：158→160、-183→-185、mu=5
+        except Exception as e:
+            check(f"Y 軸固定刻度驗證發生例外：{e}", False)
+
+        # ---- 圖表尺寸：固定或自適應（依 config 旗標）----
+        print("\n[驗證：圖表尺寸模式]")
+        try:
+            if CFG.CHART_ADAPTIVE_SIZE:
+                b, per = CFG.CHART_BASE_WIDTH_CM, CFG.CHART_WIDTH_PER_LABEL_CM
+                lo_w, hi_w = CFG.CHART_MIN_WIDTH_CM, CFG.CHART_MAX_WIDTH_CM
+                def _ckw(count, exp):
+                    got = _chart_width_cm(count)
+                    check(f"_chart_width_cm({count})={got}（期望 {exp}）", abs(got - exp) < 1e-6)
+                _ckw(9, max(lo_w, min(hi_w, b + 9 * per)))
+                _ckw(25, max(lo_w, min(hi_w, b + 25 * per)))
+                _ckw(100000, hi_w)
+                _ckw(0, lo_w)
+                check("Label 越多圖越寬（單調遞增）",
+                      _chart_width_cm(30) > _chart_width_cm(10) >= lo_w)
+            else:
+                check(f"固定尺寸：寬度與 Label 數無關（皆={CFG.CHART_WIDTH_CM}cm）",
+                      _chart_width_cm(0) == CFG.CHART_WIDTH_CM
+                      and _chart_width_cm(9) == CFG.CHART_WIDTH_CM
+                      and _chart_width_cm(500) == CFG.CHART_WIDTH_CM)
+        except Exception as e:
+            check(f"圖表尺寸模式驗證發生例外：{e}", False)
+
+        # ---- X 軸 Label 間隔由 config 控制（改 CFG 值 → 標籤依新間隔）----
+        print("\n[驗證：X 軸 Label 間隔可調（config）]")
+        try:
+            check(f"config 有 X_AXIS_LABEL_INTERVAL_SEC（={CFG.X_AXIS_LABEL_INTERVAL_SEC}）",
+                  isinstance(CFG.X_AXIS_LABEL_INTERVAL_SEC, (int, float))
+                  and CFG.X_AXIS_LABEL_INTERVAL_SEC > 0)
+        except Exception as e:
+            check(f"X 軸 Label 間隔設定驗證發生例外：{e}", False)
+
+        # ---- Arming 門檻：idle/0A 不進入（不建立 Session）；charge 且 |I|≥門檻 才確認 ----
+        print("\n[驗證：Arming 啟動門檻]")
+        try:
+            cur["r"] = reading(0.0, 60, "idle")               # idle、I=0
+            armed_idle = _arm_for_charge_discharge(object(), 0.02, 0.08)
+            check("Arming：idle/0A → 不進入充放電（不建立 Session）", armed_idle is False)
+            cur["r"] = reading(5.0, 60, "charge")             # charge、I≈5.6A ≥ 門檻
+            armed_chg = _arm_for_charge_discharge(object(), 0.0, 0.0)
+            check("Arming：charge 且 |I|≥門檻 → 確認進入（可建立 Session）", armed_chg is True)
+        except Exception as e:
+            check(f"Arming 驗證發生例外：{e}", False)
     finally:
         read_all = orig
 
@@ -2203,6 +2483,11 @@ def main():
         return
     run_live(args.action, args.power, args.mode, args.duration, args.interval,
              ignore_stop=args.ignore_stop)
+
+
+# 模組載入即印出版本橫幅：任何程序（含背景 device_control_menu / run_all）一 import 就顯示，
+# 立即辨識載入的是哪一版模組（避免長駐程序用到舊模組卻無人察覺）。
+print_module_banner()
 
 
 if __name__ == "__main__":

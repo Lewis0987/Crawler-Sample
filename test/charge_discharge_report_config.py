@@ -129,6 +129,33 @@ AUTO_END_ON_CRITICAL = True
 # 連續判定為 idle / PCS 停止的取樣次數 → 視為充放電結束（pcs_stop / completed）
 IDLE_END_SAMPLES = 3
 
+# ---- 啟動門檻（Arming）：未真正進入充/放電前「不建立 Session/資料夾」----
+# run_live 先進入 arming 監測（不建資料夾），需同時滿足：
+#   1) 方向為 charge 或 discharge
+#   2) |battery_current_a| >= START_CURRENT_THRESHOLD_A（排除 0A / 小幅漂移）
+#   連續達到 START_CONFIRM_SAMPLES 次才判定「真正進入充/放電」→ 此時才建立 Session。
+START_CURRENT_THRESHOLD_A = 1.0     # 啟動電流門檻（絕對值，A）
+START_CONFIRM_SAMPLES = 2           # 需連續成立的取樣次數（去抖動）
+
+# X 軸時間 Label 間隔（秒）：以第一筆為基準，每隔此秒數挑最接近的一筆標記；
+# 首/尾一定顯示；曲線仍用完整資料（只調整 Label 顯示）。改此值即同步改變三個紀錄頁。
+#   N秒一個；10 → 每 10 秒一個；30 → 每 30 秒一個
+#   註：N 必須大於取樣間隔（約 5s），否則幾乎每筆都命中目標→形同全顯示。
+X_AXIS_LABEL_INTERVAL_SEC = 10
+
+# ---- 圖表自適應尺寸（三個紀錄頁共用；只變寬度、高度固定）----
+# 依 X 軸 Label 數量決定圖表寬度：Label 越多圖越寬，避免右側/底部大片空白或 Label 過密。
+#   width = CHART_BASE_WIDTH_CM + label_count * CHART_WIDTH_PER_LABEL_CM
+#   再限制在 [CHART_MIN_WIDTH_CM, CHART_MAX_WIDTH_CM]
+# Plot Area／Legend／左右留白皆為比例式（manualLayout 分數）→ 隨寬度同步縮放、不跑位。
+CHART_ADAPTIVE_SIZE = False       # 固定版型：三頁同尺寸、不依 Label 數/資料量改變（True→依 Label 數自適應）
+CHART_HEIGHT_CM = 22.0            # 固定高度
+CHART_WIDTH_CM = 32.0            # 固定寬度（CHART_ADAPTIVE_SIZE=False 時使用）
+CHART_BASE_WIDTH_CM = 16.0       # 自適應基準寬度
+CHART_WIDTH_PER_LABEL_CM = 0.7   # 每個 X 軸 Label 增加的寬度
+CHART_MIN_WIDTH_CM = 20.0        # 寬度下限
+CHART_MAX_WIDTH_CM = 60.0        # 寬度上限
+
 # ======================================================================
 # 輸出欄位（samples / alarms / events）— writer 與 Excel 共用同一份定義
 # ======================================================================
