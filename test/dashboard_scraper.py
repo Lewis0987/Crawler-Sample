@@ -1,38 +1,59 @@
 # -*- coding: utf-8 -*-
 """
-內網 Dashboard 抓取工具 — 正式版（第一階段：Data Overview 整頁）
+內網 Dashboard 抓取工具 — 數據概覽（Data Overview）
 ==================================================================
-核心解析邏輯整合自已驗證的 dashboard_min.py。本階段只做「數據概覽 Data Overview」
-整頁，不碰其他 tab。
+終端摘要「只印目前數據概覽畫面實際顯示的欄位」，欄位名稱、順序、狀態文字、單位
+皆比照前端 Vue 渲染邏輯（batteryOverview / pcsOverview.data / env-detail /
+controlOverview 等）逐欄對應，不沿用舊版摘要、不多印 UI 沒顯示的資料。
 
-【已驗證結論（前端 JS 靜態分析 + 實際回傳）】
-  - baseURL = http://192.168.128.110:8080/admin-api （API 在同主機 8080）
-  - 免登入、免 tenant-id，全部 GET。
-  - overview/* 回傳扁平 dict（key + <key>Unit）。
-  - envCon/*   回傳 list，內含 metricsDataVoList（{mark,value,unit}）。
-  - alarm/list 回傳 {total, rows, code, msg}。
+【資料來源與解析（前端 JS 靜態分析 + 實際回傳校正）】
+  一、電池概覽
+    - 基本資訊 / Rack容量 / Rack極端值：overview/mainControlCollectsInformation、
+      overview/rackCapacityInformation、overview/rackExtremeValueInformation
+      （扁平 dict：<key> + <key>Unit；極端值另含 <key>Index）。
+      數值以「JS 顯示規則」呈現（整數浮點去掉 .0）；絕緣電阻 > 1000 比照前端加千分位。
+  二、PCS概覽（envCon/pcs，list→metricsDataVoList）
+    - 系統：啟停 systemOnOrOffStatus(value) / 併網離網(systemGridTiedStatus·
+      systemOffGridStatus 的 oldValue) / 工作模式(energyDispatchingMode.oldValue 交/直
+      + getRunMode 排程/手動) / 充放電(systemCharging·systemDischarging.oldValue)。
+    - 電量統計：累計交流放/充電 = UI 綁定 LowByte 的 value（accumulatedAcDischargeLowByte /
+      accumulatedAcChargingPowerLowByte，原樣顯示含小數位）；High×65536+Low 的合併值僅供
+      [DEBUG]（SHOW_DEBUG_RAW=True 才印）。當天交流放/充電 dailyDischarged/ChargedEnergyThroughAcPort。
+    - 直流：dcPower / dcCurrent / dcInputVoltage。
+    - 交流：totalPfOfAcBus / totalActivePowerOfAcBus / totalApparentPowerOfAcBus。
+  三、環控概覽
+    - 急停/閉門器/SPD/消防報警/消防故障：envCon/ttyS0 數位訊號，
+      正常 = oldValue=="1" 且 device.alertFlag 非 True（比照 env-detail.js）。
+    - 水浸：envCon/water 的 alarm，正常 = oldValue=="0"。
+    - 冷卻循環系統：envCon/waterPumpStateRead（比照 controlOverview：正常 = 非真值）。
+    - 空調：狀態(alertFlag) / 執行狀態(envicoolEdition=="103"→workingMode 否則
+      equipmentWorkingStatus) / 設定溫度(coolingSetTemperature)。
+    - UPS：狀態(alertFlag) / 工作模式(workingMode) / 電池容量(batteryCapacity)。
+    - 多功能傳感器：狀態(alertFlag) / 溫度 / 濕度 / 甲烷濃度(ch4,%LEL) / 氫氣濃度(h2,ppm)。
+    - AC 380 電量儀：狀態(alertFlag) / 相電壓AB·BC·CA / 相電流A·B·C。
 
-【欄位信心度】
-  - 電池主資訊、PCS 四組、空調、告警：已用實際 JSON 校正（curated）。
-  - Rack 容量/極值、水系統、UPS、ttyS0、多功能傳感器、AC380 電量儀：
-    尚無實際回傳，改用「通用攤平器」帶出 API 真實欄位（不硬猜），
-    待拿到真資料後再做 curated 對應。
-
-【限制】只用 requests GET；不做 POST/PUT/DELETE；不碰設備控制。
+【輸出原則】終端只印上述 UI 欄位；告警等 UI 未顯示於概覽卡片者仍存於 JSON、不進終端。
+【相容性】保留 _flatten_metrics / _fmt_metric 供 device_control_scraper 重用。
+【限制】只用 GET；不做 POST/PUT/DELETE；不碰設備控制。
 
 執行方式：
     pip install requests
-    python dashboard_scraper.py
+    python dashboard_scraper.py --once     # 抓一次即結束
+    python dashboard_scraper.py --loop      # 啟動背景循環（Ctrl+C 乾淨停止）
+    python dashboard_scraper.py             # 依 ENABLE_AUTO_FETCH：True→背景循環 / False→單次
 """
 
 import os
 import csv
 import json
+import atexit
+import argparse
+import threading
 from datetime import datetime
 
 import requests
 
-from api_client import ApiClient  # PCS控制模式(手動/智慧) 需 getRunMode（authed）→ 需登入
+from api_client import ApiClient
 
 
 # ======================================================================
@@ -40,20 +61,24 @@ from api_client import ApiClient  # PCS控制模式(手動/智慧) 需 getRunMod
 # ======================================================================
 BASE_URL = "http://192.168.128.110:8080/admin-api"   # 已驗證；如 8853 有代理可改成 :8853
 TIMEOUT = 8                 # 單支 API 逾時秒數
-INTERVAL_SECONDS = 10       # 每 N 秒抓一次
-MAX_LOOPS = 0               # 最多抓幾輪；0 = 無限（Ctrl+C 停止）
+INTERVAL_SECONDS = 60       # 背景循環每 N 秒抓一次（下限 1 秒，避免設 0 狂打 API）
+# 背景自動抓取總開關：True→無參數執行時自動啟動背景循環；False→不自動啟動（--once 仍可單次抓取）
+ENABLE_AUTO_FETCH = True
 
 # 輸出設定
 OUTPUT_TO_CONSOLE = True
 OUTPUT_TO_JSON = True
 OUTPUT_TO_CSV = True
+# 累計交流放/充電：UI 綁定 LowByte 的 value（正式輸出照此顯示）。High×65536+Low 的
+# 「原始合併值」僅供除錯：設為 True 才會在終端末尾多印 [DEBUG] 兩行；預設 False（正式輸出不顯示）。
+SHOW_DEBUG_RAW = False
 # 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 JSON_PATH = os.path.join(_OUTPUT_DIR, "dashboard_data.json")   # 完整原始資料（每輪覆寫最新快照）
 CSV_PATH = os.path.join(_OUTPUT_DIR, "dashboard_data.csv")     # 每輪摘要（附加一列，累積時間序列）
 
-# 告警本次取回筆數（只影響顯示筆數，不影響 API 回傳的 total）
+# 告警本次取回筆數（僅存 JSON、不印終端；數據概覽卡片不顯示告警明細）
 ALARM_PAGE_SIZE = 3
 
 # ---- Data Overview 全部區塊 endpoint（method 皆為 GET）----
@@ -64,123 +89,22 @@ ENDPOINTS = {
     "Rack極端值資訊": "/hmiGuest/unauthorizedAccess/overview/rackExtremeValueInformation",
     # 二、PCS 概覽
     "PCS概覽":        "/hmiGuest/unauthorizedAccess/envCon/pcs",
-    # 三、環控概覽（6 張卡）
+    # 三、環控概覽
     "環控_空調":      "/hmiGuest/unauthorizedAccess/envCon/air",
-    "環控_水系統":    "/hmiGuest/unauthorizedAccess/envCon/water",
+    "環控_水系統":    "/hmiGuest/unauthorizedAccess/envCon/water",       # 水浸 alarm
     "環控_UPS":       "/hmiGuest/unauthorizedAccess/envCon/ups",
-    "環控_串口ttyS0": "/hmiGuest/unauthorizedAccess/envCon/ttyS0",
+    "環控_串口ttyS0": "/hmiGuest/unauthorizedAccess/envCon/ttyS0",       # 急停/閉門/消防/SPD 數位訊號
     "多功能傳感器":   "/hmiGuest/unauthorizedAccess/envCon/multifunction",
     "AC380電量儀":    "/hmiGuest/unauthorizedAccess/envCon/voltameter",
-    # 二b、PCS 控制模式（手動/智慧）與排程狀態（需登入的 /client、/schedule 端點）
-    "getRunMode":       "/client/dynamic/dataOrControl/pcs/getRunMode",
-    "getScheduleSwitch": "/schedule/config/getScheduleSwitch",
-    # 四、告警資訊
+    "冷卻循環_泵狀態": "/hmiGuest/unauthorizedAccess/envCon/waterPumpStateRead",  # 冷卻循環系統狀態
+    # PCS 工作模式所需（排程/手動）：getRunMode（需登入）
+    "getRunMode":     "/client/dynamic/dataOrControl/pcs/getRunMode",
+    # 告警（僅存 JSON、不印終端）
     "告警資訊":       ("/hmiGuest/unauthorizedAccess/alarm/list", {"pageNo": 1, "pageSize": ALARM_PAGE_SIZE}),
 }
 
-# 尚無實際回傳、改用通用攤平器（會帶出 API 真實欄位）的區塊
-GENERIC_BLOCKS = {
-    "Rack容量資訊", "Rack極端值資訊",
-    "環控_水系統", "環控_UPS", "環控_串口ttyS0", "多功能傳感器", "AC380電量儀",
-}
-
-# ---- 電池概覽主資訊欄位（皆依實際 JSON key 確認）----
-BATTERY_FIELDS = {
-    "電壓": ["rackTotalBatteryVoltage"],                                     # V
-    "電流": ["rackElectricCurrent"],                                         # A
-    "R+":  ["rackInsulationResistanceRPositive"],                            # KΩ
-    "R-":  ["rackInsulationResistanceRPositiveNegative"],                    # KΩ
-    "SOC": ["rackSoc"],                                                      # %
-    "SOH": ["rackSoh"],                                                      # %
-}
-
-# ---- 環控-空調欄位（envCon/air，以 mark 對應；已用實際 JSON 校正）----
-ENV_FIELDS = {
-    "執行狀態": "equipmentWorkingStatus",   # type.attr.run/stop
-    "工作模式": "workingMode",              # type.attr.refrigeration/dehumidification/airSupply...
-    "設定溫度": "coolingSetTemperature",
-    "櫃內溫度": "cabinetTemperature",
-    "櫃內濕度": "cabinetHumidity",
-}
-
-# ---- PCS 概覽（envCon/pcs）分組欄位；標題為顯示中文，值取自對應 mark（皆依實際 JSON 校正）----
-PCS_GROUPS = {
-    "系統資訊": {
-        "啟停狀態":   "systemOnOrOffStatus",
-        "併網/離網":  "systemGridTiedStatus",
-        "充電狀態":   "systemChargingStatus",
-        "放電狀態":   "systemDischargingStatus",
-        "故障狀態":   "systemFaultStatus",
-        "告警狀態":   "systemAlarmStatus",
-        "控制模式":   "controlMode",
-        "模組溫度":   "moduleTemperature",
-        "環境溫度":   "ambientTemperature",
-        "櫃內溫度":   "cabinetTemperature",
-    },
-    "電量統計資訊": {
-        "交流總有功功率": "totalActivePowerOfAcBus",       # kW
-        "交流總無功功率": "totalReactivePowerOfAcBus",     # kVar
-        "交流總視在功率": "totalApparentPowerOfAcBus",     # kVA
-        "可用有功容量":   "availableActivePowerCapacity",  # kW
-        "當日充電電量":   "dailyChargedEnergyThroughAcPort",   # kWh
-        "當日放電電量":   "dailyDischargedEnergyThroughAcPort", # kWh
-    },
-    "直流資訊": {
-        "直流輸入電壓": "dcInputVoltage",   # V
-        "直流電流":     "dcCurrent",        # A
-        "直流功率":     "dcPower",          # kW
-    },
-    "交流資訊": {
-        "AB線電壓":  "voltageOfAcBusLineAB",   # V
-        "BC線電壓":  "voltageOfAcBusLineBC",   # V
-        "CA線電壓":  "voltageOfAcBusLineCA",   # V
-        "A相電流":   "currentOfAcBusLineA",    # A
-        "B相電流":   "currentOfAcBusLineB",    # A
-        "C相電流":   "currentOfAcBusLineC",    # A
-        "母線頻率":  "acBusFrequency",         # Hz
-    },
-}
-
-# ---- AC380 電量儀（envCon/voltameter）mark → 中文欄位（對齊 HMI「AC 380 電量儀」）----
-# 依 mark 對照，不用 index；未列於此表的 mark 仍以原名保留（不遺漏）。
-AC380_FIELDS = {
-    "phaseVoltageAB": "相電壓AB", "phaseVoltageBC": "相電壓BC", "phaseVoltageCA": "相電壓CA",
-    "phaseCurrentA": "相電流A", "phaseCurrentB": "相電流B", "phaseCurrentC": "相電流C",
-    "activePowerA": "A相有功功率", "activePowerB": "B相有功功率", "activePowerC": "C相有功功率",
-    "totalActivePower": "總有功功率",
-    "reactivePowerA": "A相無功功率", "reactivePowerB": "B相無功功率", "reactivePowerC": "C相無功功率",
-    "totalReactivePower": "總無功功率",
-    "apparentPowerA": "A相視在功率", "apparentPowerB": "B相視在功率", "apparentPowerC": "C相視在功率",
-    "totalApparentPower": "總視在功率",
-    "powerFactorA": "A相功率因數", "powerFactorB": "B相功率因數", "powerFactorC": "C相功率因數",
-    "totalPowerFactor": "總功率因數",
-}
-
-# ---- UI 顯示層（formatter）：console 只印 UI 有的欄位；parser 與 JSON 保留完整 ----
-# AC380 電量儀 UI 只顯示相電壓/相電流（HMI 卡片欄位）；功率/功率因數保留在 parser/JSON、console 不印。
-AC380_UI_FIELDS = ["相電壓AB", "相電壓BC", "相電壓CA", "相電流A", "相電流B", "相電流C"]
-
-
-def ui_filter(summary, whitelist):
-    """UI formatter：只保留 whitelist 內且存在的欄位（保序）。parser/JSON 不受影響。"""
-    if not isinstance(summary, dict):
-        return summary
-    return {k: summary[k] for k in whitelist if k in summary}
-
-
-# ---- dashboard_data.csv 固定欄位（只保留 Dashboard 概覽卡片欄位；順序固定）----
-# 由 curated 定義自動組出：電池概覽 / PCS概覽(4組) / 環控空調概覽 / 告警摘要。
-# 未 curated 的通用區塊（Rack容量/極端值、環控_水系統/UPS/串口ttyS0、多功能傳感器、AC380電量儀）
-# 屬 API 原始攤平、非概覽卡片欄位 → 不寫入 CSV；完整原始資料仍在 dashboard_data.json。
-DASHBOARD_CSV_FIELDS = (
-    ["timestamp"]
-    + [f"電池_{k}" for k in BATTERY_FIELDS]
-    + [f"PCS_{g}_{k}" for g, fields in PCS_GROUPS.items() for k in fields]
-    + [f"環控空調_{k}" for k in ENV_FIELDS]
-    + ["告警_API總數", "告警_本批啟用數"]
-)
-
 # ---- i18n 狀態值中文對照（value 為 type.attr.* 這類 key 時翻譯；查不到就保留原字串）----
+# 供 _zh() 使用；device_control_scraper 透過 _flatten_metrics 共用同一份對照。
 STATUS_MAP = {
     "type.attr.desc.normal":      "正常",
     "type.attr.desc.fault":       "故障",
@@ -228,33 +152,86 @@ STATUS_MAP = {
     "type.attr.unitNoGeneralAlarm":"無總告警",
     "type.attr.batteryPowerIsGood":"電池電量正常",
 }
+
+# PCS 啟停狀態顯示（數據概覽用；比照 UI「停止/運轉」，不動共用 STATUS_MAP 以免影響 device_control）
+_PCS_ONOFF_TEXT = {
+    "type.attr.desc.stop":  "停止",
+    "type.attr.desc.off":   "停止",
+    "type.attr.desc.run":   "運轉",
+    "type.attr.desc.running": "運轉",
+    "type.attr.desc.start": "運轉",
+    "type.attr.desc.on":    "運轉",
+}
+
+# PCS getRunMode 值語意（排程/手動）
+_RUNMODE_SMART = {"auto", "schedule", "smart", "intelligent", "智慧模式", "智慧"}
+_RUNMODE_MANUAL = {"manual", "手動模式", "手動"}
+
+# ---- 一、電池概覽：欄位定義（皆對應 overview 扁平 dict 的 <key> / <key>Unit）----
+BATTERY_BASIC = [                       # 基本資訊（含 SOC/SOH，UI 以儀表顯示數值）
+    ("電壓",       "rackTotalBatteryVoltage"),
+    ("電流",       "rackElectricCurrent"),
+    ("絕緣電阻R+", "rackInsulationResistanceRPositive"),
+    ("絕緣電阻R-", "rackInsulationResistanceRPositiveNegative"),
+    ("SOC",        "rackSoc"),
+    ("SOH",        "rackSoh"),
+]
+# 絕緣電阻 > 1000 時比照前端 toLocaleString() 加千分位
+_INSULATION_KEYS = {"rackInsulationResistanceRPositive", "rackInsulationResistanceRPositiveNegative"}
+
+RACK_CAPACITY = [                       # Rack容量資訊（依前端 pcsOverview.data.js 順序）
+    ("可充電電量", "rechargeableBatteryCapacity"),
+    ("可放電電量", "dischargeableCapacity"),
+    ("單次充電能量", "singleChargeEnergy"),
+    ("單次放電能量", "singleDischargeEnergy"),
+    ("累計充電能量", "accumulatedChargingEnergy"),
+    ("累計放電能量", "accumulatedDisChargingEnergy"),
+    ("當日充電能量", "accumulatedDailyChargingEnergy"),
+    ("當日放電能量", "accumulatedDailyDisChargingEnergy"),
+]
+
+RACK_EXTREME = [                        # Rack極端值資訊（含 <key>Index 對應編號）
+    ("最大電壓", "rackCellMaxVoltage"),
+    ("最小電壓", "rackCellMinVoltage"),
+    ("最大溫度", "rackCellMaxTemperature"),
+    ("最小溫度", "rackCellMinTemperature"),
+    ("最大SOC", "rackCellMaxSoc"),
+    ("最小SOC", "rackCellMinSoc"),
+    ("最大SOH", "rackCellMaxSoh"),
+    ("最小SOH", "rackCellMinSoh"),
+]
+
+# ---- 二、PCS 直流/交流資訊：mark 定義（envCon/pcs metricsDataVoList）----
+PCS_DC = [
+    ("直流功率",     "dcPower"),
+    ("直流電流",     "dcCurrent"),
+    ("直流輸入電壓", "dcInputVoltage"),
+]
+PCS_AC = [
+    ("交流母線總功率因數", "totalPfOfAcBus"),
+    ("交流母線總有功功率", "totalActivePowerOfAcBus"),
+    ("交流母線總視在功率", "totalApparentPowerOfAcBus"),
+]
+
+# ---- 三、多功能傳感器 / AC380 電量儀：mark 定義（envCon）----
+MULTIFUNCTION = [
+    ("溫度",     "temperature"),
+    ("濕度",     "humidity"),
+    ("甲烷濃度", "ch4"),
+    ("氫氣濃度", "h2"),
+]
+AC380 = [
+    ("相電壓AB", "phaseVoltageAB"),
+    ("相電壓BC", "phaseVoltageBC"),
+    ("相電壓CA", "phaseVoltageCA"),
+    ("相電流A",  "phaseCurrentA"),
+    ("相電流B",  "phaseCurrentB"),
+    ("相電流C",  "phaseCurrentC"),
+]
 # ======================================================================
 
 
-# ---------------- 共用工具（沿用 dashboard_min.py）----------------
-def _unwrap(payload):
-    """
-    解開 API 封包：code == 0/200 視為成功（優先回 data，無 data 回整包）；
-    失敗保留 code/msg 方便除錯。
-    """
-    if isinstance(payload, dict) and "code" in payload:
-        code = payload.get("code")
-        if code in (0, 200):
-            return payload.get("data", payload)
-        return {"_error": code, "msg": payload.get("msg"), "_raw": payload}
-    return payload
-
-
-def _pick(data, keys, default="N/A"):
-    """從 dict 依候選鍵順序取第一個存在的值；取不到回傳 default。"""
-    if not isinstance(data, dict):
-        return default
-    for k in keys:
-        if k in data and data[k] is not None:
-            return data[k]
-    return default
-
-
+# ---------------- 共用工具 ----------------
 def _zh(value):
     """把 i18n 狀態值（type.attr.*）翻成中文；查不到或非字串就原樣回傳。"""
     if isinstance(value, str) and value in STATUS_MAP:
@@ -262,10 +239,147 @@ def _zh(value):
     return value
 
 
+def _js_num(v):
+    """
+    以「前端 JS 顯示規則」呈現數字：整數值的浮點去掉 .0（0.0→'0'、21.0→'21'），
+    其餘保留最短往返表示（901.8→'901.8'、3.222→'3.222'）。非數字原樣轉字串。
+    """
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v == int(v) else repr(v)
+    return str(v)
+
+
+def _fmt_overview(d, key, comma=False):
+    """overview 扁平 dict：<key> 數值（JS 規則）＋ <key>Unit；comma 且 >1000 時加千分位。"""
+    if not isinstance(d, dict):
+        return "-"
+    v = d.get(key)
+    if v is None:
+        return "-"
+    unit = d.get(key + "Unit", "")
+    if comma and isinstance(v, (int, float)) and abs(v) > 1000:
+        s = f"{int(round(v)):,}"          # 比照前端 toLocaleString()
+    else:
+        s = _js_num(v)
+    return f"{s} {unit}" if unit else s
+
+
+def _fmt_extreme(d, key):
+    """Rack極端值：<key> 數值＋單位，後接對應編號「  #<index>」。"""
+    if not isinstance(d, dict):
+        return "-"
+    v = d.get(key)
+    if v is None:
+        return "-"
+    unit = d.get(key + "Unit", "")
+    idx = d.get(key + "Index")
+    s = f"{_js_num(v)} {unit}" if unit else _js_num(v)
+    if idx not in (None, ""):
+        s += f"  #{idx}"
+    return s
+
+
+def _flatten_env(data):
+    """
+    envCon 回傳（list[device] 或單一 dict）→ {mark: {value, oldValue, unit, alertFlag}}。
+    保留 device 層 alertFlag（數位訊號狀態判斷用）；value 不在此翻譯（顯示時再 _zh）。
+    """
+    flat = {}
+    items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        aflag = item.get("alertFlag")
+        for m in item.get("metricsDataVoList") or []:
+            if isinstance(m, dict) and m.get("mark"):
+                flat[m["mark"]] = {"value": m.get("value"), "oldValue": m.get("oldValue"),
+                                   "unit": m.get("unit"), "alertFlag": aflag}
+    return flat
+
+
+def _fmt_env(flat, mark):
+    """envCon 數值欄位：value（字串，backend 已格式化）＋ unit；無資料回 '-'。"""
+    md = flat.get(mark)
+    if not md or md.get("value") in (None, ""):
+        return "-"
+    v, unit = md["value"], md.get("unit")
+    return f"{v} {unit}" if unit else f"{v}"
+
+
+def _zh_env(flat, mark):
+    """envCon 狀態欄位：value 經 _zh() 中文化（如 workingMode→製冷/市電模式）；無資料回 '-'。"""
+    md = flat.get(mark)
+    if not md or md.get("value") in (None, ""):
+        return "-"
+    return _zh(md["value"])
+
+
+def _pcs_onoff(flat):
+    """PCS 啟停狀態：systemOnOrOffStatus 的 value → 停止/運轉（比照 UI）；無資料回 '-'。"""
+    md = flat.get("systemOnOrOffStatus")
+    if not md or md.get("value") in (None, ""):
+        return "-"
+    raw = md["value"]
+    return _PCS_ONOFF_TEXT.get(raw) or _zh(raw)
+
+
+def _dev_status(data):
+    """裝置通訊/總狀態：device.alertFlag 恰為 False → 正常，否則異常（比照 controlOverview）。"""
+    items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    if not items or not isinstance(items[0], dict):
+        return "異常"
+    return "正常" if items[0].get("alertFlag") is False else "異常"
+
+
+def _io_normal(flat, mark):
+    """ttyS0 數位訊號：正常 = oldValue=='1' 且 device.alertFlag 非 True（env-detail.js 邏輯）。"""
+    md = flat.get(mark)
+    if not md:
+        return "-"
+    good = str(md.get("oldValue")) == "1" and md.get("alertFlag") is not True
+    return "正常" if good else "異常"
+
+
+def _water_normal(flat, mark="alarm"):
+    """水浸（envCon/water alarm）：正常 = oldValue=='0'（env-detail.js 邏輯）。"""
+    md = flat.get(mark)
+    if not md:
+        return "-"
+    return "正常" if str(md.get("oldValue")) == "0" else "異常"
+
+
+def _cooling_status(pump_data):
+    """冷卻循環系統狀態（envCon/waterPumpStateRead）：比照 controlOverview 的 !k.value → 正常/異常。"""
+    if pump_data is None:
+        return "異常"
+    if isinstance(pump_data, bool):
+        return "正常" if not pump_data else "異常"
+    return "正常" if not pump_data else "異常"
+
+
+def _combine_hilo(flat, hi, lo):
+    """累計交流電量 = HighByte×65536 + LowByte（value 已含 ×0.1 縮放），組「值 單位」。"""
+    h, l = flat.get(hi), flat.get(lo)
+    if not h or not l:
+        return "-"
+    try:
+        val = round(float(h["value"]) * 65536 + float(l["value"]), 3)   # round 去除浮點雜訊
+    except (TypeError, ValueError):
+        return "-"
+    unit = l.get("unit") or h.get("unit") or ""
+    return f"{_js_num(val)} {unit}" if unit else _js_num(val)
+
+
+# ---------------- 相容工具（device_control_scraper 依賴，行為與舊版一致）----------------
 def _flatten_metrics(data):
     """
-    把 envCon 回傳的 list 攤平成 {mark: {"value": <已翻譯值>, "unit": <單位或 None>}}。
+    把 envCon 回傳的 list 攤平成 {mark: {"value": <已中文化值>, "unit", "oldValue"}}。
     狀態值（type.attr.*）先經 _zh() 套中文；數值/單位保留原樣，交由 _fmt_metric 組字串。
+    （device_control_scraper 直接 import 使用，請維持此行為。）
     """
     flat = {}
     items = data if isinstance(data, list) else [data]
@@ -279,16 +393,12 @@ def _flatten_metrics(data):
             if not mark:
                 continue
             flat[mark] = {"value": _zh(m.get("value", "")), "unit": m.get("unit"),
-                          "oldValue": m.get("oldValue")}   # oldValue 保留原樣（開關/旗標判斷用）
+                          "oldValue": m.get("oldValue")}
     return flat
 
 
 def _fmt_metric(md, decimals=None):
-    """
-    把 {"value","unit"} 組成顯示字串「value unit」。
-    - decimals 不為 None 時，數值型 value 會格式化為固定小數位。
-    - 無單位時不補；非數字值套小數位失敗則保留原值。
-    """
+    """把 {"value","unit"} 組成顯示字串「value unit」；decimals 不為 None 時數值套固定小數位。"""
     if not isinstance(md, dict):
         return "N/A"
     value, unit = md.get("value"), md.get("unit")
@@ -306,239 +416,170 @@ _client = None
 
 
 def _get_client():
-    """建立並快取已登入的 ApiClient（輪詢時只登入一次）。"""
+    """建立並快取已登入的 ApiClient（輪詢時只登入一次；getRunMode 需登入）。"""
     global _client
     if _client is None:
         _client = ApiClient()
-        _client.login_hmi(USERNAME)   # getRunMode/getScheduleSwitch 需登入
+        _client.login_hmi(USERNAME)
     return _client
 
 
 def get_data_by_api():
-    """逐一 GET 所有 Data Overview 區塊（含 authed getRunMode/getScheduleSwitch）；
-    共用 api_client 的登入與封包解封（code 0/200 → data），單支失敗回 None。"""
+    """逐一 GET 所有數據概覽區塊；client.get 已解封包（code 0/200 → data），單支失敗回 None。"""
     client = _get_client()
     result = {}
     for name, spec in ENDPOINTS.items():
         path, params = spec if isinstance(spec, tuple) else (spec, None)
-        result[name] = client.get(path, params=params)   # client.get 已解封包、失敗回 None
+        result[name] = client.get(path, params=params)
     return result
 
 
-# ---------------- 摘要整理函式 ----------------
+# ---------------- 各區塊摘要（回傳有序 dict，供終端與 CSV 共用）----------------
 def summarize_battery(data):
-    """整理電池概覽主資訊，並組上對應單位（<key>Unit）；無資料回傳 None。"""
-    if not isinstance(data, dict) or data.get("_error"):
-        return None
-    result = {}
-    for label, keys in BATTERY_FIELDS.items():
-        val = _pick(data, keys)
-        if val != "N/A":
-            for k in keys:
-                if k in data and data[k] is not None:
-                    unit = data.get(k + "Unit")
-                    if unit:
-                        val = f"{val} {unit}"
-                    break
-        result[label] = val
-    return result
-
-
-def summarize_pcs(data):
-    """
-    整理 PCS 概覽，依 PCS_GROUPS 分成 系統/電量/直流/交流 四組。
-    回傳 {群組: {欄位: 顯示值}}；無資料回傳 None。
-    """
-    if data is None or (isinstance(data, dict) and data.get("_error")):
-        return None
-    metrics = _flatten_metrics(data)
-    if not metrics:
-        return None
-    grouped = {}
-    for group, fields in PCS_GROUPS.items():
-        grouped[group] = {label: _fmt_metric(metrics.get(mark)) for label, mark in fields.items()}
-    return grouped
-
-
-def pcs_mode_view(pcs_data, runmode, schedule):
-    """
-    PCS 概覽（UI 顯示層）：只回 HMI 有的 4 個模式欄位，與 dashboard_min 完全一致。
-    共用 device_control_scraper 的解析（延遲 import 以避開模組循環），故兩支 dashboard 結果相同。
-      PCS當前狀態（100% 複製前端 pcsMode_US.vue：依 systemOnOrOffStatus[永遠]/fault/gridTied/offGrid/
-                   charging/discharging[oldValue=="1"] 順序，用中文 value 以「 / 」串接）
-      PCS控制模式（手動/智慧）  PCS工作模式（併網/離網）  PCS功率控制模式
-    無資料回傳 None。
-    """
-    if pcs_data is None or (isinstance(pcs_data, dict) and pcs_data.get("_error")):
-        return None
-    from device_control_scraper import (
-        parse_pcs_modes, get_pcs_current_status, _pcs_raw,
-        _CONTROL_MODE_DISPLAY, _GRID_MODE_DISPLAY,
-    )
-    raw = _pcs_raw(pcs_data)
-    modes = parse_pcs_modes(runmode, schedule, raw)
+    """一、電池概覽 → {基本資訊, Rack容量資訊, Rack極端值資訊}（Rack 兩區另取對應 endpoint）。"""
+    basic = data.get("電池概覽")
+    cap = data.get("Rack容量資訊")
+    ext = data.get("Rack極端值資訊")
     return {
-        # PCS當前狀態走唯一共用來源（zh-TW guest PCS → parse_pcs_current_status）
-        "PCS當前狀態":     get_pcs_current_status(_get_client()),
-        "PCS控制模式":     _CONTROL_MODE_DISPLAY[modes["control_mode"]],
-        "PCS工作模式":     _GRID_MODE_DISPLAY[modes["grid_mode"]],
-        "PCS功率控制模式": modes["power_control_mode"],
+        "基本資訊": {label: _fmt_overview(basic, key, comma=(key in _INSULATION_KEYS))
+                     for label, key in BATTERY_BASIC},
+        "Rack容量資訊": {label: _fmt_overview(cap, key) for label, key in RACK_CAPACITY},
+        "Rack極端值資訊": {label: _fmt_extreme(ext, key) for label, key in RACK_EXTREME},
     }
 
 
-def summarize_env(data):
-    """整理環控-空調重要欄位（curated）；無資料回傳 None。"""
-    if data is None or (isinstance(data, dict) and data.get("_error")):
-        return None
-    metrics = _flatten_metrics(data)
-    if not metrics:
-        return None
-    return {label: _fmt_metric(metrics.get(mark)) for label, mark in ENV_FIELDS.items()}
+def summarize_pcs(data):
+    """二、PCS概覽 → {系統資訊, 電量統計資訊, 直流資訊, 交流資訊}。"""
+    flat = _flatten_env(data.get("PCS概覽"))
+    runmode = data.get("getRunMode")
 
+    def old(m):
+        return str((flat.get(m) or {}).get("oldValue") or "")
 
-def summarize_generic(data):
-    """
-    通用攤平器（給尚未 curated 的區塊用）：帶出 API「實際回傳」的欄位，不硬猜。
-    - envCon 型（list 或含 metricsDataVoList）：輸出 {mark: 顯示值}。
-    - overview 型（扁平 dict）：key 配對 <key>Unit 輸出 {key: 顯示值}。
-    無資料回傳 None。
-    """
-    if data is None or (isinstance(data, dict) and data.get("_error")):
-        return None
-
-    # envCon 型
-    if isinstance(data, list) or (isinstance(data, dict) and "metricsDataVoList" in data):
-        metrics = _flatten_metrics(data)
-        return {mark: _fmt_metric(md) for mark, md in metrics.items()} or None
-
-    # overview 扁平 dict 型
-    if isinstance(data, dict):
-        out = {}
-        for k, v in data.items():
-            if v is None or k.endswith("Unit") or k.startswith("_"):
-                continue
-            unit = data.get(k + "Unit")
-            v = _zh(v)
-            out[k] = f"{v} {unit}" if unit else v
-        return out or None
-    return None
-
-
-def summarize_voltameter(data):
-    """
-    AC380 電量儀（envCon/voltameter）共用解析：依 mark 對照中文欄位（AC380_FIELDS，對齊 HMI），
-    **依 mark 取值、非 index**；未列於對照表的 mark 以原名保留（不遺漏）。
-    缺值不誤轉 0：欄位不存在就不輸出該行（_flatten_metrics 只帶回實際回傳的 mark）。
-    只有 1 台電量儀（deviceId 固定），_flatten_metrics 取其 metricsDataVoList。
-    """
-    if data is None or (isinstance(data, dict) and data.get("_error")):
-        return None
-    metrics = _flatten_metrics(data)
-    if not metrics:
-        return None
-    out = {}
-    for mark, label in AC380_FIELDS.items():      # 先照 HMI 欄位順序（依 mark）
-        if mark in metrics:
-            out[label] = _fmt_metric(metrics[mark])
-    for mark, md in metrics.items():              # 其餘未對照的 mark 保留原名，避免遺漏
-        if mark not in AC380_FIELDS:
-            out[mark] = _fmt_metric(md)
-    return out or None
-
-
-def summarize_alarm(data):
-    """
-    整理告警資訊。回傳 (total, active_in_batch, brief)：
-    - total：alarm/list API 回傳的「總筆數」欄位（rows 結構中的 total）。
-             是資料庫端告警總數，非程式計算，也不受 pageSize 影響。
-    - active_in_batch：本次「取回這批資料」中 alarmStatus 為真的筆數。
-             ⚠️ 僅代表本次取回資料中的啟用數，不是全部 total 筆的真實啟用數。
-    - brief：本次取回資料的前 3 筆精簡欄位。
-    無資料時回傳 (None, 0, [])。
-    """
-    if isinstance(data, dict) and not data.get("_error"):
-        items = data.get("rows") or data.get("list") or data.get("records") or []
-        total = data.get("total", len(items))   # total 直接取自 API 回傳欄位，非程式計算
-    elif isinstance(data, list):
-        items, total = data, len(data)
+    # 系統資訊
+    on_off = _pcs_onoff(flat)                                   # 啟停狀態（停止/運轉）
+    if old("systemOffGridStatus") == "1":                      # 併網/離網模式（以 oldValue 判斷）
+        grid = "離網"
+    elif old("systemGridTiedStatus") == "1":
+        grid = "併網"
     else:
-        return None, 0, []
+        grid = "-"
+    ed = old("energyDispatchingMode")                          # 工作模式：交/直 + 排程/手動
+    acdc = "交流" if ed == "0" else "直流" if ed == "1" else ""
+    rm = runmode.strip().lower() if isinstance(runmode, str) else ""
+    suffix = "排程" if rm in _RUNMODE_SMART else "手動" if rm in _RUNMODE_MANUAL else ""
+    working = "離網" if grid == "離網" else ((acdc + suffix) or "-")
+    if old("systemChargingStatus") == "1":                     # 充/放電狀態
+        chg = "充電"
+    elif old("systemDischargingStatus") == "1":
+        chg = "放電"
+    else:
+        chg = "-"
 
-    active_in_batch = sum(
-        1 for a in items
-        if isinstance(a, dict) and a.get("alarmStatus") in (True, 1, "1", "true", "True")
-    )
+    system = {
+        "啟停狀態": on_off,
+        "併網/離網模式": grid,
+        "工作模式": working,
+        "充/放電狀態": chg,
+    }
+    energy = {
+        # UI 綁定 LowByte 的 value（原樣顯示，含小數位）；High/Low 合併值僅供 [DEBUG]，不放正式輸出
+        "累計交流放電電量": _fmt_env(flat, "accumulatedAcDischargeLowByte"),
+        "累計交流充電電量": _fmt_env(flat, "accumulatedAcChargingPowerLowByte"),
+        "當天交流放電電量": _fmt_env(flat, "dailyDischargedEnergyThroughAcPort"),
+        "當天交流充電電量": _fmt_env(flat, "dailyChargedEnergyThroughAcPort"),
+    }
+    dc = {label: _fmt_env(flat, mark) for label, mark in PCS_DC}
+    ac = {label: _fmt_env(flat, mark) for label, mark in PCS_AC}
+    return {"系統資訊": system, "電量統計資訊": energy, "直流資訊": dc, "交流資訊": ac}
 
-    brief = []
-    for a in items[:3]:
-        if not isinstance(a, dict):
-            continue
-        brief.append({
-            "typeMark":    a.get("typeMark", "N/A"),
-            "targetMark":  a.get("targetMark", "N/A"),
-            "level":       a.get("level", "N/A"),
-            "alarmStatus": a.get("alarmStatus", "N/A"),
-            "val":         a.get("val", "N/A"),
-        })
-    return total, active_in_batch, brief
+
+def summarize_env(data):
+    """三、環控概覽 → 依 UI 順序的卡片 dict（每卡片為 {欄位: 值}）。"""
+    ttys0 = _flatten_env(data.get("環控_串口ttyS0"))
+    water = _flatten_env(data.get("環控_水系統"))
+    air = _flatten_env(data.get("環控_空調"))
+    ups = _flatten_env(data.get("環控_UPS"))
+    multi = _flatten_env(data.get("多功能傳感器"))
+    volt = _flatten_env(data.get("AC380電量儀"))
+
+    # 空調執行狀態：envicoolEdition=="103" 用 workingMode，否則 equipmentWorkingStatus（controlOverview 邏輯）
+    edition = str((air.get("envicoolEdition") or {}).get("value") or "")
+    air_run = _zh_env(air, "workingMode") if edition == "103" else _zh_env(air, "equipmentWorkingStatus")
+
+    cards = {
+        "急停按鈕": {"狀態": _io_normal(ttys0, "emergencyButton")},
+        "閉門器":   {"狀態": _io_normal(ttys0, "accessControl")},
+        "水浸":     {"狀態": _water_normal(water)},
+        "SPD":      {"狀態": _io_normal(ttys0, "SPD")},
+        "消防": {
+            "消防報警": _io_normal(ttys0, "fireAlarm"),
+            "消防故障": _io_normal(ttys0, "fireMalfunction"),
+        },
+        "冷卻循環系統": {"狀態": _cooling_status(data.get("冷卻循環_泵狀態"))},
+        "空調": {
+            "狀態": _dev_status(data.get("環控_空調")),
+            "執行狀態": air_run,
+            "設定溫度": _fmt_env(air, "coolingSetTemperature"),
+        },
+        "UPS": {
+            "狀態": _dev_status(data.get("環控_UPS")),
+            "工作模式": _zh_env(ups, "workingMode"),
+            "電池容量": _fmt_env(ups, "batteryCapacity"),
+        },
+        "多功能傳感器": dict(
+            [("狀態", _dev_status(data.get("多功能傳感器")))]
+            + [(label, _fmt_env(multi, mark)) for label, mark in MULTIFUNCTION]
+        ),
+        "AC 380 電量儀": dict(
+            [("狀態", _dev_status(data.get("AC380電量儀")))]
+            + [(label, _fmt_env(volt, mark)) for label, mark in AC380]
+        ),
+    }
+    return cards
+
+
+def build_overview(data):
+    """把一輪 data 整理成數據概覽三大區塊（有序）；終端與 CSV 皆以此為單一來源。"""
+    return {
+        "一、電池概覽": summarize_battery(data),
+        "二、PCS概覽": summarize_pcs(data),
+        "三、環控概覽": summarize_env(data),
+    }
 
 
 # ---------------- 輸出：console 摘要 ----------------
-def _print_kv(mapping, indent="    "):
-    """印出 {label: value}；mapping 為 None 時印「無資料」。"""
-    if not mapping:
-        print(f"{indent}無資料")
-        return
-    for k, v in mapping.items():
-        print(f"{indent}{k}: {v}")
+def pcs_accum_debug(data):
+    """[DEBUG] 累計交流放/充電的 High×65536+Low 原始合併值（僅除錯用，正式輸出不顯示）。"""
+    flat = _flatten_env(data.get("PCS概覽"))
+    return {
+        "累計交流放電電量原始合併值": _combine_hilo(
+            flat, "accumulatedAcDischargePowerHighByte", "accumulatedAcDischargeLowByte"),
+        "累計交流充電電量原始合併值": _combine_hilo(
+            flat, "accumulatedAcChargingPowerHighByte", "accumulatedAcChargingPowerLowByte"),
+    }
 
 
 def print_summary(record):
-    """把一輪 record 印成人看的摘要（不印整包 JSON）。"""
-    data = record["data"]
+    """把一輪 record 印成數據概覽摘要（只印 UI 有顯示的欄位）。"""
+    overview = build_overview(record["data"])
     print("=" * 56)
     print(f"時間：{record['timestamp']}")
-
-    # UI 顯示層（formatter）：console 只印 HMI UI 有的區塊/欄位；完整資料仍在 dashboard_data.json。
-    # Rack容量/Rack極端值、水系統、UPS、串口ttyS0、多功能傳感器 為 raw mark（非 HMI UI 格式）→ console 不印。
-
-    # 一、電池概覽
-    print("\n【一、電池概覽】")
-    print("  ● 主資訊")
-    _print_kv(summarize_battery(data.get("電池概覽")), indent="      ")
-
-    # 二、PCS 概覽（UI：當前狀態/控制模式/工作模式/功率控制模式；不印 4 群組 raw、不印故障狀態）
-    print("\n【二、PCS概覽】")
-    _print_kv(pcs_mode_view(data.get("PCS概覽"), data.get("getRunMode"), data.get("getScheduleSwitch")),
-              indent="  ")
-
-    # 三、環控概覽（空調 + AC380 電量儀；其餘 raw 區塊 console 不印，JSON 保留）
-    print("\n【三、環控概覽】")
-    print("  ● 空調")
-    _print_kv(summarize_env(data.get("環控_空調")), indent="      ")
-    # AC380 電量儀：UI 只印相電壓/相電流（formatter）；完整資料仍在 parser/JSON
-    print("  ● AC380 電量儀")
-    _print_kv(ui_filter(summarize_voltameter(data.get("AC380電量儀")), AC380_UI_FIELDS), indent="      ")
-
-    # 四、告警資訊
-    print("\n【四、告警資訊】")
-    total, active_in_batch, brief = summarize_alarm(data.get("告警資訊"))
-    if total is None:
-        print("    無資料")
-    else:
-        print(f"    告警總數（API total）：{total}")
-        print(f"    目前啟用中的告警數（alarmStatus=True，僅本次取回資料）：{active_in_batch}")
-        print(f"    本次顯示前 {len(brief)} 筆：")
-        if not brief:
-            print("      （無告警項目）")
-        for i, a in enumerate(brief, 1):
-            print(f"      [{i}] typeMark={a['typeMark']} targetMark={a['targetMark']} "
-                  f"level={a['level']} alarmStatus={a['alarmStatus']} val={a['val']}")
+    for section, groups in overview.items():
+        print(f"\n【{section}】")
+        for group, fields in groups.items():
+            print(f"  ● {group}")
+            for label, value in fields.items():
+                print(f"      {label}：{value}")
+    # 除錯用：High/Low 原始合併值（預設關閉，不影響正式與 UI 一致的輸出）
+    if SHOW_DEBUG_RAW:
+        for label, val in pcs_accum_debug(record["data"]).items():
+            print(f"[DEBUG] {label}：{val}")
 
 
 # ---------------- 輸出：JSON（完整原始快照）----------------
 def save_to_json(record, path=JSON_PATH):
-    """把一輪完整原始資料寫成 JSON（每輪覆寫，永遠是最新快照）。"""
+    """把一輪完整原始資料寫成 JSON（每輪覆寫，永遠是最新快照；含 UI 未顯示的原始資料）。"""
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
@@ -548,47 +589,31 @@ def save_to_json(record, path=JSON_PATH):
 
 # ---------------- 輸出：CSV（每輪摘要時間序列）----------------
 def build_summary_row(record):
-    """把一輪 record 攤平成單層摘要 dict（給 CSV 用），欄位帶區塊前綴以免碰撞。"""
-    data = record["data"]
+    """把數據概覽攤平成單層 dict（欄位帶「區塊_群組_欄位」前綴），供 CSV 時間序列用。"""
+    overview = build_overview(record["data"])
     row = {"timestamp": record["timestamp"]}
-
-    # 只輸出概覽卡片（curated）欄位；未 curated 的通用區塊不寫入 CSV（仍在 JSON）。
-    batt = summarize_battery(data.get("電池概覽"))
-    if batt:
-        for k, v in batt.items():
-            row[f"電池_{k}"] = v
-
-    pcs = summarize_pcs(data.get("PCS概覽"))
-    if pcs:
-        for group, fields in pcs.items():
-            for k, v in fields.items():
-                row[f"PCS_{group}_{k}"] = v
-
-    env = summarize_env(data.get("環控_空調"))
-    if env:
-        for k, v in env.items():
-            row[f"環控空調_{k}"] = v
-
-    total, active_in_batch, _ = summarize_alarm(data.get("告警資訊"))
-    row["告警_API總數"] = total
-    row["告警_本批啟用數"] = active_in_batch
+    for section, groups in overview.items():
+        sec = section.split("、")[-1]                       # 去掉「一、」等序號前綴
+        for group, fields in groups.items():
+            for label, value in fields.items():
+                row[f"{sec}_{group}_{label}"] = value
     return row
 
 
 def save_to_csv(row, path=CSV_PATH):
     """
-    逐輪把「概覽卡片欄位」附加一列到 CSV（固定欄位 DASHBOARD_CSV_FIELDS、順序固定）。
-    - 只寫入白名單欄位，未在清單內的欄位不輸出；缺值輸出空字串。
-    - 若既有檔案表頭與固定欄位不符（例如舊版全量欄位），改以固定欄位重新建立檔案，
-      保留仍符合新欄位的舊資料列。使用 utf-8-sig 讓 Excel 正確辨識中文。
+    逐輪把摘要附加一列（固定欄位＝本 row 的鍵、順序固定）。
+    既有檔案表頭與目前欄位不符（含舊版欄位）時，改以目前欄位重建檔案，保留仍相容的舊列。
+    使用 utf-8-sig 讓 Excel 正確辨識中文。
     """
+    fields = list(row.keys())
     try:
         existing_header = []
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
                 existing_header = next(csv.reader(f), [])
 
-        fresh = existing_header != DASHBOARD_CSV_FIELDS  # 表頭不符（含舊版全量）→ 重建
+        fresh = existing_header != fields
         old_rows = []
         if not fresh and os.path.exists(path):
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
@@ -596,18 +621,25 @@ def save_to_csv(row, path=CSV_PATH):
 
         mode = "w" if fresh else "a"
         with open(path, mode, encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=DASHBOARD_CSV_FIELDS,
-                                    extrasaction="ignore", restval="")
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", restval="")
             if fresh:
                 writer.writeheader()
                 for r in old_rows:
-                    writer.writerow({k: r.get(k, "") for k in DASHBOARD_CSV_FIELDS})
-            writer.writerow({k: row.get(k, "") for k in DASHBOARD_CSV_FIELDS})
+                    writer.writerow({k: r.get(k, "") for k in fields})
+            writer.writerow({k: row.get(k, "") for k in fields})
     except OSError as e:
         print(f"  [警告] 寫入 CSV 失敗：{e}")
 
 
-# ---------------- 主流程 ----------------
+# ---------------- 主流程 / 背景循環控制 ----------------
+LOOP_THREAD_NAME = "dashboard-fetch-loop"
+_LOCK_PATH = os.path.join(_OUTPUT_DIR, ".dashboard_loop.lock")  # 跨程序鎖：避免多程序同時背景寫入
+
+_loop_thread = None                 # 目前背景抓取 Thread（None = 未執行）
+_loop_stop = threading.Event()      # 停止旗標；set() 即要求循環結束
+_loop_guard = threading.Lock()      # 保護 start/stop 臨界區（避免競態、重複建立）
+
+
 def collect_once():
     """抓一輪，回傳 record。"""
     return {
@@ -616,31 +648,152 @@ def collect_once():
     }
 
 
-def main():
-    """依設定每 N 秒抓一次，並輸出到 console / JSON / CSV。"""
-    import time  # 僅主迴圈需要
+def fetch_dashboard():
+    """抓一次並輸出到 console / JSON / CSV；回傳 record（單次與循環共用）。"""
+    record = collect_once()
+    if OUTPUT_TO_CONSOLE:
+        print_summary(record)
+    if OUTPUT_TO_JSON:
+        save_to_json(record)
+    if OUTPUT_TO_CSV:
+        save_to_csv(build_summary_row(record))
+    return record
 
-    print(f"開始抓取，baseURL={BASE_URL}，間隔 {INTERVAL_SECONDS} 秒（Ctrl+C 停止）")
-    loops = 0
+
+# ---- 跨程序 PID 鎖（Windows 以 tasklist 判斷存活；判斷不了則保守放行）----
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
     try:
-        while True:
-            record = collect_once()
+        import subprocess
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                             capture_output=True, text=True, timeout=5)
+        return str(pid) in (out.stdout or "")
+    except Exception:
+        return True   # 不確定就當作存活（保守，避免搶鎖造成雙寫）
 
-            if OUTPUT_TO_CONSOLE:
-                print_summary(record)
-            if OUTPUT_TO_JSON:
-                save_to_json(record)
-            if OUTPUT_TO_CSV:
-                save_to_csv(build_summary_row(record))
 
-            loops += 1
-            if MAX_LOOPS and loops >= MAX_LOOPS:
-                print(f"\n已達設定輪數 {MAX_LOOPS}，結束。")
-                break
+def _read_lock_pid():
+    try:
+        with open(_LOCK_PATH, "r", encoding="utf-8") as f:
+            return int((f.read().strip() or "0"))
+    except (OSError, ValueError):
+        return 0
 
-            time.sleep(INTERVAL_SECONDS)
+
+def _acquire_process_lock():
+    """取得跨程序鎖：其他存活程序持鎖→失敗；陳舊鎖自動接管。鎖檔操作失敗則降級放行。"""
+    try:
+        if os.path.exists(_LOCK_PATH):
+            pid = _read_lock_pid()
+            if pid and pid != os.getpid() and _pid_alive(pid):
+                return False
+        with open(_LOCK_PATH, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        return True
+    except OSError:
+        return True
+
+
+def _release_process_lock():
+    try:
+        if os.path.exists(_LOCK_PATH) and _read_lock_pid() in (0, os.getpid()):
+            os.remove(_LOCK_PATH)
+    except OSError:
+        pass
+
+
+def _loop_run():
+    """背景循環本體：while not stop_event → fetch → stop_event.wait(interval)（不使用 time.sleep）。"""
+    interval = max(1, INTERVAL_SECONDS)     # 下限 1 秒，避免 INTERVAL_SECONDS=0 狂打 API
+    while not _loop_stop.is_set():
+        try:
+            fetch_dashboard()
+        except Exception as e:              # 單輪例外不終止整個循環
+            print(f"[Dashboard] 背景抓取例外：{e}")
+        _loop_stop.wait(interval)           # 可被 stop_dashboard_loop() 立即喚醒
+
+
+def start_dashboard_loop():
+    """
+    啟動背景抓取循環（單例）：
+      - 已在執行 → 印「Dashboard 自動抓取已在執行」，不建立第二個 Thread。
+      - 其他程序持鎖 → 略過（避免多程序同時寫 dashboard_data.json）。
+      - 啟動前 stop_event.clear()，建立 daemon Thread（名稱 dashboard-fetch-loop）。
+    回傳 True=本次成功啟動；False=未啟動。
+    """
+    global _loop_thread
+    with _loop_guard:
+        if _loop_thread is not None and _loop_thread.is_alive():
+            print("Dashboard 自動抓取已在執行")
+            return False
+        if not _acquire_process_lock():
+            print(f"Dashboard 自動抓取已由其他程序（PID {_read_lock_pid()}）執行中，略過啟動")
+            return False
+        _loop_stop.clear()
+        _loop_thread = threading.Thread(target=_loop_run, name=LOOP_THREAD_NAME, daemon=True)
+        _loop_thread.start()
+    print(f"Dashboard 自動抓取已啟動（thread={LOOP_THREAD_NAME}，間隔 {max(1, INTERVAL_SECONDS)} 秒）")
+    return True
+
+
+def stop_dashboard_loop():
+    """停止背景循環：stop_event.set() → 等待 Thread 結束 → 清除 Thread 與跨程序鎖。可安全重複呼叫。"""
+    global _loop_thread
+    with _loop_guard:
+        th = _loop_thread
+        if th is None or not th.is_alive():
+            _loop_thread = None
+            _release_process_lock()
+            return False
+        _loop_stop.set()
+    th.join(timeout=max(1, INTERVAL_SECONDS) + TIMEOUT + 5)
+    _loop_thread = None
+    _release_process_lock()
+    print("Dashboard 自動抓取已停止")
+    return True
+
+
+# 程式結束（正常/例外/atexit）時保證停止背景循環，不留背景 Thread 或鎖檔。
+atexit.register(stop_dashboard_loop)
+
+
+def main():
+    """
+    CLI 模式：
+      --once  抓一次後結束（永遠可用，忽略 ENABLE_AUTO_FETCH）。
+      --loop  啟動背景循環，直到 Ctrl+C 才 stop_dashboard_loop() 乾淨停止。
+      無參數  依 ENABLE_AUTO_FETCH：True→自動背景循環；False→單次抓取。
+    """
+    parser = argparse.ArgumentParser(description="Dashboard 數據概覽抓取")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--once", action="store_true", help="抓一次後結束")
+    group.add_argument("--loop", action="store_true", help="背景循環，每 INTERVAL_SECONDS 一次直到 Ctrl+C")
+    args = parser.parse_args()
+
+    loop_mode = args.loop or (not args.once and ENABLE_AUTO_FETCH)
+
+    if not loop_mode:                       # --once，或無參數且 ENABLE_AUTO_FETCH=False
+        fetch_dashboard()
+        return
+
+    # Ctrl+Break（Windows SIGBREAK）也比照 Ctrl+C 觸發 KeyboardInterrupt → 乾淨停止
+    import signal
+    try:
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+    except (AttributeError, ValueError):
+        pass                                 # 非 Windows 或非主執行緒：略過
+
+    print(f"開始背景抓取，baseURL={BASE_URL}，間隔 {max(1, INTERVAL_SECONDS)} 秒（Ctrl+C 停止）")
+    if not start_dashboard_loop():
+        return                              # 已有其他實例在跑，不重複啟動
+    try:
+        while _loop_thread is not None and _loop_thread.is_alive():
+            _loop_thread.join(timeout=0.5)   # 分段 join，讓 Ctrl+C 可即時中斷
     except KeyboardInterrupt:
-        print("\n使用者中斷（Ctrl+C），程式結束。")
+        print("\n使用者中斷（Ctrl+C）…")
+    finally:
+        stop_dashboard_loop()
 
 
 if __name__ == "__main__":

@@ -31,8 +31,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 任務定義（順序即執行順序）。run_all 只知道 script 與 expected outputs，不碰其內部邏輯。
 TASKS = [
-    {"key": "dashboard", "script": "dashboard_min.py",
-     "outputs": ["dashboard_min.json"]},
+    {"key": "dashboard", "script": "dashboard_scraper.py", "args": ["--once"],
+     "outputs": ["dashboard_data.json", "dashboard_data.csv"]},
     {"key": "battery", "script": "battery_data_scraper.py",
      "outputs": ["battery_data.json", "battery_data.csv",
                  "battery_cells.json", "battery_cells.csv"]},
@@ -91,7 +91,7 @@ def run_task(task, idx, total):
         return "FAIL"
 
     proc = subprocess.run(
-        [sys.executable, "-X", "utf8", script_path],
+        [sys.executable, "-X", "utf8", script_path, *task.get("args", [])],
         cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
 

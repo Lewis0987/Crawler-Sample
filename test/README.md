@@ -13,8 +13,7 @@
 |---|---|
 | `api_client.py` | API 薄封裝（session／登入／`Authorization: Bearer`／統一 timeout）。`login123.env` 存真實密碼（已 gitignore）。 |
 | `device_control_scraper.py` | **共用解析核心**。PCS／電池／空調／進排風／冷卻循環等區塊解析；產生 `device_control_readonly.json`。`parse_pcs_current_status()` 於此定義（唯一）。 |
-| `dashboard_scraper.py` | Dashboard 擷取；`pcs_mode_view()`、AC380 電量儀摘要；輸出 `dashboard_data.csv`。 |
-| `dashboard_min.py` | 精簡 Dashboard（電池／PCS／AC380／環控／告警概覽）。 |
+| `dashboard_scraper.py` | **唯一 Dashboard 抓取程式**。數據概覽（電池／PCS／環控）逐欄對齊 UI；`--once` 單次 / `--loop` 背景循環（`start_dashboard_loop`/`stop_dashboard_loop`，可乾淨停止、單例）；輸出 `dashboard_data.json` / `dashboard_data.csv`。 |
 | `device_control_menu.py` | CLI 設備控制選單（查詢＋控制）。 |
 | `device_control_operator.py` | PCS 控制模式 payload 組裝與送出（需 `--execute` + YES）。 |
 | `test_pcs_modes.py` | 離線單元測試（PCS 模式／當前狀態解析）。 |
@@ -98,11 +97,11 @@ def parse_pcs_current_status(metrics):
 ```
 
 資料來源（唯一共用）：`get_pcs_current_status(client)` → `fetch_pcs_status_data()`（帶 `Accept-Language: zh-TW`）→ `parse_pcs_current_status()`。
-四支輸出全部共用此**同一函式與同一來源**（無重複邏輯）：
+共用此**同一函式與同一來源**（無重複邏輯）：
 - `device_control_scraper.parse_pcs()`（`pcs_status_data` 為 zh-TW 抓取）→ 寫入 `device_control_readonly.json`
-- `dashboard_scraper.pcs_mode_view()` → `get_pcs_current_status(_get_client())`
-- `dashboard_min.py` → 使用 `dashboard_scraper.pcs_mode_view()`
 - `device_control_menu.py` → 顯示 `device_control_readonly.json`
+
+> 註：`dashboard_scraper.py` 的「數據概覽」PCS 區塊改用自身 `summarize_pcs()`（啟停狀態取 value、併網/離網與充放電取 oldValue），與上述「PCS當前狀態 badge」為不同用途、不共用。
 
 > 注意：mode 類解析（`PCS工作模式`/`PCS功率控制模式`/`PCS控制模式`）仍讀 **enum**（不帶語言標頭）的那份資料，故 zh-TW 僅用於當前狀態 badge，不影響 mode 解析。
 
@@ -118,8 +117,8 @@ def parse_pcs_current_status(metrics):
 
 ```bash
 python device_control_scraper.py     # 產生 device_control_readonly.json + 主控台摘要
-python dashboard_scraper.py          # Dashboard + dashboard_data.csv
-python dashboard_min.py              # 精簡 Dashboard
+python dashboard_scraper.py --once   # Dashboard 抓一次（數據概覽）→ dashboard_data.json / .csv
+python dashboard_scraper.py --loop   # Dashboard 背景循環（每 INTERVAL_SECONDS 一次，Ctrl+C 停止）
 python device_control_menu.py        # CLI 設備控制選單
 python run_all.py                    # 一鍵執行全部
 python test_pcs_modes.py             # 離線單元測試
