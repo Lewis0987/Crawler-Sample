@@ -413,15 +413,31 @@ def _fmt_metric(md, decimals=None):
 # ---------------- 抓取（api_client / 只用 GET）----------------
 USERNAME = "hmiUser"
 _client = None
+_login_ok = False   # 最近一次登入是否成功（需登入端點如 getRunMode 是否可用）
+
+# 需登入才能取得的欄位，登入失敗時顯示此標記（與「空值 -」語意區分：- = API 回空值/未知）
+LOGIN_FAILED_TAG = "登入失敗（需 HMI 權限）"
+
+# 終端黃色警告（Windows 10+ 主控台支援 ANSI；載入時嘗試啟用 VT，無害）
+_YELLOW, _RESET = "\033[33m", "\033[0m"
+try:
+    os.system("")
+except Exception:
+    pass
 
 
 def _get_client():
-    """建立並快取已登入的 ApiClient（輪詢時只登入一次；getRunMode 需登入）。"""
-    global _client
+    """建立並快取 ApiClient（輪詢時只登入一次；記錄登入結果供資料來源標示/需登入欄位判斷）。"""
+    global _client, _login_ok
     if _client is None:
         _client = ApiClient()
-        _client.login_hmi(USERNAME)
+        _login_ok = bool(_client.login_hmi(USERNAME))
     return _client
+
+
+def is_login_ok():
+    """最近一次登入是否成功。"""
+    return _login_ok
 
 
 def get_data_by_api():
@@ -448,8 +464,10 @@ def summarize_battery(data):
     }
 
 
-def summarize_pcs(data):
-    """二、PCS概覽 → {系統資訊, 電量統計資訊, 直流資訊, 交流資訊}。"""
+def summarize_pcs(data, login_ok=True):
+    """二、PCS概覽 → {系統資訊, 電量統計資訊, 直流資訊, 交流資訊}。
+    login_ok=False（HMI 登入失敗）時，需登入的「工作模式」（排程/手動來自 getRunMode）標為 <登入失敗>；
+    其餘欄位（啟停/併網離網/充放電/電量/直流/交流）皆為免登入 guest 端點的即時 LIVE 值，照常顯示。"""
     flat = _flatten_env(data.get("PCS概覽"))
     runmode = data.get("getRunMode")
 
@@ -464,11 +482,15 @@ def summarize_pcs(data):
         grid = "併網"
     else:
         grid = "-"
-    ed = old("energyDispatchingMode")                          # 工作模式：交/直 + 排程/手動
-    acdc = "交流" if ed == "0" else "直流" if ed == "1" else ""
-    rm = runmode.strip().lower() if isinstance(runmode, str) else ""
-    suffix = "排程" if rm in _RUNMODE_SMART else "手動" if rm in _RUNMODE_MANUAL else ""
-    working = "離網" if grid == "離網" else ((acdc + suffix) or "-")
+    # 工作模式：交/直（guest）＋ 排程/手動（來自需登入的 getRunMode）。登入失敗→整欄標 <登入失敗>
+    if not login_ok:
+        working = LOGIN_FAILED_TAG
+    else:
+        ed = old("energyDispatchingMode")
+        acdc = "交流" if ed == "0" else "直流" if ed == "1" else ""
+        rm = runmode.strip().lower() if isinstance(runmode, str) else ""
+        suffix = "排程" if rm in _RUNMODE_SMART else "手動" if rm in _RUNMODE_MANUAL else ""
+        working = "離網" if grid == "離網" else ((acdc + suffix) or "-")
     if old("systemChargingStatus") == "1":                     # 充/放電狀態
         chg = "充電"
     elif old("systemDischargingStatus") == "1":
@@ -539,11 +561,11 @@ def summarize_env(data):
     return cards
 
 
-def build_overview(data):
+def build_overview(data, login_ok=True):
     """把一輪 data 整理成數據概覽三大區塊（有序）；終端與 CSV 皆以此為單一來源。"""
     return {
         "一、電池概覽": summarize_battery(data),
-        "二、PCS概覽": summarize_pcs(data),
+        "二、PCS概覽": summarize_pcs(data, login_ok),
         "三、環控概覽": summarize_env(data),
     }
 
@@ -561,10 +583,29 @@ def pcs_accum_debug(data):
 
 
 def print_summary(record):
-    """把一輪 record 印成數據概覽摘要（只印 UI 有顯示的欄位）。"""
-    overview = build_overview(record["data"])
+    """把一輪 record 印成數據概覽摘要（只印 UI 有顯示的欄位），並於開頭標示資料來源。"""
+    source = record.get("source", "LIVE(API)")
+    login_ok = record.get("login_ok", True)
+
     print("=" * 56)
-    print(f"時間：{record['timestamp']}")
+    # 抓取全失敗且無快取 → 不印可能過期的設備資訊，直接顯示無資料
+    if source is None:
+        print(f"時間：{record['timestamp']}")
+        print(f"{_YELLOW}登入失敗／無法連線，無法取得最新資料（且無可用快取）。{_RESET}")
+        return
+
+    # 資料來源標頭（LIVE=即時 API；CACHE=即時抓取失敗時改讀上一輪 JSON，可能過期）
+    if source == "CACHE(JSON)":
+        print(f"{_YELLOW}資料來源：CACHE(JSON) @ {record.get('cache_time', '?')}"
+              f"（⚠ 可能過期：本次即時抓取失敗，顯示上一輪快照）{_RESET}")
+    else:
+        print(f"資料來源：LIVE(API) @ {record['timestamp']}")
+
+    # 登入失敗警告：guest 資料仍為即時 LIVE，但需登入欄位無法取得
+    if not login_ok:
+        print(f"{_YELLOW}⚠ HMI 登入失敗：目前使用 Guest API，部分需登入欄位無法取得。{_RESET}")
+
+    overview = build_overview(record["data"], login_ok)
     for section, groups in overview.items():
         print(f"\n【{section}】")
         for group, fields in groups.items():
@@ -590,7 +631,7 @@ def save_to_json(record, path=JSON_PATH):
 # ---------------- 輸出：CSV（每輪摘要時間序列）----------------
 def build_summary_row(record):
     """把數據概覽攤平成單層 dict（欄位帶「區塊_群組_欄位」前綴），供 CSV 時間序列用。"""
-    overview = build_overview(record["data"])
+    overview = build_overview(record["data"], record.get("login_ok", True))
     row = {"timestamp": record["timestamp"]}
     for section, groups in overview.items():
         sec = section.split("、")[-1]                       # 去掉「一、」等序號前綴
@@ -640,12 +681,50 @@ _loop_stop = threading.Event()      # 停止旗標；set() 即要求循環結束
 _loop_guard = threading.Lock()      # 保護 start/stop 臨界區（避免競態、重複建立）
 
 
+# 需登入才能取得的區塊（其餘皆為免登入 guest 端點，登入失敗仍為 LIVE）
+_LOGIN_REQUIRED_KEYS = {"getRunMode"}
+
+
+def _has_live(data):
+    """是否至少有一個 guest 區塊取得有效即時資料（排除 None 與 {_error}）。"""
+    for k, v in (data or {}).items():
+        if k in _LOGIN_REQUIRED_KEYS or v is None:
+            continue
+        if isinstance(v, dict) and v.get("_error"):
+            continue
+        return True
+    return False
+
+
+def _load_cache(path=JSON_PATH):
+    """讀取上一輪寫入的 dashboard_data.json（即時抓取全失敗時的 fallback）；無/損毀回 None。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+        if isinstance(rec, dict) and isinstance(rec.get("data"), dict):
+            return rec
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def collect_once():
-    """抓一輪，回傳 record。"""
-    return {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "data": get_data_by_api(),
-    }
+    """
+    抓一輪並標示資料來源：
+      - LIVE(API)：至少一個 guest 區塊取得即時資料（登入失敗仍算 LIVE，因 guest 免登入）。
+      - CACHE(JSON)：guest 全部抓取失敗 → 改讀上一輪 dashboard_data.json（明確標記、可能過期）。
+      - None：抓取全失敗且無快取 → print_summary 顯示「無法取得最新資料」。
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = get_data_by_api()
+    login_ok = is_login_ok()
+    if _has_live(data):
+        return {"timestamp": now, "data": data, "login_ok": login_ok, "source": "LIVE(API)"}
+    cached = _load_cache()
+    if cached:
+        return {"timestamp": now, "data": cached.get("data", {}), "login_ok": login_ok,
+                "source": "CACHE(JSON)", "cache_time": cached.get("timestamp")}
+    return {"timestamp": now, "data": {}, "login_ok": login_ok, "source": None}
 
 
 def fetch_dashboard():
@@ -653,10 +732,12 @@ def fetch_dashboard():
     record = collect_once()
     if OUTPUT_TO_CONSOLE:
         print_summary(record)
-    if OUTPUT_TO_JSON:
-        save_to_json(record)
-    if OUTPUT_TO_CSV:
-        save_to_csv(build_summary_row(record))
+    # 只有 LIVE 才覆寫 JSON/CSV：CACHE（讀舊檔）不回寫、無資料不寫，避免以舊蓋新或污染時間序列
+    if record.get("source") == "LIVE(API)":
+        if OUTPUT_TO_JSON:
+            save_to_json(record)
+        if OUTPUT_TO_CSV:
+            save_to_csv(build_summary_row(record))
     return record
 
 
