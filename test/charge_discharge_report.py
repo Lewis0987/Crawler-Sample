@@ -2030,6 +2030,44 @@ def _read_csv_dicts(path):
         return list(csv.DictReader(f))
 
 
+# ======================================================================
+# 報告目錄刪除保護（防止誤刪 output/charge_discharge_reports 歷史報告）
+# ======================================================================
+# 預設禁止刪除正式報告目錄；一般流程不應開啟。需刪除時必須明確、手動設為 True。
+ALLOW_REPORT_DELETE = False
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_OUTPUT_ROOT = os.path.join(_PROJECT_ROOT, "output")
+_REPORT_ROOT = os.path.join(_OUTPUT_ROOT, CFG.OUTPUT_SUBDIR)     # output/charge_discharge_reports（正式，受保護）
+_TEST_OUTPUT_ROOT = os.path.join(_OUTPUT_ROOT, "test_output")    # selftest 專用，永不碰正式報告
+
+
+def _within(child, parent):
+    """child 是否等於 parent 或位於 parent 底下（皆取絕對路徑比較）。"""
+    child = os.path.abspath(child)
+    parent = os.path.abspath(parent)
+    return child == parent or child.startswith(parent + os.sep)
+
+
+def _safe_rmtree(path):
+    """
+    受保護的資料夾刪除（全專案唯一允許的刪除入口）：
+      (4) 目標為「正式報告根目錄」本身或其上層（output/、專案根）→ 立即中止並拋 RuntimeError。
+      (3) 目標位於正式報告目錄底下（session 子資料夾）→ 預設禁止（除非 ALLOW_REPORT_DELETE=True）。
+          → 正式模式（ALLOW_REPORT_DELETE=False）任何程式都無法刪除 output/charge_discharge_reports。
+      其餘（例如 output/test_output 底下）→ 允許刪除。
+    """
+    import shutil
+    ap = os.path.abspath(path)
+    # (4) 報告根目錄本身，或其上層（刪上層會連帶刪到報告）→ 一律中止
+    if ap == _REPORT_ROOT or _within(_REPORT_ROOT, ap):
+        raise RuntimeError(f"[報告保護] 拒絕刪除正式報告根目錄或其上層，已中止：{ap}")
+    # (3) 正式報告目錄底下的任何內容 → 預設禁止
+    if _within(ap, _REPORT_ROOT) and not ALLOW_REPORT_DELETE:
+        raise RuntimeError(f"[報告保護] 正式報告目錄禁止刪除（ALLOW_REPORT_DELETE=False）：{ap}")
+    shutil.rmtree(ap, ignore_errors=True)
+
+
 def selftest():
     """
     離線自我測試（不連設備）：驗證 Session append/resume 累積機制。
@@ -2037,18 +2075,18 @@ def selftest():
             ③ resume 再追加 5 筆放電 → 完成。全程注入假時鐘與合成 reading，不觸網。
     """
     print("== charge_discharge_report 離線自我測試：Session append / resume 累積 ==")
-    output_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                               "output", CFG.OUTPUT_SUBDIR)
+    # selftest 一律寫入獨立 output/test_output，絕不碰正式報告目錄 output/charge_discharge_reports
+    output_root = _TEST_OUTPUT_ROOT
+    os.makedirs(output_root, exist_ok=True)
     base = datetime(2026, 7, 17, 9, 0, 0)
-    # selftest 用固定示範時間 → 每次都清掉舊示範資料夾（含歷史 _2/_3… 殘留），
-    # 讓示範 Session 永遠重用同一個乾淨資料夾，不再累積。（真實 Session 不受影響）
+    # selftest 用固定示範時間 → 每次都清掉「test_output 內」舊示範資料夾（含歷史 _2/_3… 殘留），
+    # 讓示範 Session 永遠重用同一個乾淨資料夾。（正式報告目錄不受影響、且被 _safe_rmtree 保護禁止刪除）
     import glob as _glob
-    import shutil as _shutil
     _demo_base = base.strftime(CFG.SESSION_FOLDER_TIME_FMT) + "_auto"
     for _p in ([os.path.join(output_root, _demo_base)]
                + _glob.glob(os.path.join(output_root, _demo_base + "_*"))):
         if os.path.isdir(_p):
-            _shutil.rmtree(_p, ignore_errors=True)
+            _safe_rmtree(_p)   # 經保護：允許 test_output，禁止刪正式報告目錄
     clk = {"dt": base}
     now_fn = lambda: clk["dt"]                       # noqa: E731
     cur = {"r": None}
