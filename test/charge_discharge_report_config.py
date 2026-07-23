@@ -159,8 +159,11 @@ CHART_MAX_WIDTH_CM = 60.0        # 寬度上限
 # ======================================================================
 # 輸出欄位（samples / alarms / events）— writer 與 Excel 共用同一份定義
 # ======================================================================
+# 註：Session 固定動作標籤（charge/discharge/auto）刻意「不」放入逐筆 Raw Data
+#     （每筆都重複同一值、無資訊量）；僅保留於 session_state.json / Summary / metadata / 資料夾名。
+#     每筆即時充放電方向請看 charge_discharge_direction 欄（charge/discharge/idle，逐筆變化）。
 SAMPLE_FIELDS = [
-    "sample_index", "timestamp", "elapsed_seconds", "action", "target_power_kw",
+    "sample_index", "timestamp", "elapsed_seconds", "target_power_kw",
     "pcs_status", "pcs_control_mode", "pcs_work_mode", "pcs_power_control_mode",
     "actual_active_power_kw", "actual_reactive_power_kvar",
     "battery_status", "battery_power_status",

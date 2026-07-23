@@ -979,7 +979,7 @@ class ReportSession:
             "sample_index": self.sample_index,
             "timestamp": _now_str(),
             "elapsed_seconds": elapsed,
-            "action": self.action,
+            # Session 固定標籤（self.action）不放逐筆 Raw Data；保留於 session_state.json / Summary / 資料夾名
             "target_power_kw": self.target_power_kw,
             "pcs_status": r.get("pcs_status"),
             "pcs_control_mode": r.get("pcs_control_mode"),
