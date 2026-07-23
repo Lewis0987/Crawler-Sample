@@ -139,9 +139,12 @@ START_CONFIRM_SAMPLES = 2           # 需連續成立的取樣次數（去抖動
 
 # X 軸時間 Label 間隔（秒）：以第一筆為基準，每隔此秒數挑最接近的一筆標記；
 # 首/尾一定顯示；曲線仍用完整資料（只調整 Label 顯示）。改此值即同步改變三個紀錄頁。
-#   N秒一個；10 → 每 10 秒一個；30 → 每 30 秒一個
-#   註：N 必須大於取樣間隔（約 5s），否則幾乎每筆都命中目標→形同全顯示。
-X_AXIS_LABEL_INTERVAL_SEC = 10
+# N 秒一個；10 → 每 10 秒一個；30 → 每 30 秒一個
+X_AXIS_LABEL_INTERVAL_SEC = 10  # 註：N 必須大於取樣間隔（約 5s），否則幾乎每筆都命中目標→形同全顯示。
+
+# X 軸 Label 選取的除錯列印（[X-LABEL 驗證]…目標/區間/選中）。預設 False＝正式執行不輸出；
+# 僅開發驗證時設 True 才印。此旗標只控制 Console 輸出，不影響 Label 演算法/±3s 搜尋/Excel 圖表。
+DEBUG_XLABEL = False
 
 # ---- 圖表自適應尺寸（三個紀錄頁共用；只變寬度、高度固定）----
 # 依 X 軸 Label 數量決定圖表寬度：Label 越多圖越寬，避免右側/底部大片空白或 Label 過密。
@@ -265,9 +268,9 @@ ANALYSIS_COMM_MIN_RATE = 1.0       # 資料完整率低於此 → 通訊 Warning
 TAB_COLORS = {
     "Summary": "548235",      # 綠
     "KPI": "2E75B6",          # 藍
-    "充放電紀錄": "548235",    # 綠
-    "充電紀錄": "ED7D31",      # 橘黃 Orange
-    "放電紀錄": "FFC000",      # 黃 Yellow
+    "Charge & Discharge": "548235",    # 綠
+    "Charge": "ED7D31",                # 橘黃 Orange
+    "Discharge": "FFC000",             # 黃 Yellow
     "Raw Data": "808080",     # 灰
     "Alarm": "C00000",        # 紅 Red
 }

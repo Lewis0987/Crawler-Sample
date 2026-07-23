@@ -72,6 +72,7 @@ EP_SCHEDULE = "/schedule/config/getScheduleSwitch"
 EP_DODI = "/can/v1/getDOAndDIMsg"
 EP_ALARM = "/hmiGuest/unauthorizedAccess/alarm/list"
 EP_RACKEXT = "/hmiGuest/unauthorizedAccess/overview/rackExtremeValueInformation"  # Rack 最高/最低溫度
+EP_RACKCAP = "/hmiGuest/unauthorizedAccess/overview/rackCapacityInformation"      # 設備今日累計充/放電量（與 Dashboard 當日一致）
 _PCS_LANG_HEADER = {"Accept-Language": "zh-TW"}
 
 # ======================================================================
@@ -406,6 +407,14 @@ def read_all(client):
                                    if isinstance(rex, dict) else None)
     r["rack_min_temperature_c"] = (_to_float(rex.get("rackCellMinTemperature"))
                                    if isinstance(rex, dict) else None)
+
+    # 1c) 設備今日累計充/放電量（guest；overview/rackCapacityInformation，與 Dashboard「當日」同源同值）
+    #     直接取 API 值、不重新積分；僅供 Summary 對照，不進 samples.csv、不影響能量統計。
+    rcap = _get(EP_RACKCAP)
+    r["device_daily_charge_kwh"] = (_to_float(rcap.get("accumulatedDailyChargingEnergy"))
+                                    if isinstance(rcap, dict) else None)
+    r["device_daily_discharge_kwh"] = (_to_float(rcap.get("accumulatedDailyDisChargingEnergy"))
+                                       if isinstance(rcap, dict) else None)
 
     # 2) PCS 有功/無功/直流/狀態（guest）
     #    - 英文 enum（不帶語言）：供數值與 parse_pcs_modes 解析（gridTied/ac/dc 等）
@@ -746,6 +755,8 @@ class ReportSession:
         self._last_dir_event = None          # 最近一次已記錄的 charge/idle/discharge_start 方向
         self._last_rack_max = None           # Rack 最高溫 fallback：某次 API 無值時沿用上一筆有效值
         self._last_rack_min = None           # Rack 最低溫 fallback
+        # 設備今日累計充/放電量（API 直接值，取最新一筆有效；僅供 Summary 對照，不參與能量積分）
+        self.device_daily = {"charge": None, "discharge": None}
 
         if state is None:
             # ---------- 新 Session ----------
@@ -846,6 +857,11 @@ class ReportSession:
         r = read_all(self.client)
         power = r.get("actual_active_power_kw") if CFG.POWER_SOURCE == "pcs" else r.get("calculated_power_kw")
         self.energy.add(power, elapsed)      # 以相對秒數積分（dt = elapsed - prev_elapsed）
+        # 記錄設備今日累計（API 值；取最新有效，供 Summary 對照，不影響上面的能量積分）
+        if r.get("device_daily_charge_kwh") is not None:
+            self.device_daily["charge"] = r.get("device_daily_charge_kwh")
+        if r.get("device_daily_discharge_kwh") is not None:
+            self.device_daily["discharge"] = r.get("device_daily_discharge_kwh")
 
         # 新增告警（baseline 之後才出現者才算新增）
         new_al = self.alarm_tracker.update(r.get("alarm_rows"), _now_str(), elapsed)
@@ -1161,6 +1177,9 @@ class ReportSession:
         return {
             "session_id": self.session_id,
             "action": self.action,
+            # 設備今日累計（API 直接值；與 Dashboard「當日充/放電量」同源，非本次 Session 積分）
+            "device_daily_charge_kwh": self.device_daily.get("charge"),
+            "device_daily_discharge_kwh": self.device_daily.get("discharge"),
             "control_mode": self.control_mode_label,
             "report_created_time": self.start_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "start_time": self.start_dt.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1591,7 +1610,9 @@ class ReportSession:
         # ================= Sheet 1：Summary（Dashboard）=================
         ws = wb.active
         ws.title = "Summary"
-        ws["A1"] = "PCS 充放電報告 — Summary"
+        # 寫到 test_output（selftest 合成資料）→ 標題加 TEST DATA / SELFTEST，避免誤認為正式實機報告
+        _mark = "⚠ TEST DATA / SELFTEST — " if _within(self.folder, _TEST_OUTPUT_ROOT) else ""
+        ws["A1"] = _mark + "PCS 充放電報告 — Summary"
         ws["A1"].font = TITLE
         r = 3
         r = _section(ws, r, 1, "Session資訊")
@@ -1603,10 +1624,14 @@ class ReportSession:
         r = _kv(ws, r, 1, "控制模式", sess["control_mode"])
         r = _kv(ws, r, 1, "PCS模式", sess["pcs_mode"])
         r += 1
-        r = _section(ws, r, 1, "充放電統計")
-        r = _kv(ws, r, 1, "Charge Energy (kWh)", stats.get("charged_energy_kwh"), hi=True)
-        r = _kv(ws, r, 1, "Discharge Energy (kWh)", stats.get("discharged_energy_kwh"), hi=True)
-        r = _kv(ws, r, 1, "Net Energy (kWh)", stats.get("net_energy_kwh"), hi=True)
+        r = _section(ws, r, 1, "本次充放電統計（Σ功率×Δt 積分）")
+        r = _kv(ws, r, 1, "本次充電量(kWh)", stats.get("charged_energy_kwh"), hi=True)
+        r = _kv(ws, r, 1, "本次放電量(kWh)", stats.get("discharged_energy_kwh"), hi=True)
+        r = _kv(ws, r, 1, "本次淨電量(kWh)", stats.get("net_energy_kwh"), hi=True)
+        r += 1
+        r = _section(ws, r, 1, "設備今日累計（API 直接值，非本次積分；同 Dashboard 當日）")
+        r = _kv(ws, r, 1, "設備今日充電量 (kWh)", sess.get("device_daily_charge_kwh"))
+        r = _kv(ws, r, 1, "設備今日放電量 (kWh)", sess.get("device_daily_discharge_kwh"))
         r += 1
         r = _section(ws, r, 1, "SOC (開始→最高→結束)")
         r = _kv(ws, r, 1, "開始SOC(%)", stats.get("start_soc_percent"))
@@ -1656,9 +1681,9 @@ class ReportSession:
             ("最小電流(A)", stats.get("min_current_a")),
             ("SOC增加(充電)", cs["soc_change"]),
             ("SOC下降(放電)", (round(-ds["soc_change"], 2) if ds["soc_change"] is not None else None)),
-            ("充電量(kWh)", stats.get("charged_energy_kwh")),
-            ("放電量(kWh)", stats.get("discharged_energy_kwh")),
-            ("Net Energy(kWh)", stats.get("net_energy_kwh")),
+            ("本次充電量(kWh)", stats.get("charged_energy_kwh")),
+            ("本次放電量(kWh)", stats.get("discharged_energy_kwh")),
+            ("本次淨電量(kWh)", stats.get("net_energy_kwh")),
             ("往返效率(%)", stats.get("round_trip_efficiency_percent")),
             ("資料筆數", stats.get("sample_count")),
             ("資料完整率", f"{analysis['comm_rate'] * 100:.1f}%"),
@@ -1727,16 +1752,18 @@ class ReportSession:
                 wr.column_dimensions[lbl_letter].width = 12
                 wr.column_dimensions[lbl_letter].hidden = True   # 隱藏整欄（不顯示給使用者）
                 label_count = sum(1 for l in x_labels if l)
-                # §9 驗證列印：第一/最後時間、N、每個目標±3s區間、選中實際時間 / 略過
-                def _fs(sec):
-                    sec = int(sec) % 86400
-                    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
-                _hms_rows = [_hms(s.get("timestamp")) for s in rows]
-                print(f"[X-LABEL 驗證] {title}｜第一筆={_hms_rows[0]} 最後={_hms_rows[-1]} "
-                      f"N={lbl_step}s ±3s｜目標數={len(x_log)} 顯示={label_count}")
-                for (tg, lo, hi, sel) in x_log:
-                    print(f"    目標 {_fs(tg)}  區間[{_fs(lo)}~{_fs(hi)}] → "
-                          + (f"選中 {_fs(sel)}" if sel is not None else "略過(無資料)"))
+                # §9 [DEBUG] X-LABEL 驗證列印：僅 CFG.DEBUG_XLABEL=True 時輸出；正式執行保持 Console 乾淨。
+                #     只控制列印，不影響 Label 演算法 / ±3s 搜尋 / N 秒選取 / Excel 圖表。
+                if CFG.DEBUG_XLABEL:
+                    def _fs(sec):
+                        sec = int(sec) % 86400
+                        return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+                    _hms_rows = [_hms(s.get("timestamp")) for s in rows]
+                    print(f"[X-LABEL 驗證] {title}｜第一筆={_hms_rows[0]} 最後={_hms_rows[-1]} "
+                          f"N={lbl_step}s ±3s｜目標數={len(x_log)} 顯示={label_count}")
+                    for (tg, lo, hi, sel) in x_log:
+                        print(f"    目標 {_fs(tg)}  區間[{_fs(lo)}~{_fs(hi)}] → "
+                              + (f"選中 {_fs(sel)}" if sel is not None else "略過(無資料)"))
                 # 共用 Y 軸：取「電流 + Rack 最大/最小溫度」整體，含 0；Major Unit 固定 5、取整到 5 的倍數。
                 hf = dict(CFG.RECORD_COLUMNS)
                 yvals = list(_col_floats(rows, hf["Current(A)"]))
@@ -1756,12 +1783,12 @@ class ReportSession:
             ("結束", sess["end_time"], False),
             ("充電時間", _fmt_hms(dir_sec["charge"]), False),
             ("放電時間", _fmt_hms(dir_sec["discharge"]), False),
-            ("Charge(kWh)", stats.get("charged_energy_kwh"), True),
-            ("Discharge(kWh)", stats.get("discharged_energy_kwh"), True),
-            ("Net(kWh)", stats.get("net_energy_kwh"), True),
+            ("本次充電量(kWh)", stats.get("charged_energy_kwh"), True),
+            ("本次放電量(kWh)", stats.get("discharged_energy_kwh"), True),
+            ("本次淨電量(kWh)", stats.get("net_energy_kwh"), True),
             ("取樣筆數", stats.get("sample_count"), False),
         ]
-        _record_sheet("充放電紀錄", all_rows, "Session Analysis",
+        _record_sheet("Charge & Discharge", all_rows, "Session Analysis",
                       "Charge / Discharge Current & Rack Temperature",
                       session_pairs, analysis_lines, "tbl_all")
 
@@ -1778,7 +1805,7 @@ class ReportSession:
             ("平均Voltage(V)", cs["avg_voltage"], False),
             ("筆數", cs["count"], False),
         ]
-        _record_sheet("充電紀錄", charge_rows, "Charge Summary", "Charge Current & Rack Temperature",
+        _record_sheet("Charge", charge_rows, "Charge Summary", "Charge Current & Rack Temperature",
                       charge_pairs, [], "tbl_charge")
 
         # Sheet 5：放電紀錄（direction == discharge）
@@ -1794,7 +1821,7 @@ class ReportSession:
             ("平均Voltage(V)", ds["avg_voltage"], False),
             ("筆數", ds["count"], False),
         ]
-        _record_sheet("放電紀錄", discharge_rows, "Discharge Summary", "Discharge Current & Rack Temperature",
+        _record_sheet("Discharge", discharge_rows, "Discharge Summary", "Discharge Current & Rack Temperature",
                       discharge_pairs, [], "tbl_discharge")
 
         # Summary 頁只保留摘要與統計（不放任何圖表）。
@@ -2108,6 +2135,7 @@ def selftest():
             "pcs_status": "執行", "pcs_control_mode": "智慧模式", "pcs_work_mode": "併網",
             "pcs_power_control_mode": "交流有功", "pcs_manual_switch": 0, "pcs_schedule_enabled": True,
             "battery_power_status": "已上電",
+            "device_daily_charge_kwh": 4.6, "device_daily_discharge_kwh": 3.7,   # 合成設備今日累計
             "alarm_rows": alarms or [], "alarm_total": len(alarms or []),
         }
 
@@ -2225,7 +2253,7 @@ def selftest():
             per_sheet = {n: len(wbx2[n]._charts) for n in wbx2.sheetnames}
             check(f"Summary 圖表=0（{per_sheet.get('Summary')}）", per_sheet.get("Summary") == 0)
             check(f"KPI 圖表=0（{per_sheet.get('KPI')}）", per_sheet.get("KPI") == 0)
-            for sname in ("充放電紀錄", "充電紀錄", "放電紀錄"):
+            for sname in ("Charge & Discharge", "Charge", "Discharge"):
                 check(f"{sname} 圖表=1（{per_sheet.get(sname)}）", per_sheet.get(sname) == 1)
                 # 輔助標籤欄移到最右側 AN 且隱藏（不顯示給使用者），Summary 旁不再有輔助標籤
                 an1 = wbx2[sname]["AN1"].value
