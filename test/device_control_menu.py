@@ -1122,7 +1122,7 @@ def _core_switch_fields(block, fields):
                 out[key] = fields[key]
     elif block == "電池":
         # 依「最終格式」規範：儀表板電池區塊只顯示核心開關「電池上下電狀態」。
-        # （放電/充電/待機的「當前狀態」不在儀表板顯示，但仍用於 operator 的電池下電前置檢查。）
+        # （放電/充電/待機的「電池充放電狀態」不在儀表板顯示，但仍用於 operator 的電池下電前置檢查。）
         out["電池上下電狀態"] = fields.get("電池上下電狀態", "暫無資料")
     elif block == "進排風":
         v = str(fields.get("進排風執行狀態", ""))

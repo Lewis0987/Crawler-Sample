@@ -70,7 +70,7 @@ _CONTROL_MODE_DISPLAY = {"smart": "智慧模式", "manual": "手動模式", "unk
 _SCHEDULE_DISPLAY = {True: "開", False: "關", None: "暫無資料"}
 # PCS 電網模式（唯讀狀態顯示；非控制）：併網/離網 ← guest PCS 執行狀態
 _GRID_MODE_DISPLAY = {"grid_connected": "併網", "off_grid": "離網", "unknown": "未知"}
-# 電池「當前狀態」判斷閾值（|功率| ≤ 此值視為待機，kW）
+# 電池「充放電狀態」判斷閾值（|功率| ≤ 此值視為待機，kW）
 _BATTERY_IDLE_KW = 0.1
 
 
@@ -399,10 +399,36 @@ def parse_pcs(pcs_data, schedule, runmode, pcs_status_data=None):
     return out
 
 
-def parse_battery(main, manual_power, dodi):
+def _battery_current_state_like_hmi(main, bcu):
+    """
+    電池「當前狀態」——**100% 複製 HMI /pcsControl `battery.vue` 的 _() 判斷**
+    （前端已確認為 getBcuState 的唯一消費者；來源見 charge_discharge_report_DESIGN.md）：
+      cur = mainControlCollectsInformation.rackElectricCurrent（原始電流，非 V×A）
+        cur > 0  → 充電
+        cur < 0  → 放電
+        cur == 0 → getBcuState ? 故障 : 待機
+        cur 無效 / 無資料 / 例外 → 故障（比照前端 try/catch 與 null 分支）
+    bcu（/can/v1/getBcuState）取得失敗（非 bool）時，比照前端預設 true → 故障側。
+    """
+    u = bcu if isinstance(bcu, bool) else True        # 前端 catch 預設 U.value=true
+    try:
+        cur = float(main["rackElectricCurrent"])
+    except (TypeError, ValueError, KeyError):
+        return "故障"                                  # null / 無資料 / 例外 → 故障
+    if cur > 0:
+        return "充電"
+    if cur < 0:
+        return "放電"
+    if cur == 0:
+        return "故障" if u else "待機"
+    return "故障"                                      # NaN 等 → 故障
+
+
+def parse_battery(main, manual_power, dodi, bcu=None):
     """
     HMI 右上 [電池] 區塊，固定順序：
-      電池上下電狀態 → 當前狀態/SOC/電壓/電流/功率 → 主正反饋/主正/主負反饋/主負/環流。
+      電池上下電狀態 → 電池當前狀態 → 電池充放電狀態 → SOC/電壓/電流/功率 → 主正反饋/主正/主負反饋/主負/環流。
+    電池當前狀態 100% 複製 HMI battery.vue（current 符號 + getBcuState）；電池充放電狀態為 V×A 能量流向。
     """
     out = {}
     # 1) 電池上下電狀態 ← 主正/主負接觸器反饋（getDOAndDIMsg）；非 getManuallyPowerState
@@ -428,10 +454,8 @@ def parse_battery(main, manual_power, dodi):
             out["當前功率"] = f"{power_kw:.3f} kW"
     else:
         out["電池充放電狀態"] = "暫無資料"
-    # 電池當前狀態：真正來源（與 UI「故障/待機…」相同的欄位）尚未確認。
-    # 在確認前一律「未知」——不以 PCS fault flag 猜測、不因 current=0 判待機、不 fallback。
-    # 待實機故障時用 inspect_device_status.py 同時點比對確認來源後，再實作正確映射。
-    out["電池當前狀態"] = "未知（來源待確認）"
+    # 電池當前狀態：100% 複製 HMI /pcsControl battery.vue（唯一 getBcuState 消費者，已全 bundle 驗證）。
+    out["電池當前狀態"] = _battery_current_state_like_hmi(main, bcu)
     # 3) 反饋/接觸器（主正反饋/主正/主負反饋/主負/環流）← getDOAndDIMsg
     out.update(parse_feedback(dodi))
     # 4) 暫時 Debug（唯讀）
@@ -537,7 +561,7 @@ def summarize_status(rd):
         "PCS": parse_pcs(rd.get("guest_pcs"), rd.get("getScheduleSwitch"), rd.get("getRunMode"),
                          rd.get("guest_pcs_tw")),
         "電池": parse_battery(rd.get("overview_mainControl"), rd.get("getManuallyPowerState"),
-                             rd.get("getDOAndDIMsg")),
+                             rd.get("getDOAndDIMsg"), rd.get("getBcuState")),
         "空調": parse_air(rd.get("guest_air")),
         "進排風": parse_vent(rd.get("guest_ttyS0")),
         "冷卻循環": parse_cooling(rd.get("guest_ttyS0"), rd.get("guest_water")),
