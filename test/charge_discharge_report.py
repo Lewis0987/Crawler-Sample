@@ -52,6 +52,7 @@ import charge_discharge_report_config as CFG
 
 # 重用既有唯讀解析（不重寫登入/判斷邏輯）
 from api_client import ApiClient
+import battery_data_scraper as BDS   # Cell 快照：重用既有 getPackInformation 抓取與正規化，不複製 API 邏輯
 from device_control_scraper import (
     battery_power_state_from_dodi,
     battery_flow_state,
@@ -732,6 +733,525 @@ class SafetyMonitor:
 
 
 # ======================================================================
+# Cell 快照：抓取（可注入）＋統計＋色階（純函式，Excel/CSV/未來 Web 共用）
+# ----------------------------------------------------------------------
+#   _fetch_cell_packs()       單一唯讀入口（selftest 可 monkeypatch；失敗回 (None, error)）
+#   calculate_cell_statistics() 該筆快照的 Max/Min/Average/Diff（含 mean/std/IQR 供離群判定）
+#   get_voltage_fill / get_temperature_fill  值→{bg,font,level}（不碰 openpyxl，可跨輸出重用）
+# ======================================================================
+def _fetch_cell_packs(client):
+    """
+    取得一次 Cell 原始 pack list（重用 battery_data_scraper.fetch_battery_cell_data）。
+    回傳 (data, error_message)；任何例外/None 皆回 (None, 原因字串)，呼叫端據此標記 failed，
+    **絕不沿用上一筆或 cache 冒充本次資料**。selftest 以 monkeypatch 注入合成資料。
+    """
+    try:
+        data = BDS.fetch_battery_cell_data(client)
+    except Exception as e:                       # 網路/解析/登入等任何失敗
+        return None, f"{type(e).__name__}: {e}"
+    if not isinstance(data, list) or not data:
+        return None, "getPackInformation 回傳空資料或非預期格式"
+    return data, None
+
+
+_CELL_DATA_KEY = {"voltage": "cell_voltage", "temperature": "cell_temperature"}
+
+
+def _cell_valid_values(snapshot, data_type):
+    """收集該快照所有 Pack、所有 Cell 的有效數值（排除 None/NaN）；data_type ∈ voltage/temperature。"""
+    key = _CELL_DATA_KEY[data_type]
+    out = []
+    for _pk, d in (snapshot.get("packs") or {}).items():
+        for v in (d.get(key) or []):
+            if v is None:
+                continue
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f == f:                            # 排除 NaN
+                out.append(f)
+    return out
+
+
+def calculate_cell_statistics(snapshot, data_type):
+    """
+    計算該筆快照的 Cell 統計（**先用原始值計算，顯示時才格式化**）：
+      max / min / average / diff（=max-min）/ count，另含 mean / std / q1 / q3 / iqr 供色階離群判定。
+    空值/None/NaN/無效字串一律不納入；無有效值 → 各統計為 None。
+    """
+    vals = _cell_valid_values(snapshot, data_type)
+    n = len(vals)
+    if n == 0:
+        return {"max": None, "min": None, "average": None, "diff": None, "count": 0,
+                "mean": None, "std": None, "q1": None, "q3": None, "iqr": None}
+    vmax, vmin = max(vals), min(vals)
+    mean = sum(vals) / n
+    var = sum((x - mean) ** 2 for x in vals) / n            # 母體變異數（相對色階用，非統計推論）
+    std = var ** 0.5
+
+    def _pct(sorted_vals, q):                                # 線性內插百分位（Q1=0.25、Q3=0.75）
+        if len(sorted_vals) == 1:
+            return sorted_vals[0]
+        pos = q * (len(sorted_vals) - 1)
+        lo = int(pos)
+        frac = pos - lo
+        hi = min(lo + 1, len(sorted_vals) - 1)
+        return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac
+    sv = sorted(vals)
+    q1, q3 = _pct(sv, 0.25), _pct(sv, 0.75)
+    return {"max": vmax, "min": vmin, "average": mean, "diff": vmax - vmin, "count": n,
+            "mean": mean, "std": std, "q1": q1, "q3": q3, "iqr": q3 - q1}
+
+
+def _band_into(t, levels):
+    """t∈[0,1] → levels 清單中的等級（依清單長度等分）。"""
+    n = len(levels)
+    if n <= 1:
+        return levels[0] if levels else "normal"
+    return levels[min(max(int(t * n), 0), n - 1)]
+
+
+def _band_level(t):
+    """t∈[0,1] → 完整 CELL_LEVEL_ORDER 等分（threshold 模式用）。"""
+    return _band_into(t, CFG.CELL_LEVEL_ORDER)
+
+
+def _band_centered(t, levels):
+    """
+    normal 置中、佔中央大部分（CELL_NORMAL_BAND_FRAC）的分段：
+      - t 落在中央帶 → normal（levels 中央）；只有更靠近兩端者才落到外圈等級。
+      - 避免資料整體偏高/偏低時整片被判成非 normal（如電壓 3.215~3.224 幾乎全綠）。
+    levels 需為奇數長、對稱、normal 在中央（符合 CELL_LEVEL_GATE 各階設計）。
+    """
+    n = len(levels)
+    if n <= 1:
+        return levels[0] if levels else "normal"
+    m = n // 2                                   # 中央（normal）索引
+    frac = max(0.0, min(0.98, float(getattr(CFG, "CELL_NORMAL_BAND_FRAC", 0.6))))
+    lo, hi = 0.5 - frac / 2, 0.5 + frac / 2
+    if lo <= t <= hi:
+        return levels[m]
+    if t < lo:                                   # 下半：levels[0..m-1] 分佈於 [0, lo]
+        if m <= 0 or lo <= 0:
+            return levels[0]
+        return levels[min(m - 1, int((t / lo) * m))]
+    upper = n - 1 - m                            # 上半：levels[m+1..] 分佈於 [hi, 1]
+    if upper <= 0 or hi >= 1:
+        return levels[n - 1]
+    return levels[m + 1 + min(upper - 1, int(((t - hi) / (1 - hi)) * upper))]
+
+
+def _gate_active_levels(diff, data_type):
+    """
+    Diff-Gate：依該筆 Diff（Max−Min）大小回傳「可用等級清單」（低→高、對稱、以 normal 為中心）。
+    Diff 越小可用等級越少（趨近只有 normal＝全綠）；Diff 夠大才逐步解鎖外圈等級直到 abnormal 兩端。
+    """
+    gate = CFG.CELL_LEVEL_GATE.get(data_type)
+    if not gate:
+        return list(CFG.CELL_LEVEL_ORDER)
+    try:
+        d = abs(float(diff)) if diff is not None else 0.0
+    except (TypeError, ValueError):
+        d = 0.0
+    for thr, levels in gate:
+        if thr is None or d <= thr:
+            return levels
+    return gate[-1][1]
+
+
+def _gated_level(value, stats, data_type):
+    """
+    Diff-Gate 相對分級：先依 stats['diff'] 決定「可用等級集合」，再依 value 在 min~max 的相對位置
+    映射到該集合。Diff 很小 → 集合僅 normal（全綠）；**不再對微小雜訊硬鋪滿 7 段或判離群**。
+    電壓/溫度各自套用自己的門檻（見 CFG.CELL_LEVEL_GATE），不共用數值範圍。
+    """
+    if value is None or stats is None or stats.get("count", 0) == 0:
+        return "no_data"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "no_data"
+    if v != v:
+        return "no_data"
+    levels = _gate_active_levels(stats.get("diff"), data_type)
+    if len(levels) <= 1:
+        return levels[0] if levels else "normal"
+    vmin, vmax = stats.get("min"), stats.get("max")
+    span = (vmax - vmin) if (vmin is not None and vmax is not None) else 0
+    if not span:                                   # 全相同值 → 取中央（normal）
+        return levels[len(levels) // 2]
+    return _band_centered((v - vmin) / span, levels)   # normal 置中、佔中央大部分
+
+
+def _threshold_level(value, low, high):
+    """固定門檻分級（未來 COLOR_MODE='threshold' 用）：低於 low→abnormal_low、高於 high→abnormal_high，
+    介於 low~high 依相對位置等分為 len(CELL_LEVEL_ORDER) 段。"""
+    if value is None:
+        return "no_data"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "no_data"
+    if v != v:
+        return "no_data"
+    if low is not None and v < low:
+        return "abnormal_low"
+    if high is not None and v > high:
+        return "abnormal_high"
+    if low is not None and high is not None and high > low:
+        return _band_level((v - low) / (high - low))
+    return "normal"
+
+
+def _auto_font(argb):
+    """依底色亮度自動選字色（深底白字、淺底黑字）；不更動使用者選定的填滿色。"""
+    h = (argb or "FF000000")[-6:]
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return "000000"
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    return "FFFFFF" if lum < 140 else "000000"
+
+
+def _fill_for_level(level):
+    """level key → {'bg','font','level'}；bg 取自 CFG.CELL_COLOR_PALETTE（正規化 FF+後6位不透明），
+    font 由 bg 亮度自動決定。找不到 level → no_data。"""
+    raw = CFG.CELL_COLOR_PALETTE.get(level) or CFG.CELL_COLOR_PALETTE["no_data"]
+    argb = "FF" + str(raw)[-6:].upper()           # 統一 8 位 ARGB、FF 不透明
+    return {"bg": argb, "font": _auto_font(argb), "level": level}
+
+
+def get_voltage_fill(value, stats):
+    """Cell 電壓 → 顏色描述 {'bg','font','level'}（不碰 openpyxl；Excel/CSV/Web 共用）。
+    COLOR_MODE='relative' 走相對色階；='threshold' 走 CELL_THRESHOLDS voltage_low/high。
+    與溫度**分開**判斷，不共用數值範圍。"""
+    if CFG.CELL_COLOR_MODE == "threshold":
+        th = CFG.CELL_THRESHOLDS
+        return _fill_for_level(_threshold_level(value, th.get("voltage_low"), th.get("voltage_high")))
+    return _fill_for_level(_gated_level(value, stats, "voltage"))
+
+
+def get_temperature_fill(value, stats):
+    """Cell 溫度 → 顏色描述 {'bg','font','level'}（與電壓分開，獨立函式、獨立 Diff-Gate 門檻）。"""
+    if CFG.CELL_COLOR_MODE == "threshold":
+        th = CFG.CELL_THRESHOLDS
+        return _fill_for_level(_threshold_level(value, th.get("temperature_low"), th.get("temperature_high")))
+    return _fill_for_level(_gated_level(value, stats, "temperature"))
+
+
+def get_diff_fill(diff, data_type):
+    """
+    差值（Max-Min）色階 → {'bg','font','level'}：依 Diff-Gate 階層，取「該階可用等級的最高一級」
+    代表嚴重度（Diff 越小越綠、越大越紅；小差＝normal 綠）。與矩陣/摘要同一套門檻，一致。
+    threshold 模式優先用 CELL_THRESHOLDS 的 <type>_diff_max。
+    """
+    if diff is None:
+        return _fill_for_level("no_data")
+    if CFG.CELL_COLOR_MODE == "threshold":
+        ref = CFG.CELL_THRESHOLDS.get(f"{data_type}_diff_max")
+        if ref and ref > 0:
+            try:
+                d = abs(float(diff))
+            except (TypeError, ValueError):
+                return _fill_for_level("no_data")
+            return _fill_for_level("abnormal_high" if d >= ref else _band_level(d / ref))
+    return _fill_for_level(_gate_active_levels(diff, data_type)[-1])
+
+
+# ======================================================================
+# Cell Volt. / Cell Temp. 工作表：共用版面框架
+# ----------------------------------------------------------------------
+# 兩表用同一套版面函式，透過參數（data_type/formatter/statistics/color_provider/labels）區分。
+# 未來新增 Cell Resistance / Balance / Alarm 只需提供對應 formatter + statistics + color_provider，
+# 不需複製整份工作表程式。色階計算 / 顏色選擇 / Excel 上色三者已拆開（見 get_*_fill）。
+# ======================================================================
+def _cell_geometry():
+    """由 config 推導版面幾何（不寫死於繪圖流程）：回傳各區塊尺寸（欄列數）。"""
+    cols = CFG.CELL_MATRIX_COLS
+    cpp = CFG.CELLS_PER_PACK
+    mrows = -(-cpp // cols)                       # ceil：每 Pack 矩陣列數（20/4=5）
+    layout = CFG.CELL_PACK_LAYOUT
+    maxpacks = max(len(r) for r in layout) if layout else 1
+    pack_w, pack_h = cols, 1 + mrows              # Pack：1 標題列 + 矩陣列
+    gap_col = gap_row = 1
+    grid_w = maxpacks * pack_w + (maxpacks - 1) * gap_col
+    grid_h = len(layout) * pack_h + (len(layout) - 1) * gap_row
+    summary_w, summary_gap, header_h, block_gap = 2, 1, 3, 2
+    block_w = summary_w + summary_gap + grid_w
+    block_h = header_h + grid_h
+    return {"cols": cols, "cpp": cpp, "mrows": mrows, "pack_w": pack_w, "pack_h": pack_h,
+            "gap_col": gap_col, "gap_row": gap_row, "grid_w": grid_w, "grid_h": grid_h,
+            "summary_w": summary_w, "summary_gap": summary_gap, "header_h": header_h,
+            "block_w": block_w, "block_h": block_h, "block_gap": block_gap}
+
+
+def _dynamic_pack_layout(packs):
+    """
+    依 CELL_PACK_LAYOUT 順序，只保留快照中「實際存在」的 Pack；缺的略過並壓縮該列（不留 N/A 空位）。
+    不在樣板中的 Pack 依序補在最後（每列寬度沿用樣板最大列寬）。回傳 list[list[int]]。
+    """
+    present = set()
+    for pk in (packs or {}).keys():
+        try:
+            present.add(int(pk))
+        except (TypeError, ValueError):
+            pass
+    rows, placed = [], set()
+    for layout_row in CFG.CELL_PACK_LAYOUT:
+        kept = [p for p in layout_row if p in present]
+        if kept:
+            rows.append(kept)
+            placed.update(kept)
+    extras = sorted(p for p in present if p not in placed)
+    if extras:
+        w = max((len(r) for r in CFG.CELL_PACK_LAYOUT), default=4)
+        for i in range(0, len(extras), w):
+            rows.append(extras[i:i + w])
+    return rows
+
+
+def _thin_border():
+    from openpyxl.styles import Border, Side
+    s = Side(style="thin", color="B0B0B0")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def _num_or_none(v):
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def render_pack_matrix(ws, top, left, pack_no, values, stats, color_provider, number_format):
+    """
+    畫一個 Pack 的 Cell 矩陣：Pack 名稱置中於矩陣上方，Cell 數值置中、完整框線、依色階上色。
+    values=None（缺該 Pack）或不足 → 對應格顯示 N/A（不使報表失敗）。原始值存入 cell、顯示才格式化。
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    g = _cell_geometry()
+    cols, mrows, cpp = g["cols"], g["mrows"], g["cpp"]
+    border = _thin_border()
+    center = Alignment(horizontal="center", vertical="center")
+    # Pack 標題（跨矩陣欄寬）
+    ws.merge_cells(start_row=top, start_column=left, end_row=top, end_column=left + cols - 1)
+    tc = ws.cell(row=top, column=left, value=f"Pack {pack_no}")
+    tc.font = Font(bold=True, color="000000", size=9)
+    tc.alignment = center
+    tc.fill = PatternFill("solid", fgColor="F2F2F2")
+    for c in range(left, left + cols):
+        ws.cell(row=top, column=c).border = border
+    # 矩陣格（依 packList 原順序，由左至右、由上至下）
+    vals = list(values) if values else []
+    for idx in range(cpp):
+        rr = top + 1 + idx // cols
+        cc = left + idx % cols
+        raw = _num_or_none(vals[idx]) if idx < len(vals) else None
+        cell = ws.cell(row=rr, column=cc)
+        cell.alignment = center
+        cell.border = border
+        if raw is None:
+            cell.value = "N/A"
+            spec = _fill_for_level("no_data")
+        else:
+            cell.value = raw
+            cell.number_format = number_format
+            spec = color_provider(raw, stats)
+        cell.fill = PatternFill("solid", fgColor=spec["bg"])
+        cell.font = Font(color=spec["font"], size=9)
+    _ = get_column_letter  # 版面欄寬於 create_cell_sheet 統一設定
+
+
+def render_record_block(ws, top, left, snapshot, data_type, number_format, stat_format,
+                        color_provider, summary_labels):
+    """
+    畫一筆紀錄區塊：上方置中粗體「時間」+「Snapshot 來源」，左側統計摘要，右側 Pack 矩陣（固定排列）。
+    失敗快照（cell_data_status=failed）只畫標頭與錯誤訊息，不參與統計/矩陣。
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    g = _cell_geometry()
+    center = Alignment(horizontal="center", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+    ts = snapshot.get("timestamp") or ""
+    reason = snapshot.get("snapshot_reason") or ""
+    reason_label = CFG.CELL_SNAPSHOT_REASON_LABEL.get(reason, reason)
+
+    def _merge_header(row, text, bold=False, color="000000", fill=None):
+        ws.merge_cells(start_row=row, start_column=left,
+                       end_row=row, end_column=left + g["block_w"] - 1)
+        c = ws.cell(row=row, column=left, value=text)
+        c.font = Font(bold=bold, color=color, size=11 if bold else 10)
+        c.alignment = center
+        if fill:
+            c.fill = PatternFill("solid", fgColor=fill)
+    _merge_header(top, f"時間：{ts}", bold=True)
+    _merge_header(top + 1, f"Snapshot：{reason_label}")
+
+    content_top = top + g["header_h"]
+
+    # 失敗快照：只顯示錯誤，不畫矩陣
+    if snapshot.get("cell_data_status") == "failed":
+        ws.merge_cells(start_row=content_top, start_column=left,
+                       end_row=content_top, end_column=left + g["block_w"] - 1)
+        c = ws.cell(row=content_top, column=left,
+                    value=f"⚠ Cell 資料擷取失敗（cell_data_status=failed）：{snapshot.get('error_message')}")
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", fgColor="FF0000")
+        c.alignment = left_align
+        return
+
+    stats = calculate_cell_statistics(snapshot, data_type)
+
+    # ---- 左側統計摘要（標籤列 + 數值列，直向堆疊）----
+    # 數值儲存格背景色**共用** color_provider（與右側 Pack 矩陣同一套 get_voltage_fill/
+    # get_temperature_fill、同一份 stats）→ 兩邊必定一致；差值用 get_diff_fill。SOC/Power 不上色。
+    sc = left
+    rr = content_top
+    border = _thin_border()
+
+    def _summary_pair(label, value, number_fmt=None, is_str=False, bold=False, fill_desc=None):
+        nonlocal rr
+        lc = ws.cell(row=rr, column=sc, value=label)
+        lc.font = Font(bold=True, size=9)
+        lc.alignment = left_align
+        vc = ws.cell(row=rr + 1, column=sc, value=value)
+        vc.alignment = left_align
+        if not is_str and value is not None and number_fmt:
+            vc.number_format = number_fmt
+        if fill_desc is not None:
+            vc.fill = PatternFill("solid", fgColor=fill_desc["bg"])
+            vc.font = Font(size=10, bold=bold, color=fill_desc["font"])
+            vc.border = border
+        else:
+            vc.font = Font(size=10, bold=bold)     # SOC/Power：維持黑字、不上色
+        rr += 2
+
+    title_c = ws.cell(row=rr, column=sc, value=summary_labels["title"])
+    title_c.font = Font(bold=True, size=11, color="1F4E78")
+    rr += 1
+    _summary_pair(summary_labels["max"], stats["max"], stat_format, bold=True,
+                  fill_desc=color_provider(stats["max"], stats))
+    _summary_pair(summary_labels["min"], stats["min"], stat_format, bold=True,
+                  fill_desc=color_provider(stats["min"], stats))
+    _summary_pair(summary_labels["avg"], stats["average"], stat_format,
+                  fill_desc=color_provider(stats["average"], stats))
+    _summary_pair(summary_labels["diff"], stats["diff"], stat_format, bold=True,
+                  fill_desc=get_diff_fill(stats["diff"], data_type))
+    soc = snapshot.get("soc")
+    power = snapshot.get("power_kw")
+    _summary_pair("當前SOC", (f"{soc:.0f} %" if isinstance(soc, (int, float)) else "N/A"), is_str=True)
+    _summary_pair("當前功率", (f"{power:.2f} kW" if isinstance(power, (int, float)) else "N/A"),
+                  is_str=True)
+    if snapshot.get("warnings"):
+        wc = ws.cell(row=rr, column=sc,
+                     value=f"⚠ {len(snapshot['warnings'])} 項資料警告（見 cell_snapshots.json）")
+        wc.font = Font(size=8, color="C00000")
+        wc.alignment = left_align
+        rr += 1
+    # 左側摘要只保留 最大/最小/平均/極差 + SOC/功率；不再逐筆重複顯示 Legend（資訊冗餘、已移除）。
+
+    # ---- 右側 Pack 矩陣（只排「實際存在」的 Pack，依 CELL_PACK_LAYOUT 順序、壓縮缺項）----
+    packs = snapshot.get("packs") or {}
+    key = _CELL_DATA_KEY[data_type]
+    display_rows = _dynamic_pack_layout(packs)
+    grid_left = left + g["summary_w"] + g["summary_gap"]
+    for li, layout_row in enumerate(display_rows):
+        prow_top = content_top + li * (g["pack_h"] + g["gap_row"])
+        for pj, pack_no in enumerate(layout_row):
+            pcol = grid_left + pj * (g["pack_w"] + g["gap_col"])
+            pdata = packs.get(str(pack_no))
+            values = (pdata.get(key) if isinstance(pdata, dict) else None)
+            render_pack_matrix(ws, prow_top, pcol, pack_no, values, stats,
+                               color_provider, number_format)
+
+
+def setup_cell_sheet_print_area(ws, total_rows, total_cols, data_type):
+    """版面/列印：Landscape、Fit to Width、凍結最上方、縮放、依 data_type 設矩陣欄寬。"""
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.properties import PageSetupProperties
+    g = _cell_geometry()
+    period = g["block_w"] + g["block_gap"]
+    matrix_w = CFG.CELL_VOLT_COL_WIDTH if data_type == "voltage" else CFG.CELL_TEMP_COL_WIDTH
+    for c in range(1, total_cols + 1):
+        off = (c - 1) % period
+        if off < g["summary_w"]:
+            w = CFG.CELL_SUMMARY_LABEL_WIDTH if off == 0 else CFG.CELL_SUMMARY_VALUE_WIDTH
+        elif off < g["block_w"]:
+            w = matrix_w
+        else:
+            w = 2                                  # 區塊之間的間隔欄
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.page_setup.orientation = CFG.CELL_SHEET_PAGE_ORIENTATION
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_view.zoomScale = CFG.CELL_SHEET_ZOOM
+    ws.freeze_panes = "A3"                          # 固定最上方模式標題/時間列
+
+
+def create_cell_sheet(wb, sheet_name, data_type, snapshots, *, number_format, stat_format,
+                      color_provider, summary_labels):
+    """
+    共用框架：建立一張 Cell 明細工作表（Cell Volt. 或 Cell Temp.）。
+      - 依 mode 分區（Discharge 黃 / Charge 藍 / Standby 灰）；標題列跨越該模式所有紀錄區塊。
+      - 同模式多筆紀錄橫向依時間排列；紀錄數動態，不固定筆數。
+      - 空資料模式不產生區塊；完全無快照 → 顯示提示。
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    ws = wb.create_sheet(sheet_name)
+    center = Alignment(horizontal="center", vertical="center")
+    g = _cell_geometry()
+
+    valid = [s for s in (snapshots or [])]
+    if not valid:
+        ws["A1"] = f"{sheet_name}：本次 session 無 Cell 快照資料"
+        ws["A1"].font = Font(bold=True, size=12, color="808080")
+        return ws
+
+    # 依 mode 分組（未知/idle → standby，不硬歸類）
+    by_mode = {"discharge": [], "charge": [], "standby": []}
+    for s in valid:
+        m = s.get("mode") if s.get("mode") in by_mode else "standby"
+        by_mode[m].append(s)
+    for m in by_mode:
+        by_mode[m].sort(key=lambda s: str(s.get("timestamp") or ""))
+
+    period = g["block_w"] + g["block_gap"]
+    cur_row = 1
+    max_cols = 1
+    for mode in CFG.CELL_BAND_ORDER:
+        band = by_mode.get(mode) or []
+        if not band:
+            continue                                # 空區塊不產生
+        band_cfg = CFG.CELL_MODE_BAND[mode]
+        band_cols = len(band) * period - g["block_gap"]
+        max_cols = max(max_cols, band_cols)
+        # 模式標題列（跨越該模式所有紀錄區塊）
+        ws.merge_cells(start_row=cur_row, start_column=1,
+                       end_row=cur_row, end_column=max(1, band_cols))
+        bc = ws.cell(row=cur_row, column=1, value=band_cfg["label"])
+        bc.font = Font(bold=True, size=12, color=band_cfg["font"])
+        bc.fill = PatternFill("solid", fgColor=band_cfg["bg"])
+        bc.alignment = center
+        block_top = cur_row + 2
+        for i, snap in enumerate(band):
+            left = 1 + i * period
+            render_record_block(ws, block_top, left, snap, data_type, number_format,
+                                stat_format, color_provider, summary_labels)
+        cur_row = block_top + g["block_h"] + g["block_gap"]
+
+    setup_cell_sheet_print_area(ws, cur_row, max_cols, data_type)
+    return ws
+
+
+# ======================================================================
 # 報告 Session
 # ======================================================================
 class ReportSession:
@@ -745,6 +1265,10 @@ class ReportSession:
         self.now_fn = now_fn or datetime.now
         self.samples = []
         self.events = []
+        # Cell 快照（起訖＋方向切換擷取；session 內累積、不覆蓋，供 Cell Volt./Temp. 產表）
+        self.cell_snapshots = []
+        self._modes_snapshotted = set()     # 已擷取過 start 快照的模式（判 *_start vs mode_changed_to_*）
+        self._last_snapshot_mode = None     # 最近一筆快照的模式（避免同模式重複觸發）
         self.energy = EnergyAccumulator()
         self.alarm_tracker = AlarmTracker()
         self.end_state = None
@@ -837,6 +1361,13 @@ class ReportSession:
                        f"SOC={self.start_state.get('soc_percent')} "
                        f"P={self.start_state.get('actual_active_power_kw')}kW "
                        f"baseline_alarms={len(self.alarm_tracker.records)}")
+        # session_start Cell 快照（綁定開始狀態的方向/SOC/功率；起始若已是 charge/discharge，
+        # 後續同模式的 *_start 會因去重不重複產生）
+        d0, _s0 = resolve_direction(r.get("pcs_charging_flag"), r.get("pcs_discharging_flag"),
+                                    r.get("actual_active_power_kw"))
+        p0 = (r.get("actual_active_power_kw") if CFG.POWER_SOURCE == "pcs"
+              else r.get("calculated_power_kw"))
+        self._capture_cell_snapshot(r, d0, p0, "session_start")
         self._persist_state()
         return r
 
@@ -844,6 +1375,7 @@ class ReportSession:
         # 續接：載入既有 samples.csv（全 Session）與 alarms.csv（維持去重），不重寫表頭
         self.samples = self._load_all_samples()
         self.alarm_tracker.load_existing(self._load_csv_rows(CFG.FILE_ALARMS))
+        self._load_cell_snapshots()          # 續接既有 Cell 快照（保留歷史、不覆蓋）
         # 事件 append（不重寫表頭）：只記 recording_resume（session_start 只在新建時出現一次）
         self.log_event("recording_resume", "info",
                        f"resume session={self.session_id} sample_index={self.sample_index} "
@@ -899,6 +1431,13 @@ class ReportSession:
             self.log_event(f"{direction}_start", "info",
                            f"P={power}kW source={direction_source}")
             self._last_dir_event = direction
+        # Cell 快照：僅在進入 charge/discharge（方向切換）時擷取（idle/standby 不主動擷取）；
+        # 首次進入某模式→{mode}_start，之後再切回→mode_changed_to_{mode}。
+        if (getattr(CFG, "CELL_SNAPSHOT_ENABLED", True) and direction in ("charge", "discharge")
+                and direction != self._last_snapshot_mode):
+            reason = (f"mode_changed_to_{direction}" if direction in self._modes_snapshotted
+                      else f"{direction}_start")
+            self._capture_cell_snapshot(r, direction, power, reason)
         # idle 連續判定（供自動結束）
         if direction == "idle" or "停" in str(r.get("pcs_status", "")):
             self._idle_streak += 1
@@ -910,6 +1449,74 @@ class ReportSession:
         self._append_csv(CFG.FILE_SAMPLES, CFG.SAMPLE_FIELDS, row)
         self._persist_state()               # 每筆取樣後即時持久化（供 resume 續接累積）
         return r, critical_stop
+
+    # ---------- Cell 快照擷取 / 持久化 ----------
+    def _capture_cell_snapshot(self, r, direction, power, reason):
+        """
+        於關鍵時機擷取一筆完整 Cell 快照（呼叫 battery_data_scraper 唯讀取得）。
+        - 綁定當下 timestamp / mode / soc / power；失敗標 cell_data_status=failed（不沿用舊值）。
+        - 去重：與前一筆比對 timestamp+mode+soc+power+cell_data_hash 五者皆同 → 跳過。
+        - 累積至 self.cell_snapshots 並即時寫 cell_snapshots.json（不覆蓋既有快照）。
+        """
+        if not getattr(CFG, "CELL_SNAPSHOT_ENABLED", True):
+            return None
+        mode = direction if direction in ("charge", "discharge") else "standby"
+        data, err = _fetch_cell_packs(self.client)
+        soc = (r or {}).get("soc_percent")
+        # 綁定該次擷取的實際時間（用 session 時鐘 now_fn，與 elapsed 一致；離線測試可注入假時鐘）
+        ts = self.now_fn().strftime("%Y-%m-%d %H:%M:%S")
+        snap = BDS.create_cell_snapshot(
+            data, ts, mode, soc, power, reason,
+            error_message=err, expected_packs=CFG.CELL_EXPECTED_PACKS)
+        # 去重（timestamp+mode+soc+power+cell_data_hash 五者皆同 → 視為重複，例如 session_start 與
+        # charge_start 恰同一秒且同資料）
+        if self.cell_snapshots:
+            p = self.cell_snapshots[-1]
+            if (p.get("timestamp") == snap["timestamp"] and p.get("mode") == snap["mode"]
+                    and p.get("soc") == snap["soc"] and p.get("power_kw") == snap["power_kw"]
+                    and p.get("cell_data_hash") == snap["cell_data_hash"]):
+                self.log_event("cell_snapshot_dedup", "info",
+                               f"reason={reason} 與 {p.get('snapshot_id')} 完全相同，跳過")
+                self._last_snapshot_mode = mode
+                if mode in ("charge", "discharge"):
+                    self._modes_snapshotted.add(mode)
+                return None
+        snap["snapshot_id"] = f"SNAP-{len(self.cell_snapshots) + 1:03d}"
+        self.cell_snapshots.append(snap)
+        self._last_snapshot_mode = mode
+        if mode in ("charge", "discharge"):
+            self._modes_snapshotted.add(mode)
+        self._write_cell_snapshots()
+        status = snap["cell_data_status"]
+        self.log_event("cell_snapshot", "warning" if status == "failed" else "info",
+                       f"{snap['snapshot_id']} reason={reason} mode={mode} status={status} "
+                       f"packs={snap['pack_count']} cells={snap['cell_count']}"
+                       + (f" err={err}" if err else "")
+                       + (f" warnings={len(snap['warnings'])}" if snap.get("warnings") else ""))
+        return snap
+
+    def _write_cell_snapshots(self):
+        """寫 cell_snapshots.json（版本化；session 內累積歷史 Cell 快照，供 Cell Volt./Temp. 產表）。"""
+        obj = {
+            "schema_version": BDS.CELL_SNAPSHOT_SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "generated_at": _now_str(),
+            "snapshot_count": len(self.cell_snapshots),
+            "snapshots": self.cell_snapshots,
+        }
+        self._dump_json(CFG.FILE_CELL_SNAPSHOTS, obj)
+
+    def _load_cell_snapshots(self):
+        """resume/regen：讀回既有 cell_snapshots.json（保留歷史；還原去重/reason 判斷狀態）。"""
+        obj = _load_json_file(self._path(CFG.FILE_CELL_SNAPSHOTS))
+        snaps = obj.get("snapshots") if isinstance(obj, dict) else None
+        self.cell_snapshots = snaps if isinstance(snaps, list) else []
+        for s in self.cell_snapshots:
+            m = s.get("mode")
+            if m in ("charge", "discharge"):
+                self._modes_snapshotted.add(m)
+        if self.cell_snapshots:
+            self._last_snapshot_mode = self.cell_snapshots[-1].get("mode")
 
     def should_auto_end(self):
         """回傳 (end?, reason) —— 依 config 判斷是否自動結束（不送控制）。"""
@@ -930,6 +1537,12 @@ class ReportSession:
         self.end_reason = end_reason or "unknown"
         r = read_all(self.client)
         self.end_state = self._state_from_reading(r)
+        # session_end Cell 快照（綁定結束當下狀態；與前一筆完全相同會去重，但結束狀態仍存於 summary）
+        d_end, _se = resolve_direction(r.get("pcs_charging_flag"), r.get("pcs_discharging_flag"),
+                                       r.get("actual_active_power_kw"))
+        p_end = (r.get("actual_active_power_kw") if CFG.POWER_SOURCE == "pcs"
+                 else r.get("calculated_power_kw"))
+        self._capture_cell_snapshot(r, d_end, p_end, "session_end")
         self.status = CFG.SESSION_COMPLETED
         self.log_event("session_end", "info",
                        f"reason={self.end_reason}({CFG.END_REASON.get(self.end_reason,'')}) "
@@ -947,6 +1560,7 @@ class ReportSession:
         圖表以 report.xlsx 內嵌方式產生（不另建 charts/ CSV）。"""
         stats = self._compute_statistics()
         self._write_alarms()
+        self._write_cell_snapshots()         # Cell 快照持久化（含 pause/finalize 當下的最新累積）
         self._write_statistics(stats)
         self._write_summary(stats)
         self._write_xlsx(stats)
@@ -1824,6 +2438,25 @@ class ReportSession:
         _record_sheet("Discharge", discharge_rows, "Discharge Summary", "Discharge Current & Rack Temperature",
                       discharge_pairs, [], "tbl_discharge")
 
+        # ================= Cell Volt. / Cell Temp.（Discharge 之後、Raw Data 之前）=================
+        # 只有「本次 session 有歷史 Cell 快照」才產生兩張工作表；讀既有快照、不重抓最新值覆蓋歷史。
+        # 無快照（如 Cell 功能之前建立、無 cell_snapshots.json 的舊報告）→ 略過，**不產生空白表**，
+        # 避免造成「有支援卻空白」的誤解。
+        if self.cell_snapshots:
+            create_cell_sheet(wb, "Cell Volt.", "voltage", self.cell_snapshots,
+                              number_format=CFG.CELL_VOLT_CELL_FORMAT,
+                              stat_format=CFG.CELL_VOLT_STAT_FORMAT,
+                              color_provider=get_voltage_fill,
+                              summary_labels=CFG.CELL_VOLT_SUMMARY_LABELS)
+            create_cell_sheet(wb, "Cell Temp.", "temperature", self.cell_snapshots,
+                              number_format=CFG.CELL_TEMP_CELL_FORMAT,
+                              stat_format=CFG.CELL_TEMP_STAT_FORMAT,
+                              color_provider=get_temperature_fill,
+                              summary_labels=CFG.CELL_TEMP_SUMMARY_LABELS)
+        else:
+            print("  [Cell] 無 Cell 快照（此報告建立時尚未支援 Cell 快照功能）"
+                  "→ 略過 Cell Volt./Cell Temp.，不產生空白工作表。")
+
         # Summary 頁只保留摘要與統計（不放任何圖表）。
 
         # ================= Sheet 6：Raw Data（完整欄位，不刪任何欄）=================
@@ -2095,6 +2728,167 @@ def _safe_rmtree(path):
     shutil.rmtree(ap, ignore_errors=True)
 
 
+def _fake_pack_data(npacks=19, ncells=20, vbase=3.30, tbase=25.0, missing=(),
+                    drop_cells=0, inject_nan=False, inject_none=False):
+    """
+    selftest 專用：產生 getPackInformation 格式的合成 pack list（預設 19×20），供 Cell 快照測試。
+    - missing：略過的 packNo（模擬缺 Pack）；drop_cells：Pack 1 少幾顆 cell（模擬缺 Cell）。
+    - inject_nan / inject_none：於 Pack 1 注入 NaN / None 電壓（模擬無效值）。
+    """
+    data = []
+    for pk in range(1, npacks + 1):
+        if pk in missing:
+            continue
+        cells = []
+        m = ncells - (drop_cells if pk == 1 else 0)
+        for j in range(m):
+            v = round(vbase + (j % 10) * 0.003 + (pk % 3) * 0.002, 3)
+            t = tbase + (j % 6) + (pk % 4)
+            if inject_nan and pk == 1 and j == 0:
+                v = float("nan")
+            if inject_none and pk == 1 and j == 1:
+                v = None
+            cells.append({"sort": (pk - 1) * ncells + j + 1, "voltage": v,
+                          "temperature": t, "soc": 90, "soh": 99, "equilibriumState": 0})
+        data.append({"packNo": pk, "packList": cells})
+    return data
+
+
+def _selftest_cell_snapshots(check, output_root):
+    """
+    Cell 快照情境驗證（自帶 read_all / _fetch_cell_packs monkeypatch，注入合成資料、不觸網）：
+      模式分組（Charge only / Discharge only / Charge↔Discharge）、資料異常（無資料/缺Pack/缺Cell/
+      NaN/None）、同 timestamp 去重。
+    """
+    global read_all, _fetch_cell_packs
+    _o_read, _o_fetch = read_all, _fetch_cell_packs
+    clk = {"dt": datetime(2026, 3, 12, 9, 0, 0)}
+    now = lambda: clk["dt"]                                   # noqa: E731
+    cur = {"r": None, "packs": None, "err": None}
+
+    def reading(power, soc, direction):
+        v = 890.0
+        i = round(power * 1000.0 / v, 2) if power else 0.0
+        return {
+            "communication_ok": True, "raw_source_time": "",
+            "pcs_charging_flag": direction == "charge",
+            "pcs_discharging_flag": direction == "discharge",
+            "soc_percent": float(soc), "battery_voltage_v": v, "battery_current_a": i,
+            "rack_max_temperature_c": 30.0, "rack_min_temperature_c": 25.0,
+            "battery_status": "充電" if power > 0 else ("放電" if power < 0 else "待機"),
+            "actual_active_power_kw": float(power), "actual_reactive_power_kvar": 0.0,
+            "calculated_power_kw": round(v * i / 1000, 3),
+            "pcs_status": "執行", "pcs_control_mode": "智慧模式", "pcs_work_mode": "併網",
+            "pcs_power_control_mode": "交流有功", "pcs_manual_switch": 0,
+            "pcs_schedule_enabled": True, "battery_power_status": "已上電",
+            "device_daily_charge_kwh": 4.6, "device_daily_discharge_kwh": 3.7,
+            "alarm_rows": [], "alarm_total": 0,
+        }
+
+    read_all = lambda _c: cur["r"]                           # noqa: E731
+    _fetch_cell_packs = lambda _c: ((cur["packs"], None) if cur["packs"] is not None
+                                    else (None, cur["err"] or "無 Cell 資料"))   # noqa: E731
+
+    def run_session(segs):
+        """segs: [(power, soc, direction, n), ...]；回傳 finalize 後的 session。"""
+        cur["packs"] = _fake_pack_data()
+        p0, s0, d0, _n0 = segs[0]
+        cur["r"] = reading(p0, s0, d0)
+        sess = ReportSession("auto", 10.0, "交流有功", object(), output_root, now_fn=now)
+        sess.start()
+        for (power, soc, direction, n) in segs:
+            for _ in range(n):
+                clk["dt"] += timedelta(seconds=5)
+                cur["r"] = reading(power, soc, direction)
+                sess.sample_once()
+        sess.finalize("completed")
+        return sess
+
+    try:
+        print("\n[驗證：Cell 快照情境 — 模式分組 / 方向切換]")
+        clk["dt"] = datetime(2026, 3, 12, 9, 0, 0)
+        sco = run_session([(5.0, 60, "charge", 3)])
+        check("Charge only：無 discharge 快照",
+              "discharge" not in set(s["mode"] for s in sco.cell_snapshots))
+        check("Charge only：含 session_start/session_end",
+              {"session_start", "session_end"} <= set(s["snapshot_reason"] for s in sco.cell_snapshots))
+
+        clk["dt"] = datetime(2026, 3, 12, 10, 0, 0)
+        sdo = run_session([(-5.0, 60, "discharge", 3)])
+        check("Discharge only：無 charge 快照",
+              "charge" not in set(s["mode"] for s in sdo.cell_snapshots))
+
+        clk["dt"] = datetime(2026, 3, 12, 11, 0, 0)
+        scd = run_session([(5.0, 60, "charge", 2), (-5.0, 58, "discharge", 2)])
+        rs = [s["snapshot_reason"] for s in scd.cell_snapshots]
+        check("Charge→Discharge：兩模式皆有快照",
+              {"charge", "discharge"} <= set(s["mode"] for s in scd.cell_snapshots))
+        check(f"Charge→Discharge：含 discharge_start（{rs}）", "discharge_start" in rs)
+
+        clk["dt"] = datetime(2026, 3, 12, 12, 0, 0)
+        sdc = run_session([(-5.0, 60, "discharge", 2), (5.0, 62, "charge", 2)])
+        rs2 = [s["snapshot_reason"] for s in sdc.cell_snapshots]
+        check(f"Discharge→Charge：含 charge_start（{rs2}）", "charge_start" in rs2)
+
+        print("\n[驗證：Cell 快照資料異常情境]")
+        ts = "2026-03-12 09:26:51"
+        snf = BDS.create_cell_snapshot(None, ts, "charge", 90, 5.0, "session_start")
+        check("無 Cell Data：status=failed", snf["cell_data_status"] == "failed")
+        check("無 Cell Data：packs 空、不沿用舊值", not snf["packs"])
+        from openpyxl import Workbook
+        wbf = Workbook()
+        create_cell_sheet(wbf, "Cell Volt.", "voltage", [snf],
+                          number_format=CFG.CELL_VOLT_CELL_FORMAT, stat_format=CFG.CELL_VOLT_STAT_FORMAT,
+                          color_provider=get_voltage_fill, summary_labels=CFG.CELL_VOLT_SUMMARY_LABELS)
+        check("無 Cell Data：Cell Volt. 仍可產生（不崩潰）", "Cell Volt." in wbf.sheetnames)
+
+        # 明確傳入 expected_packs=1..19 才檢查缺 Pack（預設 None＝動態、不檢查缺 Pack）
+        smp = BDS.create_cell_snapshot(_fake_pack_data(missing=(5,)), ts, "charge", 90, 5.0,
+                                       "session_start", expected_packs=list(range(1, 20)))
+        check(f"缺 Pack 5：pack_count=18（{smp['pack_count']}）", smp["pack_count"] == 18)
+        check("缺 Pack 5：warning 記錄缺少 Pack 5（有給 expected_packs）",
+              any(("缺少 Pack" in w and "5" in w) for w in smp["warnings"]))
+        # 動態模式（不給 expected_packs）：缺 Pack 不報 warning
+        smp_dyn = BDS.create_cell_snapshot(_fake_pack_data(missing=(5,)), ts, "charge", 90, 5.0,
+                                           "session_start")
+        check("動態模式：缺 Pack 不列入 warning",
+              not any("缺少 Pack" in w for w in smp_dyn["warnings"]))
+
+        smc = BDS.create_cell_snapshot(_fake_pack_data(drop_cells=2), ts, "charge", 90, 5.0, "session_start")
+        check("缺 Cell：Pack1 cell 數 18 → warning",
+              any("cell 數 18" in w for w in smc["warnings"]))
+
+        snan = BDS.create_cell_snapshot(_fake_pack_data(inject_nan=True), ts, "charge", 90, 5.0, "session_start")
+        stv = calculate_cell_statistics(snan, "voltage")
+        check("Cell NaN：max/min 非 NaN（已排除）",
+              stv["max"] is not None and stv["max"] == stv["max"] and stv["min"] == stv["min"])
+        check("Cell NaN：warning 記無效電壓", any("無效電壓" in w for w in snan["warnings"]))
+        snone = BDS.create_cell_snapshot(_fake_pack_data(inject_none=True), ts, "charge", 90, 5.0, "session_start")
+        check("Cell None：warning 記無效電壓", any("無效電壓" in w for w in snone["warnings"]))
+
+        print("\n[驗證：同 timestamp 去重]")
+        clk["dt"] = datetime(2026, 3, 12, 13, 0, 0)
+        cur["packs"] = _fake_pack_data()
+        cur["r"] = reading(5.0, 60, "charge")
+        sdup = ReportSession("auto", 10.0, "交流有功", object(), output_root, now_fn=now)
+        sdup.start()                                          # session_start（charge）
+        n1 = len(sdup.cell_snapshots)
+        sdup._capture_cell_snapshot(cur["r"], "charge", 5.0, "charge_start")   # 同秒同資料
+        check(f"同 timestamp+mode+soc+power+hash → 去重（維持 {n1} 筆）",
+              len(sdup.cell_snapshots) == n1 and n1 == 1)
+
+        # ---- 無 Cell 快照（模擬舊報告）→ 不產生 Cell Volt./Cell Temp. 空白表 ----
+        print("\n[驗證：無 Cell 快照 → 不建 Cell 工作表]")
+        from openpyxl import load_workbook as _lw
+        sco.cell_snapshots = []                               # 清空，模擬無 cell_snapshots.json
+        sco._write_xlsx(sco._compute_statistics())
+        wbx = _lw(os.path.join(sco.folder, CFG.FILE_XLSX))
+        check("無 Cell 快照：report.xlsx 不含 Cell Volt./Cell Temp.（不產生空白表）",
+              "Cell Volt." not in wbx.sheetnames and "Cell Temp." not in wbx.sheetnames)
+    finally:
+        read_all, _fetch_cell_packs = _o_read, _o_fetch
+
+
 def selftest():
     """
     離線自我測試（不連設備）：驗證 Session append/resume 累積機制。
@@ -2102,18 +2896,14 @@ def selftest():
             ③ resume 再追加 5 筆放電 → 完成。全程注入假時鐘與合成 reading，不觸網。
     """
     print("== charge_discharge_report 離線自我測試：Session append / resume 累積 ==")
-    # selftest 一律寫入獨立 output/test_output，絕不碰正式報告目錄 output/charge_discharge_reports
-    output_root = _TEST_OUTPUT_ROOT
+    # selftest 一律寫入「單一測試目錄」output/test_output/selftest_latest，絕不碰正式報告目錄。
+    # 每次執行前整個清空並重建 → 固定 timestamp 不再撞名累積成 _2/_3…；主流程與情境測試都在此目錄下。
+    output_root = os.path.join(_TEST_OUTPUT_ROOT, CFG.SELFTEST_SUBDIR)
+    if os.path.isdir(output_root):
+        _safe_rmtree(output_root)   # 經保護：允許 test_output 底下，禁止刪正式報告目錄
     os.makedirs(output_root, exist_ok=True)
+    print(f"   測試輸出目錄（每次清空重建）：{output_root}")
     base = datetime(2026, 7, 17, 9, 0, 0)
-    # selftest 用固定示範時間 → 每次都清掉「test_output 內」舊示範資料夾（含歷史 _2/_3… 殘留），
-    # 讓示範 Session 永遠重用同一個乾淨資料夾。（正式報告目錄不受影響、且被 _safe_rmtree 保護禁止刪除）
-    import glob as _glob
-    _demo_base = base.strftime(CFG.SESSION_FOLDER_TIME_FMT) + "_auto"
-    for _p in ([os.path.join(output_root, _demo_base)]
-               + _glob.glob(os.path.join(output_root, _demo_base + "_*"))):
-        if os.path.isdir(_p):
-            _safe_rmtree(_p)   # 經保護：允許 test_output，禁止刪正式報告目錄
     clk = {"dt": base}
     now_fn = lambda: clk["dt"]                       # noqa: E731
     cur = {"r": None}
@@ -2156,9 +2946,12 @@ def selftest():
         results.append(bool(ok))
         print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
 
-    global read_all
+    global read_all, _fetch_cell_packs
     orig = read_all
+    orig_fetch = _fetch_cell_packs
     read_all = lambda _c: cur["r"]                   # noqa: E731
+    # Cell 快照抓取：注入合成 19×20 pack 資料（不觸網），供 Cell Volt./Temp. 產表與快照擷取驗證
+    _fetch_cell_packs = lambda _c: (_fake_pack_data(), None)   # noqa: E731
     folder = None
     try:
         # ---- 階段①：新 Session，5 筆充電（告警 A 於取樣期間出現＝new）→ 暫停 ----
@@ -2447,6 +3240,50 @@ def selftest():
             check(f"Arming 驗證發生例外：{e}", False)
     finally:
         read_all = orig
+        _fetch_cell_packs = orig_fetch
+
+    # ---- Cell Volt. / Cell Temp. 工作表（主報告：phase③ finalize 產出）----
+    print("\n[驗證：Cell Volt. / Cell Temp. 工作表]")
+    try:
+        from openpyxl import load_workbook
+        wbc = load_workbook(os.path.join(folder, CFG.FILE_XLSX))
+        names = wbc.sheetnames
+        check("含 Cell Volt. 工作表", "Cell Volt." in names)
+        check("含 Cell Temp. 工作表", "Cell Temp." in names)
+        # 分頁順序：Cell Volt./Temp. 在 Discharge 之後、Raw Data 之前
+        if all(n in names for n in ("Discharge", "Cell Volt.", "Cell Temp.", "Raw Data")):
+            check("分頁順序：Discharge < Cell Volt. < Cell Temp. < Raw Data",
+                  names.index("Discharge") < names.index("Cell Volt.")
+                  < names.index("Cell Temp.") < names.index("Raw Data"))
+        # cell_snapshots.json 存在且累積多筆（非只留最後一筆）
+        snapobj = _load_json_file(os.path.join(folder, CFG.FILE_CELL_SNAPSHOTS)) or {}
+        snaps = snapobj.get("snapshots") or []
+        check(f"cell_snapshots.json 累積 ≥ 2 筆（{len(snaps)}）", len(snaps) >= 2)
+        check("cell_snapshots.json 已版本化（schema_version）",
+              snapobj.get("schema_version") == BDS.CELL_SNAPSHOT_SCHEMA_VERSION)
+        reasons = [s.get("snapshot_reason") for s in snaps]
+        check(f"含 session_start 與 session_end（reasons={reasons}）",
+              "session_start" in reasons and "session_end" in reasons)
+        check("含 discharge_start（phase③ 由充電切放電）", "discharge_start" in reasons)
+        # 快照皆綁定 timestamp/mode/soc/power 且有 packs（非全部重用同一筆）
+        ts_set = set(s.get("timestamp") for s in snaps)
+        check(f"快照 timestamp 不全相同（{len(ts_set)} 種）", len(ts_set) >= 2)
+        # Cell Volt. 顯示電壓（~3.x），Cell Temp. 顯示溫度（~2x）；抽第一個非 N/A 數值格驗證量級
+        def _first_num(ws):
+            for row in ws.iter_rows():
+                for c in row:
+                    if isinstance(c.value, (int, float)):
+                        return float(c.value)
+            return None
+        v0 = _first_num(wbc["Cell Volt."])
+        t0 = _first_num(wbc["Cell Temp."])
+        check(f"Cell Volt. 數值為電壓量級 2~5V（{v0}）", v0 is not None and 2.0 <= v0 <= 5.0)
+        check(f"Cell Temp. 數值為溫度量級 0~80℃（{t0}）", t0 is not None and 0.0 <= t0 <= 80.0)
+    except Exception as e:
+        check(f"Cell 工作表驗證發生例外：{e}", False)
+
+    # ---- Cell 快照情境驗證（read_all/_fetch_cell_packs 已還原，內部自帶 monkeypatch）----
+    _selftest_cell_snapshots(check, output_root)
 
     ok = all(results)
     print(f"\n== SelfTest {'PASS' if ok else 'FAIL'}（{sum(results)}/{len(results)} 檢查通過）==")
@@ -2477,15 +3314,18 @@ def _print_final(sess, stats):
     print(f"輸出資料夾      : {sess.folder}")
 
 
-def regenerate_report(folder, backup_name="report_before_chart_fix.xlsx"):
+def regenerate_report(folder, backup_name=None):
     """
     用『唯一的 _write_xlsx』重產指定 session 資料夾的 report.xlsx（與 finalize/selftest 同一函式）。
-    - 只讀該資料夾既有 samples.csv / alarms.csv / summary.json；不連設備、不動原始資料。
-    - 重產前將原 report.xlsx 備份為 backup_name（若該備份已存在則不覆蓋）。
-    - 不建立 charts/、不產生 report_analysis.xlsx；統計數值沿用 summary.json（不重算、不改變）。
+    - 只讀該資料夾既有 samples.csv / alarms.csv / summary.json / cell_snapshots.json；不連設備、不動原始資料。
+    - **不建立新的 session 資料夾**（走 resume 分支，直接在原資料夾內更新 report.xlsx）。
+    - 重產前將原 report.xlsx 備份為 backup_name；預設 report_backup_YYYYMMDD_HHMMSS.xlsx（每次一份帶時間戳）。
+    - 統計數值沿用 summary.json（不重算、不改變）。
     """
     global _now_str
     folder = os.path.abspath(folder)
+    if not backup_name:
+        backup_name = "report_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".xlsx"
     summ = _load_json_file(os.path.join(folder, CFG.FILE_SUMMARY))
     if not summ:
         print(f"[REGEN] 找不到或無法讀取 summary.json：{folder}")
@@ -2496,6 +3336,12 @@ def regenerate_report(folder, backup_name="report_before_chart_fix.xlsx"):
     sess = ReportSession.resume(folder, object())            # 僅 __init__（不 start、不寫檔）
     sess.samples = sess._load_all_samples()
     sess.alarm_tracker.load_existing(sess._load_csv_rows(CFG.FILE_ALARMS))
+    has_cell_file = os.path.exists(os.path.join(folder, CFG.FILE_CELL_SNAPSHOTS))
+    sess._load_cell_snapshots()                              # 讀回歷史 Cell 快照（不重抓最新值）
+    if not has_cell_file:
+        # Cell 功能之前建立的舊報告：不回填、不產生 Cell 工作表（保持歷史真實性）
+        print(f"[REGEN] 此報告建立時尚未支援 Cell 快照功能（無 {CFG.FILE_CELL_SNAPSHOTS}）"
+              f"→ 不會產生 Cell Volt./Cell Temp.（不以現在的即時值回填歷史）。")
     sess.start_state = summ.get("start_state") or sess.start_state
     sess.end_state = summ.get("end_state")
     sess.end_reason = sess_blk.get("end_reason") or "completed"
@@ -2537,8 +3383,8 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="離線自我測試（合成資料，不連設備）")
     ap.add_argument("--regen", metavar="FOLDER", default=None,
                     help="以最新 _write_xlsx 重產指定 session 資料夾的 report.xlsx（備份原檔、不動原始資料）")
-    ap.add_argument("--backup-name", default="report_before_chart_fix.xlsx",
-                    help="--regen 時原 report.xlsx 的備份檔名")
+    ap.add_argument("--backup-name", default=None,
+                    help="--regen 時原 report.xlsx 的備份檔名（預設 report_backup_YYYYMMDD_HHMMSS.xlsx）")
     args = ap.parse_args()
 
     if args.selftest:

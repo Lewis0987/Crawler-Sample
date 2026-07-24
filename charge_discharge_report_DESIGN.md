@@ -371,3 +371,54 @@ Session ID / 動作 / 設定功率 / 經過時間 / 目前 SOC / 實際功率 / 
 3. 驗證 OK 後，再談 `device_control_menu.py` 整合（案A / 案B）。
 
 > 本階段完全未動控制程式、未送任何充放電命令。
+
+---
+
+## 12. 實作維護筆記（Cell 工作表 + 輸出/目錄策略）
+
+> 狀態：**實作中，後續仍可能調整**。本節與程式碼保持同步；待流程穩定再整理成正式設計文件。
+> 對應：`charge_discharge_report.py` / `charge_discharge_report_config.py`（schema 1.4.0、report 1.1.0）。
+
+### 12.1 Cell Volt. / Cell Temp. 兩張工作表
+
+- **資料來源（唯讀）**：重用 `battery_data_scraper.fetch_battery_cell_data()` →
+  `GET /hmiGuest/unauthorizedAccess/battery/getPackInformation`；cell 原始欄位 `voltage`(V)、`temperature`(℃)。
+  正規化與快照函式集中在 `battery_data_scraper`：`normalize_pack_cell_data` /
+  `create_cell_snapshot` / `validate_cell_snapshot`（不複製 API 邏輯到報告端）。
+- **快照時機（起訖＋方向切換）**：`session_start / charge_start / discharge_start /
+  mode_changed_to_charge / mode_changed_to_discharge / session_end`；底層仍每 5 秒取樣，只在這些時機擷取 280-cell 完整快照。
+- **去重**：`timestamp + mode + soc + power_kw + cell_data_hash` 五者全同才視為重複，不建第二筆。
+- **持久化**：每 session 一份 `cell_snapshots.json`（版本化 `schema_version`，session 內累積不覆蓋）；
+  `resume` 與 `--regen` 只讀回歷史，**不重抓最新值覆蓋舊紀錄**；抓取失敗標 `cell_data_status="failed"`、不沿用上一筆。
+- **缺 Pack / 缺 Cell / 無效值**：`validate_cell_snapshot` 只記 warning，不使整份報表失敗。
+- **動態 Pack 排版**：`CELL_EXPECTED_PACKS=None`（動態）→ 只排出「實際存在」的 Pack（實測本站 14 Pack），缺的略過壓縮、不留 N/A 空位、不報缺 Pack；`CELL_PACK_LAYOUT` 僅作偏好順序樣板。
+- **色階啟用（Diff-Gate）**：先看該筆 Diff（Max−Min）大小決定「可用等級集合」（Diff 很小→只 normal 全綠；越大才解鎖外圈到 abnormal），再以 normal 置中（`CELL_NORMAL_BAND_FRAC`）分段 → 微小雜訊不會整片變色。電壓/溫度各自門檻（`CELL_LEVEL_GATE`）。已移除舊的 σ/IQR 離群強制上色。
+- **左側摘要**：最大/最小/平均/極差（數值格本身依 `get_*_fill` 上色，與矩陣一致）+ 當前SOC/當前功率（不上色）。**Legend 已移除**（逐筆重複、冗餘）。
+- **舊報告保護（重要）**：Cell 功能之前建立的 session 沒有 `cell_snapshots.json`。`_write_xlsx` 僅在「有歷史快照」時才產生 Cell Volt./Cell Temp.；**無快照 → 略過、不產生空白表**。`--regen` 對缺 `cell_snapshots.json` 的舊報告會明確提示且不建 Cell 表——**絕不以產生當下的即時值回填歷史紀錄**，保持歷史報告真實性。
+- **版面**：`create_cell_sheet(...)` 為共用框架（未來加 Cell Resistance/Balance/Alarm 只需給 formatter+statistics+color_provider）；
+  Pack 依 `CELL_PACK_LAYOUT` 固定排列；Discharge 黃、Charge 藍、Standby 灰分區；分頁置於 `Discharge` 之後、`Raw Data` 之前
+  （既有三張紀錄頁名稱 `Charge & Discharge`/`Charge`/`Discharge` 未改）。
+- **統計**：`calculate_cell_statistics` 用原始值計算 Max/Min/Average/Diff（含 mean/std/IQR 供色階離群判定），顯示時才格式化。
+
+### 12.2 色盤（單一來源、可由 Excel 換色）
+
+- 唯一色盤常數 `CELL_COLOR_PALETTE`（`key → ARGB`）；Matrix / 左側 Summary / Legend **共用同一組**，取色統一入口 `_fill_for_level()`。
+- 7 段等級 `CELL_LEVEL_ORDER`（`abnormal_low→…→abnormal_high`）＋ `no_data`；相對色階依等級數等分（`_band_level`），離群歸兩端。
+  Cell Volt./Temp. 共用等級名稱，但數值判斷各自獨立：`get_voltage_fill()` / `get_temperature_fill()`（不共用數值區間）；差值另用 `get_diff_fill()`。
+- 色碼來源＝使用者在 Excel 手動填色的範本，用 `read_palette_from_excel.py` 讀取（`--resolve-theme` 可將 theme+tint 解析為實際 RGB）；
+  一律正規化為 `FF+後6位`（不透明），避免 alpha 前綴造成顯示差異。字色（黑/白）由底色亮度自動決定，不更動使用者的填滿色。
+- `CELL_COLOR_MODE`：`relative`（現行）/ `threshold`（預留，填入 `CELL_THRESHOLDS` 後切換即可，不需改報表程式）。
+
+### 12.3 輸出目錄策略（正式 vs 測試，避免累積）
+
+| 用途 | 目錄 | 命名 / 清理 |
+|---|---|---|
+| **正式實機** `run_live` | `output/charge_discharge_reports/` | `YYYYMMDD_HHMMSS_<action>`；同名才加 `_2/_3…`；受 `_safe_rmtree` 保護，程式禁止刪除 |
+| **離線 `--selftest`** | `output/test_output/selftest_latest/`（`CFG.SELFTEST_SUBDIR`） | **每次執行前整個清空重建**；固定 timestamp 不再撞名累積成 `_2…` |
+| **`--regen`** | 指定的既有 session 資料夾 | **不建新資料夾**（走 resume 原地更新）；更新前備份 `report_backup_YYYYMMDD_HHMMSS.xlsx` |
+| **色盤範本** | `output/cell_palette_template.xlsx` | 由 `read_palette_from_excel.py --template` 產生；讀取/驗證不建任何 session 資料夾 |
+
+- **建立資料夾的唯一點**：`ReportSession.__init__`（新建分支決定名稱、同名加流水號）＋ `start()` 的 `os.makedirs`。
+  `--regen`、色盤讀取/驗證都**不**經過此路徑。
+- **刪除保護**：全專案唯一刪除入口 `_safe_rmtree`——目標為正式報告根目錄或其上層一律中止，正式報告目錄底下預設禁止刪除（`ALLOW_REPORT_DELETE=False`）。
+- **歷史備註**：修正前 `_selftest_cell_snapshots` 用固定 timestamp 且未先清除，故多次執行累積出 `_2`~`_6`；改為單一目錄清空重建後解除。

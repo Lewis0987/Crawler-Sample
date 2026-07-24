@@ -164,6 +164,143 @@ def to_cell_csv_rows(cell_rows):
     } for c in cell_rows]
 
 
+# ======================================================================
+# 統一 Cell 快照結構（供 charge_discharge_report 等模組重用；不重寫 API 邏輯）
+# ----------------------------------------------------------------------
+#   fetch_battery_cell_data  取原始 pack list（薄包裝 fetch_battery_data）
+#   normalize_pack_cell_data 轉統一結構 {packNo: {cell_voltage[], cell_temperature[], cell_no[]}}
+#   create_cell_snapshot     由原始 data 建立一筆快照（不連網；含 status/hash/count）
+#   validate_cell_snapshot   驗證完整性（缺 Pack / cell 數 / 排序 / 無效值）→ warning 清單
+# ======================================================================
+CELL_SNAPSHOT_SCHEMA_VERSION = "1.0"   # 快照結構版本（未來加 Cell Resistance/Balance/Alarm 時 +1）
+
+
+def fetch_battery_cell_data(client):
+    """取得電池 Pack/Cell 原始資料（GET getPackInformation，無參數）。
+    語意化命名的薄包裝，供報告模組重用同一支唯讀 API；回傳 pack list 或 None。"""
+    return fetch_battery_data(client)
+
+
+def _cell_num(v):
+    """Cell 數值安全轉 float：None / 空字串 / NaN / 非數字 → None（不納入計算與雜湊）。"""
+    if v is None:
+        return None
+    try:
+        f = float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    if f != f:            # NaN（float('nan') != 自己）
+        return None
+    return f
+
+
+def normalize_pack_cell_data(data):
+    """
+    把 getPackInformation 原始 list 正規化為統一結構（重用 build_cell_rows，維持 packList 原順序）：
+      { "<packNo>": {"cell_voltage": [...], "cell_temperature": [...], "cell_no": [...]}, ... }
+    - packNo 以字串為鍵；cell 順序 = 設備 packList 原順序（與 UI 一致，不重新排序）。
+    - 電壓/溫度保存原始數值（無效值存 None，計算時再排除；此處不四捨五入）。
+    - 電壓與溫度分開兩個 list，索引一一對應同一顆 cell，避免欄位錯置。
+    """
+    cell_rows, _per_pack = build_cell_rows(data)
+    packs = {}
+    for c in cell_rows:
+        pk = str(c.get("packNo"))
+        d = packs.setdefault(pk, {"cell_voltage": [], "cell_temperature": [], "cell_no": []})
+        d["cell_voltage"].append(_cell_num(c.get("voltage")))
+        d["cell_temperature"].append(_cell_num(c.get("temperature")))
+        d["cell_no"].append(c.get("cellNo"))
+    return packs
+
+
+def _cell_data_hash(packs):
+    """Voltage+Temperature 內容雜湊（快照去重用；與 timestamp/mode/soc/power 併用判斷是否重複）。"""
+    import hashlib
+    payload = []
+    for pk in sorted(packs.keys(), key=lambda x: (len(x), x)):
+        d = packs[pk]
+        payload.append((pk, tuple(d.get("cell_voltage") or []),
+                        tuple(d.get("cell_temperature") or [])))
+    return hashlib.md5(repr(payload).encode("utf-8")).hexdigest()
+
+
+def create_cell_snapshot(data, timestamp, mode, soc, power_kw, snapshot_reason,
+                         snapshot_id=None, error_message=None, expected_packs=None):
+    """
+    由原始 data 建立一筆統一 Cell 快照（**不連網**；data 需先由 fetch_battery_cell_data 取得）。
+    - data 為 None / 空 / 非 list → cell_data_status="failed"（**不沿用任何舊資料**）。
+    - 綁定該次取樣的 timestamp / mode / soc / power_kw；packs 為當下完整 Cell 快照。
+    - warnings 由 validate_cell_snapshot 產生（缺 Pack 等只記 warning，不使整份報表失敗）。
+    回傳 snapshot dict（欄位見設計；含 pack_count / cell_count / cell_data_hash）。
+    """
+    ok = isinstance(data, list) and len(data) > 0
+    packs = normalize_pack_cell_data(data) if ok else {}
+    cell_count = sum(len(d.get("cell_voltage") or []) for d in packs.values())
+    snap = {
+        "snapshot_id": snapshot_id,
+        "snapshot_reason": snapshot_reason,
+        "timestamp": timestamp,
+        "mode": mode,
+        "soc": _cell_num(soc),
+        "power_kw": _cell_num(power_kw),
+        "cell_data_status": "ok" if ok else "failed",
+        "error_message": error_message or (None if ok else
+                                           "battery_data_scraper 取得 Cell 資料失敗（無資料）"),
+        "pack_count": len(packs),
+        "cell_count": cell_count,
+        "cell_data_hash": _cell_data_hash(packs) if ok else None,
+        "warnings": [],
+        "packs": packs,
+    }
+    snap["warnings"] = validate_cell_snapshot(snap, expected_packs=expected_packs)
+    return snap
+
+
+def validate_cell_snapshot(snapshot, expected_packs=None, cells_per_pack=CELLS_PER_PACK):
+    """
+    驗證快照完整性，回傳 warning 字串清單（**不丟例外、不使整份報表失敗**）：
+      - Pack expected_packs（預設 1~19）是否全存在；缺哪些 Pack（缺者由報表顯示 N/A）
+      - 是否有重複 Pack（同 packNo 合併後 cell 數異常，於 cell 數檢查中反映）
+      - 每個 Pack 的電壓/溫度數量是否一致、是否 = cells_per_pack
+      - Cell 排序（cell_no）是否遞增一致
+      - 是否含無效值（None/NaN）
+    """
+    # expected_packs=None → 動態：不做「缺 Pack」檢查，只驗證實際存在的 Pack。
+    # 傳入清單（如 [1..19]）才會檢查是否缺 Pack。
+    warnings = []
+    if snapshot.get("cell_data_status") == "failed":
+        return ["cell_data_status=failed：" + str(snapshot.get("error_message"))]
+    packs = snapshot.get("packs") or {}
+    present = set()
+    for pk in packs.keys():
+        try:
+            present.add(int(pk))
+        except (TypeError, ValueError):
+            warnings.append(f"Pack 編號非數值：{pk!r}")
+    if expected_packs:
+        missing = [p for p in expected_packs if p not in present]
+        if missing:
+            warnings.append("缺少 Pack：" + ",".join(str(p) for p in missing) + "（顯示 N/A）")
+    for pk, d in packs.items():
+        vs = d.get("cell_voltage") or []
+        ts = d.get("cell_temperature") or []
+        nos = d.get("cell_no") or []
+        if len(vs) != len(ts):
+            warnings.append(f"Pack {pk}：電壓數({len(vs)})與溫度數({len(ts)})不一致（可能欄位錯置）")
+        if len(vs) != cells_per_pack:
+            warnings.append(f"Pack {pk}：cell 數 {len(vs)} ≠ 預期 {cells_per_pack}")
+        badv = sum(1 for x in vs if x is None)
+        badt = sum(1 for x in ts if x is None)
+        if badv:
+            warnings.append(f"Pack {pk}：{badv} 個無效電壓值（None/NaN/空/字串）")
+        if badt:
+            warnings.append(f"Pack {pk}：{badt} 個無效溫度值（None/NaN/空/字串）")
+        seq = [n for n in nos if isinstance(n, (int, float))]
+        if len(seq) >= 2 and any(seq[i + 1] <= seq[i] for i in range(len(seq) - 1)):
+            warnings.append(f"Pack {pk}：Cell 排序(cell_no)非遞增，順序可能與 UI 不一致")
+    return warnings
+
+
 # ---------------- console 摘要 ----------------
 def print_summary(pack_summary, cell_rows, per_pack):
     print("=" * 56)

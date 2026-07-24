@@ -414,9 +414,10 @@ def parse_battery(main, manual_power, dodi):
         v = main.get("rackTotalBatteryVoltage")
         a = main.get("rackElectricCurrent")
         soc = main.get("rackSoc")
-        # 當前狀態：共用 battery_flow_state（<0 放電 / >0 充電 / ≈0 待機），不用固定「運轉」
+        # 電池充放電狀態：battery_flow_state（V×A 能量流向：<0 放電 / >0 充電 / ≈0 待機）。
+        # ⚠ 這只代表「能量流向」，不代表設備健康/故障 → 不再指定給「電池當前狀態」。
         flow_state, power_kw = battery_flow_state(main)
-        out["當前狀態"] = flow_state
+        out["電池充放電狀態"] = flow_state
         if soc is not None:
             out["當前SOC"] = f"{soc} {main.get('rackSocUnit', '%')}"
         if v is not None:
@@ -426,15 +427,20 @@ def parse_battery(main, manual_power, dodi):
         if power_kw is not None:
             out["當前功率"] = f"{power_kw:.3f} kW"
     else:
-        out["當前狀態"] = "暫無資料"
+        out["電池充放電狀態"] = "暫無資料"
+    # 電池當前狀態：真正來源（與 UI「故障/待機…」相同的欄位）尚未確認。
+    # 在確認前一律「未知」——不以 PCS fault flag 猜測、不因 current=0 判待機、不 fallback。
+    # 待實機故障時用 inspect_device_status.py 同時點比對確認來源後，再實作正確映射。
+    out["電池當前狀態"] = "未知（來源待確認）"
     # 3) 反饋/接觸器（主正反饋/主正/主負反饋/主負/環流）← getDOAndDIMsg
     out.update(parse_feedback(dodi))
-    # 4) 暫時 Debug（確認 mapping 正確後可移除）
+    # 4) 暫時 Debug（唯讀）
     out["battery_power_field"] = "getDOAndDIMsg: main.positive/negative.contactor.feedback"
     out["battery_power_raw"] = power_raw
     out["battery_power_mapped"] = power_state
     out["current_power"] = f"{power_kw:.3f} kW" if power_kw is not None else "unknown"
-    out["current_state"] = out.get("當前狀態")
+    out["current_flow_state"] = out.get("電池充放電狀態")   # 能量流向（原 current_state 改名，避免誤解為「當前狀態」）
+    out["current_state"] = out.get("電池當前狀態")           # 電池當前狀態（目前為未知，待來源確認）
     return out
 
 
@@ -561,7 +567,7 @@ def summarize_verify(vd):
 _UI_FIELDS = {
     "PCS": ["PCS當前狀態", "PCS控制模式", "PCS排程開關狀態", "PCS工作模式",
             "PCS功率控制模式", "PCS手動模式開關"],
-    "電池": ["電池上下電狀態", "當前狀態", "當前SOC", "當前電壓", "當前電流", "當前功率",
+    "電池": ["電池上下電狀態", "電池當前狀態", "電池充放電狀態", "當前SOC", "當前電壓", "當前電流", "當前功率",
              "主正反饋", "主正", "主負反饋", "主負", "環流"],
     "空調": ["空調開關", "空調目前狀態", "空調製冷設定", "空調製熱設定", "空調濕度設定",
              "空調櫃內溫度", "空調櫃內濕度", "空調故障"],

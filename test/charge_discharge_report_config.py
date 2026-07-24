@@ -13,8 +13,8 @@ PCS 充放電報告 — 設定檔（charge_discharge_report_config.py）
 # ======================================================================
 # 版本
 # ======================================================================
-REPORT_VERSION = "1.0.0"     # 報告產生器版本（輸出檔 report_version）
-SCHEMA_VERSION = "1.3.0"     # 輸出資料結構版本（欄位/檔案結構變更時 +1）
+REPORT_VERSION = "1.1.0"     # 報告產生器版本（輸出檔 report_version）
+SCHEMA_VERSION = "1.4.0"     # 輸出資料結構版本（欄位/檔案結構變更時 +1）
 # schema 1.1.0：alarms.csv/Excel 告警 ID 調整 —— alarm_id→alarm_id_raw（全程字串、防精度遺失），
 #               新增 alarm_code（ALM-YYYYMMDD-NNN，僅供顯示/查找），欄位順序調整。
 # schema 1.2.0：Session append/resume —— samples.csv 新增 sample_index /
@@ -23,6 +23,10 @@ SCHEMA_VERSION = "1.3.0"     # 輸出資料結構版本（欄位/檔案結構變
 # schema 1.3.0：samples.csv 新增 rack_max_temperature_c / rack_min_temperature_c
 #               （來源 overview/rackExtremeValueInformation.rackCellMax/MinTemperature）；
 #               紀錄頁整合圖改為 電流 + Rack 最高/最低溫度；Summary 移除 Health。
+# schema 1.4.0：新增 Cell 快照（cell_snapshots.json，來源 battery_data_scraper.getPackInformation）；
+#               report.xlsx 新增 Cell Volt. / Cell Temp. 兩工作表（Discharge 之後、Raw Data 之前）。
+#               快照時機：session_start / charge_start / discharge_start /
+#               mode_changed_to_charge / mode_changed_to_discharge / session_end（起訖＋方向切換）。
 
 # ======================================================================
 # 取樣與計算
@@ -46,6 +50,10 @@ RTE_MIN_PHASE_RATIO = 0.2
 # 相對專案根 output/ 的子目錄；主程式會轉為絕對路徑並自動建立
 OUTPUT_SUBDIR = "charge_discharge_reports"
 
+# 離線 --selftest 專用單一測試目錄（位於 output/test_output/ 下）；每次執行前整個清空重建，
+# 避免固定 timestamp 撞名累積成 _2/_3…。正式設備報告不會寫入此處。
+SELFTEST_SUBDIR = "selftest_latest"
+
 # session 資料夾命名：<開始時間>_<action>，例如 20260716_103000_discharge
 SESSION_FOLDER_TIME_FMT = "%Y%m%d_%H%M%S"
 
@@ -57,6 +65,7 @@ FILE_ALARMS = "alarms.csv"
 FILE_EVENTS = "events.csv"
 FILE_XLSX = "report.xlsx"
 FILE_SESSION_STATE = "session_state.json"   # Session 狀態（recording/paused/completed，供續接累積）
+FILE_CELL_SNAPSHOTS = "cell_snapshots.json"  # Cell 電壓/溫度歷史快照（session 內累積，供 Cell Volt./Temp. 產表）
 
 # Session 狀態值
 SESSION_RECORDING = "recording"
@@ -271,6 +280,160 @@ TAB_COLORS = {
     "Charge & Discharge": "548235",    # 綠
     "Charge": "ED7D31",                # 橘黃 Orange
     "Discharge": "FFC000",             # 黃 Yellow
+    "Cell Volt.": "7030A0",   # 紫（Cell 電壓）
+    "Cell Temp.": "C55A11",   # 深橘（Cell 溫度）
     "Raw Data": "808080",     # 灰
     "Alarm": "C00000",        # 紅 Red
 }
+
+# ======================================================================
+# Cell 快照（Cell Volt. / Cell Temp. 工作表）— 設定集中於此，不寫死於主程式
+# ======================================================================
+# 是否於取樣關鍵時機擷取 Cell 完整快照（來源 battery_data_scraper.getPackInformation）
+CELL_SNAPSHOT_ENABLED = True
+
+# 擷取時機（起訖＋方向切換）；底層每 5 秒取樣照舊，只在這些 reason 擷取 280-cell 完整快照。
+# 相同 (timestamp, mode, soc, power, cell_data_hash) 五者皆同 → 視為重複，不建立第二筆。
+CELL_SNAPSHOT_REASONS = [
+    "session_start", "charge_start", "discharge_start",
+    "mode_changed_to_charge", "mode_changed_to_discharge", "session_end",
+]
+# snapshot_reason → 報表 Header 顯示文字（讓人一眼看出快照來源，而非只有時間）
+CELL_SNAPSHOT_REASON_LABEL = {
+    "session_start": "Session Start",
+    "charge_start": "Charge Start",
+    "discharge_start": "Discharge Start",
+    "mode_changed_to_charge": "Switched → Charge",
+    "mode_changed_to_discharge": "Switched → Discharge",
+    "session_end": "Session End",
+}
+
+# 期望 Pack 清單（供 validate 檢查是否缺 Pack）。
+# None = 動態：不做「缺 Pack」檢查，只依「實際存在的 Pack」排版與驗證
+#        （不同站點 Pack 數不同，如本站實測為 14 Pack；不會對不存在的 15~19 報警或顯示 N/A）。
+# 若某站需強制固定 Pack 數，改成 list(range(1, N+1)) 即可恢復缺 Pack 檢查。
+CELL_EXPECTED_PACKS = None
+CELLS_PER_PACK = 20                          # 每 Pack 預期 cell 數（與 battery_data_scraper 一致）
+
+# Pack 版面「偏好順序/位置」樣板；每個子清單為一列，由左到右。
+# 實際渲染只排出快照中「實際存在」的 Pack：缺的略過並壓縮該列（不留 N/A 空位）；
+# 不在樣板中的 Pack 依序補在最後。
+# CELL_PACK_LAYOUT = [
+#     [11, 10, 1],
+#     [19, 12, 9, 2],
+#     [18, 13, 8, 3],
+#     [17, 14, 7, 4],
+#     [16, 15, 6, 5],
+# ]
+CELL_PACK_LAYOUT = [
+    [1, 2, 3, 4],
+    [5, 6, 7, 8],
+    [9, 10, 11, 12],
+    [13, 14, 15, 16],
+    [17, 18, 19],
+]
+# 每個 Pack 內 Cell 矩陣欄數（20 cell → 5 列 × 4 欄）。Cell 依 packList 原順序由左至右、由上至下填。
+CELL_MATRIX_COLS = 4
+
+# 顯示數值格式：Cell Volt. 3 位小數（不轉整數、不省略小數）；Cell Temp. 整數（cell 方格）。
+# 統計摘要（Max/Min/Average/Diff）：電壓 3 位小數；溫度 1 位小數（Average 保留 1 位較有意義）。
+CELL_VOLT_CELL_FORMAT = "0.000"
+CELL_TEMP_CELL_FORMAT = "0"
+CELL_VOLT_STAT_FORMAT = "0.000"
+CELL_TEMP_STAT_FORMAT = "0.0"
+
+# 兩工作表左側摘要標籤（共用框架、以參數區分）。
+CELL_VOLT_SUMMARY_LABELS = {
+    "title": "Cell Volt.", "max": "最大電壓", "min": "最小電壓",
+    "avg": "平均電壓", "diff": "壓差", "unit": "V",
+}
+CELL_TEMP_SUMMARY_LABELS = {
+    "title": "Cell Temp.", "max": "最高溫度", "min": "最低溫度",
+    "avg": "平均溫度", "diff": "溫差", "unit": "℃",
+}
+
+# --------------------- 色階 / 門檻（集中管理，可無痛切換）---------------------
+# COLOR_MODE = "relative" → 依每筆紀錄自身 Min~Max 相對上色（目前採用，不寫死門檻）。
+# COLOR_MODE = "threshold" → 未來填入 CELL_THRESHOLDS 後改走固定門檻（介面已預留）。
+CELL_COLOR_MODE = "relative"
+
+# 固定門檻介面（目前 None＝未使用；未來設定後把 CELL_COLOR_MODE 改成 "threshold" 即可切換，
+# 不需修改報表產生程式，只走 get_voltage_fill / get_temperature_fill 內的 threshold 分支）。
+CELL_THRESHOLDS = {
+    "voltage_high": None,   # V，超過→紅
+    "voltage_low": None,    # V，低於→紅
+    "temperature_high": None,  # ℃，超過→紅
+    "temperature_low": None,   # ℃，低於→紅（電壓/溫度分開，不共用）
+    "voltage_diff_max": None,      # V，壓差達此值→紅（threshold 模式；None 則走 relative 的 Diff-Gate）
+    "temperature_diff_max": None,  # ℃，溫差達此值→紅
+}
+
+# 色階等級（由低到高，7 段）＋ no_data；名稱固定，Cell Volt./Temp. 共用「同一組名稱」
+# （但數值判斷各自獨立：get_voltage_fill / get_temperature_fill，不共用數值區間）。
+CELL_LEVEL_ORDER = ["abnormal_low", "low", "medium_low", "normal",
+                    "medium_high", "high", "abnormal_high"]      # t 由小到大對應
+CELL_LEVEL_LABEL = {
+    "abnormal_high": "異常高值", "high": "偏高", "medium_high": "中高",
+    "normal": "正常", "medium_low": "中低", "low": "偏低",
+    "abnormal_low": "異常低值", "no_data": "無資料 / N/A",
+}
+
+# 色盤（單一集中管理；key → ARGB 十六進位字串）。Cell Matrix / 左側 Summary / Legend 共用同一組。
+# ★ 來源：使用者手動填色範本 cell_palette_template.xlsx，由 read_palette_from_excel.py 讀取；
+#   theme+tint 者已解析為 Excel 實際顯示 RGB（medium_high=Accent6 較淺80%、no_data=Accent3 較淺80%）。
+# ★ 字色（黑/白）由底色亮度自動決定，不更動使用者選定的填滿色。
+# ★ ARGB 一律正規化為「FF+後6位」(不透明)，避免 00/FF alpha 前綴造成顯示差異。
+CELL_COLOR_PALETTE = {
+    "abnormal_low":  "FFFFFF00",   # 黃（使用者選色）
+    "low":           "FF99FF33",   # 黃綠
+    "medium_low":    "FF66FF33",   # 綠
+    "normal":        "FF00FF00",   # 亮綠
+    "medium_high":   "FFFDEADA",   # Accent6 較淺80%（theme 解析）
+    "high":          "FFFFCCCC",   # 淺紅
+    "abnormal_high": "FFFF0000",   # 紅
+    "no_data":       "FFEBF1DE",   # Accent3 較淺80%（theme 解析）
+}
+# 色階啟用門檻（Diff-Gate）：先看該筆 Diff（Max−Min）多大，再決定「可以用哪幾個等級」。
+# Diff 很小 → 只給 normal（全綠）；Diff 越大才逐步解鎖更外圈的等級（中高/中低 → 偏高/偏低 → 異常）。
+# 每一階 (diff_上限 或 None=以上, 可用等級清單[低→高、對稱、以 normal 為中心])；依序找第一個 diff ≤ 上限者。
+# ★ 只影響「數值→等級」的映射範圍，不改 palette/RGB/統計；電壓與溫度各自獨立門檻。
+CELL_LEVEL_GATE = {
+    "voltage": [                     # 單位 V（已放寬：小壓差幾乎全綠，僅極少數最高值用淡提示色）
+        (0.004, ["normal"]),                                                    # Diff ≤ 0.004 → 全綠
+        (0.010, ["medium_low", "normal", "medium_high"]),                       # ≤ 0.010 → 大部分綠、少量最高值淡提示
+        (0.060, ["low", "medium_low", "normal", "medium_high", "high"]),        # ≤ 0.060 → 加 偏低/偏高
+        (None,  ["abnormal_low", "low", "medium_low", "normal",                 # > 0.060 → 開放異常兩端
+                 "medium_high", "high", "abnormal_high"]),
+    ],
+    "temperature": [                 # 單位 ℃
+        (2.0, ["normal"]),                                                      # Diff ≤ 2 → 全綠
+        (5.0, ["medium_low", "normal", "medium_high"]),                         # ≤ 5 → 中低/正常/中高
+        (8.0, ["low", "medium_low", "normal", "medium_high", "high"]),          # ≤ 8 → 加 偏低/偏高
+        (None, ["abnormal_low", "low", "medium_low", "normal",                  # > 8 → 開放異常兩端
+                "medium_high", "high", "abnormal_high"]),
+    ],
+}
+# normal 中央帶寬（分段時「normal」佔正規化位置 t 的中央比例）：越大→越多 Cell 判為 normal（綠），
+# 只有更靠近極值的少數 Cell 才落到外圈等級。避免資料偏高/偏低時整片被判成非 normal。
+CELL_NORMAL_BAND_FRAC = 0.8
+
+# 顏色說明（Legend）：放在左側摘要「當前功率」下方；等級順序由 CELL_LEVEL_ORDER 反轉（高→低）＋ no_data。
+CELL_LEGEND_TITLE_RELATIVE = "顏色說明（相對色階）"
+CELL_LEGEND_TITLE_THRESHOLD = "顏色說明（固定門檻）"
+
+# 最上方模式分類區塊：Discharge 黃底、Charge 藍底（標題列跨越該模式所有紀錄區塊）。
+# Standby 用於 session 起訖當下無明確充/放電狀態者（不硬歸類成 Charge/Discharge）。
+CELL_MODE_BAND = {
+    "discharge": {"label": "Discharge", "bg": "FFC000", "font": "000000"},   # 黃底黑字
+    "charge":    {"label": "Charge",    "bg": "2E75B6", "font": "FFFFFF"},   # 藍底白字
+    "standby":   {"label": "Standby",   "bg": "808080", "font": "FFFFFF"},   # 灰底白字
+}
+CELL_BAND_ORDER = ["discharge", "charge", "standby"]   # 由上而下排列（無資料的區塊不產生）
+
+# Cell 工作表版面 / 列印
+CELL_SHEET_ZOOM = 80                 # 檢視縮放（70~85）
+CELL_SHEET_PAGE_ORIENTATION = "landscape"
+CELL_VOLT_COL_WIDTH = 8.5            # Cell Volt. 矩陣欄寬（3 位小數，較寬；加大 Cell 顯示空間）
+CELL_TEMP_COL_WIDTH = 6.5            # Cell Temp. 矩陣欄寬（整數，較窄；加大 Cell 顯示空間）
+CELL_SUMMARY_LABEL_WIDTH = 5         # 左側摘要第 1 欄（統計標籤/數值、Legend 色塊）
+CELL_SUMMARY_VALUE_WIDTH = 16        # 左側摘要第 2 欄（Legend 說明文字，需容中文）
