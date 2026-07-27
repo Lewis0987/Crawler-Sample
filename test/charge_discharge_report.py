@@ -941,6 +941,61 @@ def get_temperature_fill(value, stats):
     return _fill_for_level(_gated_level(value, stats, "temperature"))
 
 
+def get_voltage_summary_fill(value, stats, side):
+    """
+    Cell Volt.「偏離平均電壓 %」上色（Summary 最大/最小/平均電壓 + Pack 矩陣每格共用）。
+      side='high'：dev% = (value−avg)/avg×100 → 高端 normal→medium_high→high→abnormal_high
+      side='low' ：dev% = (avg−value)/avg×100 → 低端 normal→medium_low→low→abnormal_low
+      平均電壓：value=avg → dev=0 → normal。
+    顏色一律由**單一 palette**（CELL_COLOR_PALETTE＝cell_palette_template.xlsx）提供（_fill_for_level），
+    故 Summary 與 Pack 矩陣同 level_key 完全同色。value/avg 無效 → 回 None（不上色）。
+    """
+    avg = stats.get("average")
+    if value is None or avg is None:
+        return None
+    try:
+        v = float(value)
+        a = float(avg)
+    except (TypeError, ValueError):
+        return None
+    if a == 0:
+        return None
+    dev = ((v - a) if side == "high" else (a - v)) / a * 100.0
+    dev = round(max(dev, 0.0), 4)                      # 只看該側正向偏差；去浮點雜訊
+    if dev < CFG.CELL_VOLT_DEV1:
+        band = "normal"
+    elif dev < CFG.CELL_VOLT_DEV2:
+        band = "medium"
+    elif dev <= CFG.CELL_VOLT_DEV3:                    # 0.50 本身仍屬 high/low
+        band = "strong"
+    else:
+        band = "abnormal"                             # 僅 >0.50 才 abnormal
+    # 偏差 band → 模板 level_key；顏色一律由單一 palette（CELL_COLOR_PALETTE＝模板）提供（_fill_for_level）
+    return _fill_for_level(CFG.CELL_VOLT_DEV_LEVELS[side][band])
+
+
+def get_voltage_cell_fill(value, stats):
+    """
+    Cell Volt. **Pack 矩陣每格**：與左側 Summary 同一套「偏離全域平均電壓 %」規則（統一色階）。
+      value >= avg → 高側；value < avg → 低側；相等 → normal（dev=0）。
+    因此同一 Snapshot 中，最高 Cell 與 Summary 最大電壓、最低 Cell 與 Summary 最小電壓
+    會得到「相同 level_key 與相同顏色」。無效值 → no_data（模板無資料色）。
+    """
+    avg = stats.get("average")
+    if value is None or avg is None:
+        return _fill_for_level("no_data")
+    try:
+        v = float(value)
+        a = float(avg)
+    except (TypeError, ValueError):
+        return _fill_for_level("no_data")
+    if v != v or a == 0:
+        return _fill_for_level("no_data")
+    side = "high" if v >= a else "low"
+    fd = get_voltage_summary_fill(v, stats, side)
+    return fd if fd else _fill_for_level("no_data")
+
+
 def get_diff_fill(diff, data_type):
     """
     差值（Max-Min）色階 → {'bg','font','level'}：依 Diff-Gate 階層，取「該階可用等級的最高一級」
@@ -1081,6 +1136,11 @@ def render_record_block(ws, top, left, snapshot, data_type, number_format, stat_
     ts = snapshot.get("timestamp") or ""
     reason = snapshot.get("snapshot_reason") or ""
     reason_label = CFG.CELL_SNAPSHOT_REASON_LABEL.get(reason, reason)
+    # session_start 顯示文字依實際模式對齊 charge_start/discharge_start（僅顯示文字，不改 snapshot_reason/資料）：
+    #   充電 → Charge Start、放電 → Discharge Start、待機 → 維持 Session Start。
+    _mode = snapshot.get("mode")
+    if reason == "session_start" and _mode in ("charge", "discharge"):
+        reason_label = "Charge Start" if _mode == "charge" else "Discharge Start"
 
     def _merge_header(row, text, bold=False, color="000000", fill=None):
         ws.merge_cells(start_row=row, start_column=left,
@@ -1115,7 +1175,8 @@ def render_record_block(ws, top, left, snapshot, data_type, number_format, stat_
     rr = content_top
     border = _thin_border()
 
-    def _summary_pair(label, value, number_fmt=None, is_str=False, bold=False, fill_desc=None):
+    def _summary_pair(label, value, number_fmt=None, is_str=False, bold=False,
+                      fill_desc=None, border_only=False):
         nonlocal rr
         lc = ws.cell(row=rr, column=sc, value=label)
         lc.font = Font(bold=True, size=9)
@@ -1128,21 +1189,31 @@ def render_record_block(ws, top, left, snapshot, data_type, number_format, stat_
             vc.fill = PatternFill("solid", fgColor=fill_desc["bg"])
             vc.font = Font(size=10, bold=bold, color=fill_desc["font"])
             vc.border = border
+        elif border_only:
+            vc.font = Font(size=10, bold=bold)     # 白底（不填色）、黑字，但保留框線（壓差/溫差固定白底）
+            vc.border = border
         else:
-            vc.font = Font(size=10, bold=bold)     # SOC/Power：維持黑字、不上色
+            vc.font = Font(size=10, bold=bold)     # SOC/Power：維持黑字、不上色、不加框線
         rr += 2
 
     title_c = ws.cell(row=rr, column=sc, value=summary_labels["title"])
     title_c.font = Font(bold=True, size=11, color="1F4E78")
     rr += 1
-    _summary_pair(summary_labels["max"], stats["max"], stat_format, bold=True,
-                  fill_desc=color_provider(stats["max"], stats))
-    _summary_pair(summary_labels["min"], stats["min"], stat_format, bold=True,
-                  fill_desc=color_provider(stats["min"], stats))
-    _summary_pair(summary_labels["avg"], stats["average"], stat_format,
-                  fill_desc=color_provider(stats["average"], stats))
-    _summary_pair(summary_labels["diff"], stats["diff"], stat_format, bold=True,
-                  fill_desc=get_diff_fill(stats["diff"], data_type))
+    # Cell Volt. 摘要 最大/最小/平均電壓：改用「偏離平均電壓 %」對稱色階（高側暖/低側冷）；
+    # Cell Temp. 維持原 color_provider。
+    if data_type == "voltage":
+        max_fill = get_voltage_summary_fill(stats["max"], stats, "high")
+        min_fill = get_voltage_summary_fill(stats["min"], stats, "low")
+        avg_fill = get_voltage_summary_fill(stats["average"], stats, "high")   # dev=0 → 綠
+    else:
+        max_fill = color_provider(stats["max"], stats)
+        min_fill = color_provider(stats["min"], stats)
+        avg_fill = color_provider(stats["average"], stats)
+    _summary_pair(summary_labels["max"], stats["max"], stat_format, bold=True, fill_desc=max_fill)
+    _summary_pair(summary_labels["min"], stats["min"], stat_format, bold=True, fill_desc=min_fill)
+    _summary_pair(summary_labels["avg"], stats["average"], stat_format, fill_desc=avg_fill)
+    # 壓差 / 溫差：固定白底、不套任何 level 色階；只保留數值、數字格式、框線、字體（電壓與溫度皆同）。
+    _summary_pair(summary_labels["diff"], stats["diff"], stat_format, bold=True, border_only=True)
     soc = snapshot.get("soc")
     power = snapshot.get("power_kw")
     _summary_pair("當前SOC", (f"{soc:.0f} %" if isinstance(soc, (int, float)) else "N/A"), is_str=True)
@@ -1196,6 +1267,70 @@ def setup_cell_sheet_print_area(ws, total_rows, total_cols, data_type):
     ws.freeze_panes = "A3"                          # 固定最上方模式標題/時間列
 
 
+def _fmt_number_for_width(v, number_format):
+    """依 number_format 概估數值顯示字串（供欄寬估算；不影響實際儲存值/格式）。"""
+    try:
+        fmt = str(number_format or "")
+        if "." in fmt:
+            dec = len(fmt.split(".")[1])
+            return f"{float(v):.{dec}f}"
+        if fmt.strip() in ("0", "#,##0", "General", ""):
+            return f"{float(v):.0f}" if float(v) == int(float(v)) else str(v)
+        return str(v)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _disp_width(value, number_format):
+    """顯示寬度估算（CJK 全形≈2、其餘≈1）；數值先依格式轉字串。"""
+    s = _fmt_number_for_width(value, number_format) if isinstance(value, (int, float)) else str(value)
+    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in s)
+
+
+def _fit_summary_columns(ws):
+    """依內容自動調整 Cell 表「左側摘要」欄（off==0）欄寬，避免數值顯示成 ###。
+    以實際內容（標籤 CJK / 數值 / SOC/功率字串）最大顯示寬 × 字級比例計算；只調欄寬，其餘不變。
+    在字體 +Δ 之後呼叫，故已反映放大後字級。"""
+    from openpyxl.utils import get_column_letter
+    g = _cell_geometry()
+    period = g["block_w"] + g["block_gap"]
+    # 跨欄合併（時間/Snapshot/模式帶標題）的錨點跳過——它們橫跨整個區塊，不應撐寬單一摘要欄
+    merged_anchors = set()
+    for rng in ws.merged_cells.ranges:
+        if rng.min_col != rng.max_col:
+            merged_anchors.add((rng.min_row, rng.min_col))
+    for c in range(1, ws.max_column + 1):
+        if (c - 1) % period != 0:          # 只處理每個區塊的摘要欄（off==0；標籤與數值同欄）
+            continue
+        letter = get_column_letter(c)
+        need = 0.0
+        for cell in ws[letter]:
+            if cell.value is None or (cell.row, cell.column) in merged_anchors:
+                continue
+            fs = cell.font.size or 11
+            need = max(need, _disp_width(cell.value, cell.number_format) * fs / 11.0)
+        if need:
+            ws.column_dimensions[letter].width = min(40.0, max(CFG.CELL_SUMMARY_LABEL_WIDTH, need + 1.5))
+
+
+def _bump_sheet_font(ws, delta):
+    """把整張工作表「已使用字體大小」逐格 +delta（其餘字型屬性/填色/框線/對齊/欄寬/列高皆不變）。
+    只處理有值的儲存格（合併非錨點格 value=None 自動略過，避免 MergedCell 設定錯誤）；
+    未指定大小者以 openpyxl 預設 11pt 為基準 +delta。以「現值+Δ」套用，保留各元素大小比例。"""
+    from openpyxl.styles import Font
+    if not delta:
+        return
+    for row in ws.iter_rows():
+        for c in row:
+            if c.value is None:
+                continue
+            f = c.font
+            base = f.size if (f and f.size) else 11
+            c.font = Font(name=f.name, size=base + delta, bold=f.bold, italic=f.italic,
+                          color=f.color, underline=f.underline, strike=f.strike,
+                          vertAlign=f.vertAlign)
+
+
 def create_cell_sheet(wb, sheet_name, data_type, snapshots, *, number_format, stat_format,
                       color_provider, summary_labels):
     """
@@ -1213,6 +1348,7 @@ def create_cell_sheet(wb, sheet_name, data_type, snapshots, *, number_format, st
     if not valid:
         ws["A1"] = f"{sheet_name}：本次 session 無 Cell 快照資料"
         ws["A1"].font = Font(bold=True, size=12, color="808080")
+        _bump_sheet_font(ws, CFG.CELL_SHEET_FONT_DELTA)
         return ws
 
     # 依 mode 分組（未知/idle → standby，不硬歸類）
@@ -1248,6 +1384,10 @@ def create_cell_sheet(wb, sheet_name, data_type, snapshots, *, number_format, st
         cur_row = block_top + g["block_h"] + g["block_gap"]
 
     setup_cell_sheet_print_area(ws, cur_row, max_cols, data_type)
+    # 最後統一把兩表所有字體 +CELL_SHEET_FONT_DELTA（現值+Δ，保比例；版面/框線/底色/對齊不變）
+    _bump_sheet_font(ws, CFG.CELL_SHEET_FONT_DELTA)
+    # 再依內容自動調整摘要欄寬（在放大字級之後），避免數值出現 ###
+    _fit_summary_columns(ws)
     return ws
 
 
@@ -2273,12 +2413,9 @@ class ReportSession:
         r += 1
         r = _section(ws, r, 1, "Alarm")
         r = _kv(ws, r, 1, "告警數", stats.get("alarm_count"), hi=(stats.get("alarm_count") or 0) > 0)
-        # 註：Health（星等評分）已移除；Summary 最後保留 Communication 與 Alarm。
-        _autofit(ws, 2, minw=16, maxw=52)
+        # 註：Health（星等評分）已移除；Summary 保留 Communication 與 Alarm，KPI 併入下半部。
 
-        # ================= Sheet 2：KPI =================
-        wsk = wb.create_sheet("KPI")
-        wsk.append(["項目", "值"])
+        # ================= Summary 下半部：KPI（原獨立 KPI 分頁併入；公式/樣式不變，不再有 KPI 分頁）====
         kpi_rows = [
             ("充電時間", _fmt_hms(dir_sec["charge"])),
             ("放電時間", _fmt_hms(dir_sec["discharge"])),
@@ -2302,14 +2439,18 @@ class ReportSession:
             ("資料筆數", stats.get("sample_count")),
             ("資料完整率", f"{analysis['comm_rate'] * 100:.1f}%"),
         ]
-        for k, v in kpi_rows:
-            wsk.append([k, v])
-        _hdr_row(wsk, 1, 2)
-        wsk.freeze_panes = "A2"
+        r += 1
+        r = _section(ws, r, 1, "KPI")
+        kpi_hdr = r
+        ws.cell(row=kpi_hdr, column=1, value="項目")
+        ws.cell(row=kpi_hdr, column=2, value="值")
+        _hdr_row(ws, kpi_hdr, 2)                       # 保留原 KPI 表頭樣式
+        for i, (k, v) in enumerate(kpi_rows, start=1):
+            ws.cell(row=kpi_hdr + i, column=1, value=k)
+            ws.cell(row=kpi_hdr + i, column=2, value=v)
         if kpi_rows:
-            _table(wsk, f"A1:B{len(kpi_rows) + 1}", "tbl_kpi")
-        _autofit(wsk, 2, minw=16, maxw=40)
-        # KPI 頁只保留統計表格：不新增任何圖表、不留圓餅圖輔助資料區塊。
+            _table(ws, f"A{kpi_hdr}:B{kpi_hdr + len(kpi_rows)}", "tbl_kpi")
+        _autofit(ws, 2, minw=16, maxw=52)             # 含 KPI 內容後統一調欄寬
 
         # ================= 紀錄頁（充放電/充電/放電）共用建構 =================
         rec_headers = [h for h, _f in CFG.RECORD_COLUMNS]
@@ -2446,7 +2587,7 @@ class ReportSession:
             create_cell_sheet(wb, "Cell Volt.", "voltage", self.cell_snapshots,
                               number_format=CFG.CELL_VOLT_CELL_FORMAT,
                               stat_format=CFG.CELL_VOLT_STAT_FORMAT,
-                              color_provider=get_voltage_fill,
+                              color_provider=get_voltage_cell_fill,   # Pack 矩陣＝偏離全域平均%（與 Summary 統一）
                               summary_labels=CFG.CELL_VOLT_SUMMARY_LABELS)
             create_cell_sheet(wb, "Cell Temp.", "temperature", self.cell_snapshots,
                               number_format=CFG.CELL_TEMP_CELL_FORMAT,
@@ -2516,8 +2657,8 @@ class ReportSession:
             wsx.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
             wsx.page_setup.fitToWidth = 1
             wsx.page_setup.fitToHeight = 0
-            if wsx.title in CFG.TAB_COLORS:
-                wsx.sheet_properties.tabColor = CFG.TAB_COLORS[wsx.title]
+            # 僅 CFG.TAB_COLORS 有列出的工作表(Summary)上色；其餘設 None → 不寫 tabColor（Excel 預設白色）
+            wsx.sheet_properties.tabColor = CFG.TAB_COLORS.get(wsx.title)
 
         try:
             wb.save(self._path(CFG.FILE_XLSX))
@@ -2839,7 +2980,7 @@ def _selftest_cell_snapshots(check, output_root):
         wbf = Workbook()
         create_cell_sheet(wbf, "Cell Volt.", "voltage", [snf],
                           number_format=CFG.CELL_VOLT_CELL_FORMAT, stat_format=CFG.CELL_VOLT_STAT_FORMAT,
-                          color_provider=get_voltage_fill, summary_labels=CFG.CELL_VOLT_SUMMARY_LABELS)
+                          color_provider=get_voltage_cell_fill, summary_labels=CFG.CELL_VOLT_SUMMARY_LABELS)
         check("無 Cell Data：Cell Volt. 仍可產生（不崩潰）", "Cell Volt." in wbf.sheetnames)
 
         # 明確傳入 expected_packs=1..19 才檢查缺 Pack（預設 None＝動態、不檢查缺 Pack）
@@ -3025,6 +3166,13 @@ def selftest():
                 got = rgb.upper() if isinstance(rgb, str) else None
                 check(f"Tab色 {sname} = #{hexcol}（實際 {got}）",
                       got is not None and got.endswith(hexcol.upper()))
+            # 其餘工作表需為 Excel 預設（未設定 tabColor）
+            for wsx in wbx.worksheets:
+                if wsx.title in CFG.TAB_COLORS:
+                    continue
+                tc = wsx.sheet_properties.tabColor
+                got = getattr(tc, "rgb", None) if tc is not None else None
+                check(f"Tab色 {wsx.title} = 預設(未設定)（實際 {got}）", tc is None)
         except Exception as e:
             check(f"分頁顏色驗證發生例外：{e}", False)
 
@@ -3045,7 +3193,7 @@ def selftest():
             wbx2 = load_workbook(os.path.join(folder, CFG.FILE_XLSX))
             per_sheet = {n: len(wbx2[n]._charts) for n in wbx2.sheetnames}
             check(f"Summary 圖表=0（{per_sheet.get('Summary')}）", per_sheet.get("Summary") == 0)
-            check(f"KPI 圖表=0（{per_sheet.get('KPI')}）", per_sheet.get("KPI") == 0)
+            check("KPI 分頁已移除（併入 Summary）", "KPI" not in wbx2.sheetnames)
             for sname in ("Charge & Discharge", "Charge", "Discharge"):
                 check(f"{sname} 圖表=1（{per_sheet.get(sname)}）", per_sheet.get(sname) == 1)
                 # 輔助標籤欄移到最右側 AN 且隱藏（不顯示給使用者），Summary 旁不再有輔助標籤

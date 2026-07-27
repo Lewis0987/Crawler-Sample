@@ -274,16 +274,17 @@ ANALYSIS_SOC_TOL_PERCENT = 0.5     # SOC 方向一致性容差（充電不應下
 ANALYSIS_COMM_MIN_RATE = 1.0       # 資料完整率低於此 → 通訊 Warning（1.0＝要求 100%）
 
 # report.xlsx 分頁標籤顏色（openpyxl sheet_properties.tabColor；hex RGB，不影響標題列底色）
+# 僅 Summary 設定自訂顏色；未列於此的工作表一律不設 tabColor → Excel 預設頁籤顏色（白色）
 TAB_COLORS = {
-    "Summary": "548235",      # 綠
-    "KPI": "2E75B6",          # 藍
-    "Charge & Discharge": "548235",    # 綠
-    "Charge": "ED7D31",                # 橘黃 Orange
-    "Discharge": "FFC000",             # 黃 Yellow
-    "Cell Volt.": "7030A0",   # 紫（Cell 電壓）
-    "Cell Temp.": "C55A11",   # 深橘（Cell 溫度）
-    "Raw Data": "808080",     # 灰
-    "Alarm": "C00000",        # 紅 Red
+    "Summary": "4F81BD",      # 藍（KPI 已併入 Summary 下半部，不再有獨立 KPI 分頁）
+    "Charge & Discharge": "548235",   # 綠
+    # "KPI": "2E75B6",          # 藍
+    # "Charge": "ED7D31",                # 橘黃 Orange
+    # "Discharge": "FFC000",             # 黃 Yellow
+    # "Cell Volt.": "7030A0",   # 紫（Cell 電壓）
+    # "Cell Temp.": "C55A11",   # 深橘（Cell 溫度）
+    # "Raw Data": "808080",     # 灰
+    # "Alarm": "C00000",        # 紅 Red
 }
 
 # ======================================================================
@@ -417,6 +418,24 @@ CELL_LEVEL_GATE = {
 # 只有更靠近極值的少數 Cell 才落到外圈等級。避免資料偏高/偏低時整片被判成非 normal。
 CELL_NORMAL_BAND_FRAC = 0.8
 
+# Cell Volt.「偏離平均電壓 %」判斷（Summary 最大/最小/平均電壓 + Pack 矩陣每格共用同一套規則）。
+# 高側 dev% = (值−平均)/平均×100；低側 dev% = (平均−值)/平均×100（平均格 dev=0 → normal）。
+# 比較（dev 四捨五入到 1e-4 去浮點雜訊；0.50 本身仍屬 high/low，僅「>0.50」才 abnormal）：
+#   dev < DEV1            → normal
+#   DEV1 ≤ dev < DEV2     → medium(_high/_low)
+#   DEV2 ≤ dev ≤ DEV3     → (high/low)      ← 含 DEV3=0.50 本身
+#   dev > DEV3            → abnormal(_high/_low)
+CELL_VOLT_DEV1 = 0.15   # %
+CELL_VOLT_DEV2 = 0.30   # %
+CELL_VOLT_DEV3 = 0.50   # %
+# 偏差 band → 模板 level_key。★ 顏色一律由「單一 palette」CELL_COLOR_PALETTE（＝cell_palette_template.xlsx）提供，
+#   不再另存色表 → 保證 Summary 與 Pack Matrix、Cell Volt. 與 Cell Temp.「同一 level_key 完全同色」。
+#   高側→暖端（medium_high/high/abnormal_high）；低側→冷端（medium_low/low/abnormal_low）；normal 共用。
+CELL_VOLT_DEV_LEVELS = {
+    "high": {"normal": "normal", "medium": "medium_high", "strong": "high", "abnormal": "abnormal_high"},
+    "low":  {"normal": "normal", "medium": "medium_low", "strong": "low", "abnormal": "abnormal_low"},
+}
+
 # 顏色說明（Legend）：放在左側摘要「當前功率」下方；等級順序由 CELL_LEVEL_ORDER 反轉（高→低）＋ no_data。
 CELL_LEGEND_TITLE_RELATIVE = "顏色說明（相對色階）"
 CELL_LEGEND_TITLE_THRESHOLD = "顏色說明（固定門檻）"
@@ -431,6 +450,9 @@ CELL_MODE_BAND = {
 CELL_BAND_ORDER = ["discharge", "charge", "standby"]   # 由上而下排列（無資料的區塊不產生）
 
 # Cell 工作表版面 / 列印
+# Cell Volt./Temp. 兩表所有字體在「目前實際大小」上的加減量（pt）；正=放大、0=不變。
+# 以「現值 +Δ」套用（不重指定固定字級），保留各元素大小比例；欄寬/列高/框線/底色/置中/色彩不變。
+CELL_SHEET_FONT_DELTA = 2
 CELL_SHEET_ZOOM = 80                 # 檢視縮放（70~85）
 CELL_SHEET_PAGE_ORIENTATION = "landscape"
 CELL_VOLT_COL_WIDTH = 8.5            # Cell Volt. 矩陣欄寬（3 位小數，較寬；加大 Cell 顯示空間）
