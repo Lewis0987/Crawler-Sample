@@ -52,18 +52,21 @@ QUERY_CHOICE = "1"
 MENU_ACTIONS = {
     "2": ("pcs_manual_on", "PCS 手動模式開"),
     "3": ("pcs_manual_off", "PCS 手動模式關"),
-    "10": ("ac_on", "空調開"),
-    "11": ("ac_off", "空調關"),
-    "12": ("vent_on", "進排風開"),
-    "13": ("vent_off", "進排風關"),
-    "14": ("cooling_on", "冷卻循環開"),
-    "15": ("cooling_off", "冷卻循環關"),
+    "12": ("ac_on", "空調開"),
+    "13": ("ac_off", "空調關"),
+    "14": ("vent_on", "進排風開"),
+    "15": ("vent_off", "進排風關"),
+    "16": ("cooling_on", "冷卻循環開"),
+    "17": ("cooling_off", "冷卻循環關"),
 }
 # 高風險控制（需 YES 二次確認，並帶 --yes）
 HIGH_RISK_ACTIONS = {
-    "8": ("battery_power_on", "電池上電"),
-    "9": ("battery_power_off", "電池下電"),
+    "10": ("battery_power_on", "電池上電"),
+    "11": ("battery_power_off", "電池下電"),
 }
+# PCS 排程：主開關（開/關）控制 = 8；排程配置（唯讀查看）= 9
+SCHEDULE_SWITCH_CHOICE = "8"
+SCHEDULE_VIEW_CHOICE = "9"
 # PCS 功率控制：3 種模式（4/5/6），選後進入第二層（充/放電）。
 # 三種模式 payload/enum/方向皆經 DevTools 確認、可實送。
 PCS_MODE_MENU = {
@@ -116,11 +119,15 @@ VERIFY_EXPECT = {
 }
 
 MENU_TEXT = """
-==============================
+========================================
 設備控制選單
-==============================
+========================================
 
 1. 查詢目前設備狀態
+
+==============================
+【PCS】
+==============================
 
 2. PCS 手動模式開
 3. PCS 手動模式關
@@ -130,24 +137,47 @@ MENU_TEXT = """
 6. PCS 直流恆功率控制（充/放電）
 7. PCS 停止充放電
 
-8. 電池上電
-9. 電池下電
+8. PCS 排程主開關（開/關）
+9. PCS 排程配置（查看）
 
-10. 空調開
-11. 空調關
+==============================
+【電池】
+==============================
 
-12. 進排風開
-13. 進排風關
+10. 電池上電
+11. 電池下電
 
-14. 冷卻循環開
-15. 冷卻循環關
+==============================
+【空調】
+==============================
 
-16. 手動開始合併充放電報告（備用）
-17. 手動結束合併充放電報告（備用）
-18. 查看最近報告
+12. 空調開
+13. 空調關
+
+==============================
+【進排風】
+==============================
+
+14. 進排風開
+15. 進排風關
+
+==============================
+【冷卻循環】
+==============================
+
+16. 冷卻循環開
+17. 冷卻循環關
+
+==============================
+【報告】
+==============================
+
+18. 手動開始合併充放電報告（備用）
+19. 手動結束合併充放電報告（備用）
+20. 查看最新報告
 
 0. 離開
-==============================
+========================================
 """
 
 
@@ -669,7 +699,7 @@ def _report_finalize(end_reason):
 
 
 def report_start():
-    """Menu 16：開始/續接充放電報告（背景記錄；方向由 PCS 旗標自動判定）。
+    """Menu 18：開始/續接充放電報告（背景記錄；方向由 PCS 旗標自動判定）。
     若磁碟上有未完成 Session（recording/paused）→ 續接同一資料夾累積；否則建立新 Session。"""
     if not _REPORT_AVAILABLE:
         print(f"[錯誤] 無法載入報告模組：{_REPORT_IMPORT_ERR}")
@@ -1024,21 +1054,197 @@ def _print_summary_json(data, path):
     print(f"資料夾         : {path}")
 
 
+# ---- PCS 排程（唯讀查看 + 主開關控制入口）----
+_SCHED_MAIN = "/schedule/config/getScheduleSwitch"
+_SCHED_TPL_LIST = "/schedule/template/list"
+_SCHED_ITEM_LIST = "/schedule/list/{tid}"
+_SCHED_CD = {1: "充電", 2: "放電", 3: "不充不放"}
+_SCHED_PLAN = {1: "週", 2: "按日期"}
+_SCHED_WEEK = {"1": "一", "2": "二", "3": "三", "4": "四", "5": "五", "6": "六", "7": "日"}
+
+
+def _sched_readonly_client():
+    """建立已登入的 ApiClient（供排程唯讀查詢用）；失敗回 None。只做唯讀 GET。"""
+    try:
+        from api_client import ApiClient
+    except Exception as e:
+        print(f"[錯誤] 無法載入 ApiClient：{e}")
+        return None
+    c = ApiClient()
+    if not c.login_hmi():
+        print("[錯誤] 登入失敗，無法查詢排程。")
+        return None
+    return c
+
+
+def _sched_switch_state(client):
+    """讀取排程主開關狀態：回傳 (schedulePlanSwitch, manualModeSwitch) 各為 1/0/None。唯讀 GET。"""
+    sw = client.get(_SCHED_MAIN)
+    if not isinstance(sw, dict) or sw.get("_error"):
+        return None, None, sw
+
+    def _b(v):
+        return 1 if v in (1, "1") else (0 if v in (0, "0") else None)
+    return _b(sw.get("schedulePlanSwitch")), _b(sw.get("manualModeSwitch")), sw
+
+
+def _menu_input(prompt):
+    """子選單輸入；EOF/中斷視為返回（回 '0'）。"""
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return "0"
+
+
+def _sched_template_enabled(t):
+    """模板是否啟用（enableFlag==1）。"""
+    return t.get("enableFlag") in (1, "1")
+
+
+def _sched_week_text(execute_time):
+    """planType=1 的 executeTime（如 '3,4,5,1,2'）→ '週一、週二…'。"""
+    return "、".join("週" + _SCHED_WEEK.get(x, x) for x in str(execute_time or "").split(",") if x)
+
+
+def _sched_enabled_item_count(client, tpls):
+    """已啟用模板底下的排程項目總數（唯讀；供主開關警示判斷）。"""
+    n = 0
+    for t in tpls:
+        if _sched_template_enabled(t):
+            items = client.get(_SCHED_ITEM_LIST.format(tid=t.get("tempId")))
+            n += len(items) if isinstance(items, list) else 0
+    return n
+
+
+def pcs_schedule_view():
+    """
+    Item 9：PCS 排程配置（唯讀）。先列所有排程模板，選單筆後進入模板子選單。
+    只呼叫唯讀 GET（getScheduleSwitch / template/list / list/{tempId}），不送任何控制。
+    ※ 模板開/關＝個別排程 enableFlag，與 Item 8 的排程主開關（schedulePlanSwitch）不同。
+    """
+    c = _sched_readonly_client()
+    if c is None:
+        return
+    while True:
+        ps, _ms, _raw = _sched_switch_state(c)
+        tpls = c.get(_SCHED_TPL_LIST)
+        tpls = tpls if isinstance(tpls, list) else []
+        print("\nPCS 排程配置")
+        print(f"（排程主開關：{'開' if ps == 1 else ('關' if ps == 0 else '無法確認')}）")
+        if not tpls:
+            print("  (無排程模板)")
+        for i, t in enumerate(tpls, 1):
+            en = _sched_template_enabled(t)
+            print(f"{i}. {t.get('tempName')}   狀態：{'已啟用' if en else '已停用'}")
+        print("0. 返回")
+        # 主開關已開但無任何啟用項目 → 警示（智慧模式 pre-check 依據）
+        if ps == 1 and _sched_enabled_item_count(c, tpls) == 0:
+            print("⚠ 排程主開關已開啟，但排程配置沒有任何啟用項目。")
+        ch = _menu_input("請選擇排程（號碼查看單筆，0 返回）：")
+        if ch == "0":
+            return
+        if ch.isdigit() and 1 <= int(ch) <= len(tpls):
+            _pcs_schedule_template_submenu(c, tpls[int(ch) - 1])
+        else:
+            print("無效選項，請重新輸入。")
+
+
+def _pcs_schedule_template_submenu(client, tpl):
+    """
+    單筆排程模板子選單：查看明細 / 開啟此排程 / 關閉此排程（開關控制該模板 enableFlag）。
+    ⚠️ enableFlag 寫入 API（前端經 PUT /schedule/template 整筆更新）之 payload 尚未由 DevTools 確認，
+       故「開啟/關閉此排程」目前標示「尚未開放」，不送任何寫入（唯讀）。
+    """
+    tid = tpl.get("tempId")
+    while True:
+        en = _sched_template_enabled(tpl)
+        pt = tpl.get("planType")
+        items = client.get(_SCHED_ITEM_LIST.format(tid=tid))
+        items = items if isinstance(items, list) else []
+        print(f"\n排程名稱：{tpl.get('tempName')}")
+        print(f"狀態：{'已啟用' if en else '已停用'}")
+        print(f"週期：{'每週' if pt == 1 else '按日期'}")
+        if pt == 1:
+            print(f"星期：{_sched_week_text(tpl.get('executeTime'))}")
+        else:
+            print(f"日期：{tpl.get('executeTime')}")
+        print(f"排程項目數：{len(items)}")
+        print("1. 查看排程明細")
+        print("2. 開啟此排程　（尚未開放）")
+        print("3. 關閉此排程　（尚未開放）")
+        print("0. 返回")
+        ch = _menu_input("請輸入選項：")
+        if ch == "0":
+            return
+        if ch == "1":
+            if not items:
+                print("  (無排程項目)")
+            for i, it in enumerate(items, 1):
+                cd = _SCHED_CD.get(it.get("chargeOrDischarge"), it.get("chargeOrDischarge"))
+                print(f"  No.{i}  {it.get('startTime')}~{it.get('endTime')}  {cd}  "
+                      f"{it.get('instantaneousPowerLimit')} kW  SOC {it.get('soc')}%  "
+                      f"項目狀態：{'啟用' if en else '停用'}")
+        elif ch in ("2", "3"):
+            print("⚠ 目前僅唯讀，個別排程開/關控制功能尚未開放。")
+            print("  （開/關＝更新該模板 enableFlag；前端經 PUT /schedule/template 整筆更新，"
+                  "payload 尚未由 DevTools 確認，故暫不實作寫入。）")
+        else:
+            print("無效選項，請重新輸入。")
+
+
+def _pcs_schedule_switch_menu():
+    """
+    Item 8：PCS 排程主開關（開/關）。控制整個智慧排程（schedulePlanSwitch），與 Item 9 個別模板不同。
+    ⚠️ editScheduleSwitch 之實際 PUT payload 尚未由 DevTools 確認 → 開/關僅顯示、標示「尚未開放」，
+       不猜測、不送任何寫入（唯讀）。待確認 payload 後才實作（寫入後會重新 GET 驗證，失敗不顯示成功）。
+    """
+    c = _sched_readonly_client()
+    if c is None:
+        return
+    while True:
+        ps, _ms, _raw = _sched_switch_state(c)
+        cur = "開" if ps == 1 else ("關" if ps == 0 else "無法確認")
+        print("\nPCS 排程主開關")
+        print(f"目前狀態：{cur}")
+        print("1. 開啟排程主開關　（尚未開放）")
+        print("2. 關閉排程主開關　（尚未開放）")
+        print("0. 返回")
+        ch = _menu_input("請輸入選項：")
+        if ch == "0":
+            return
+        if ch in ("1", "2"):
+            print("⚠ 目前僅唯讀，排程主開關控制功能尚未開放。")
+            print("  （開/關＝PUT /schedule/config/editScheduleSwitch；payload 尚未由 DevTools 確認，"
+                  "為避免猜測 manualModeSwitch/多送欄位，暫不實作寫入。）")
+        else:
+            print("無效選項，請重新輸入。")
+
+
 def handle_choice(choice):
     """回傳 True 繼續、False 離開。"""
     if choice == "0":
         print("結束程式。")
         return False
 
-    # 充放電報告（Menu 16/17/18）：獨立唯讀報告模組，不送任何控制
-    if choice == "16":
+    # 充放電報告（Menu 18/19/20）：獨立唯讀報告模組，不送任何控制
+    if choice == "18":
         report_start()
         return True
-    if choice == "17":
+    if choice == "19":
         report_stop()
         return True
-    if choice == "18":
+    if choice == "20":
         report_view_latest()
+        return True
+
+    # PCS 排程配置（唯讀查看）
+    if choice == SCHEDULE_VIEW_CHOICE:
+        pcs_schedule_view()
+        return True
+
+    # PCS 排程主開關（開/關）— 目前唯讀顯示（寫入待確認）
+    if choice == SCHEDULE_SWITCH_CHOICE:
+        _pcs_schedule_switch_menu()
         return True
 
     # 一般控制
@@ -1063,7 +1269,7 @@ def handle_choice(choice):
         _execute_live([OPERATOR, "--action", action, "--execute", "--yes"], action, label)
         return True
 
-    # PCS 功率控制（6 交流有功 / 7 直流恆流 / 8 直流恆功率）→ 進入第二層
+    # PCS 功率控制（4 交流有功 / 5 直流恆流 / 6 直流恆功率）→ 進入第二層
     if choice in PCS_MODE_MENU:
         _pcs_mode_submenu(PCS_MODE_MENU[choice])
         return True
@@ -1194,8 +1400,8 @@ def main():
                 break
             if choice == "e":
                 _exec_menu()
-            elif choice in ("16", "17", "18"):
-                # 便利：儀表板層直接輸入 16/17/18 也可操作充放電報告（等同進控制選單後選同項）
+            elif choice in ("18", "19", "20"):
+                # 便利：儀表板層直接輸入 18/19/20 也可操作充放電報告（等同進控制選單後選同項）
                 try:
                     handle_choice(choice)
                 except Exception as e:
@@ -1203,7 +1409,7 @@ def main():
             elif choice in ("r", ""):
                 pass                       # 重新整理
             else:
-                print(f"（'{choice}' 非本層選項；請按 e 進入控制執行選單，或直接輸入 16/17/18 操作報告）")
+                print(f"（'{choice}' 非本層選項；請按 e 進入控制執行選單，或直接輸入 18/19/20 操作報告）")
     finally:
         # 離開程式時，若仍有進行中的報告 → 暫停（paused，保留可續接），不強制 completed。
         if _REPORT_AVAILABLE and _report.get("session") is not None:

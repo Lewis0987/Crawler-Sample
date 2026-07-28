@@ -63,6 +63,7 @@ _FORBIDDEN_EXACT = {
 
 # ---- verify（回讀）端點 ----
 _V_SCHEDULE = "/schedule/config/getScheduleSwitch"           # schedulePlanSwitch / manualModeSwitch
+_V_SCHEDULE_LIST = "/schedule/template/list"                 # 排程配置清單（每筆 enableFlag：1=啟用/2=停用）
 _V_RUNMODE = "/client/dynamic/dataOrControl/pcs/getRunMode"  # runMode 字串
 _V_PCS = "/client/dynamic/dataOrControl/pcs"                 # PCS 狀態（本帳號可能 403）
 _V_AIR = "/client/dynamic/dataOrControl/air"                 # 空調狀態（本帳號 403）
@@ -70,7 +71,7 @@ _V_BCU = "/can/v1/getBcuState"                               # 電池/BCU 狀態
 _V_MANUAL_POWER = "/sys/control/getManuallyPowerState"       # 手動上電操作狀態（bool；非電池上下電）
 _V_DODI = "/can/v1/getDOAndDIMsg"                            # 主正/主負接觸器反饋（電池上下電真正來源）
 _V_MAINCTL = "/hmiGuest/unauthorizedAccess/overview/mainControlCollectsInformation"  # 電池電壓/電流（充放電判斷）
-_VERIFY_READ_WHITELIST = {_V_SCHEDULE, _V_RUNMODE, _V_PCS, _V_AIR, _V_BCU,
+_VERIFY_READ_WHITELIST = {_V_SCHEDULE, _V_SCHEDULE_LIST, _V_RUNMODE, _V_PCS, _V_AIR, _V_BCU,
                           _V_MANUAL_POWER, _V_DODI, _V_MAINCTL}
 
 # battery 輪詢設定
@@ -453,11 +454,92 @@ def _confirm_high_risk(action, assume_yes):
     return ans == "YES"
 
 
-def _pcs_battery_precheck(client, logged_in, action):
+def _read_pcs_mode_state(client):
+    """
+    唯讀讀取 PCS 控制模式判斷所需狀態（皆為唯讀 GET；不呼叫任何控制 API）：
+      - schedule_switch : 1(開)/0(關)/None（schedulePlanSwitch；None=缺失/解析失敗）
+      - manual_switch   : 1(已啟用)/0(已停用)/None（manualModeSwitch）
+      - have_list       : 是否成功取得排程清單（/schedule/template/list）
+      - enabled_plans   : 清單中 enableFlag==1（啟用）的筆數
+      - total_plans     : 清單總筆數
+    """
+    sw = _read(client, _V_SCHEDULE)
+    plan_switch = manual_switch = None
+    if isinstance(sw, dict) and not sw.get("_error") and not sw.get("_blocked"):
+        ps, ms = sw.get("schedulePlanSwitch"), sw.get("manualModeSwitch")
+        plan_switch = 1 if ps in (1, "1") else (0 if ps in (0, "0") else None)
+        manual_switch = 1 if ms in (1, "1") else (0 if ms in (0, "0") else None)
+    tpl = _read(client, _V_SCHEDULE_LIST)
+    have_list = isinstance(tpl, list)
+    plans = tpl if have_list else []
+    enabled_plans = sum(1 for p in plans if isinstance(p, dict) and p.get("enableFlag") in (1, "1"))
+    return {"schedule_switch": plan_switch, "manual_switch": manual_switch,
+            "have_list": have_list, "enabled_plans": enabled_plans, "total_plans": len(plans)}
+
+
+def _pcs_charge_discharge_precheck(client, logged_in, action):
+    """
+    PCS 人工充/放電前置檢查（依控制模式實際開關組合分流；全程唯讀 GET，任何無法確認一律 fail-safe 阻擋）：
+      智慧模式（schedulePlanSwitch==1）→ 一律阻擋人工充/放電（控制權在排程，不與人工混用）；
+        若排程清單全部停用（無 enableFlag==1）→ 另提示「排程配置全部未啟用」，仍阻擋。
+      手動模式（schedulePlanSwitch==0 且 manualModeSwitch==1）→ 續做既有「電池已上電」檢查。
+      未開啟模式（schedulePlanSwitch==0 且 manualModeSwitch==0）→ 阻擋（未啟用任何控制模式）。
+      任一開關缺失/None/解析失敗 → 未知 → fail-safe 阻擋（不預設手動模式）。
+    僅套用於帶 pcs_mode 的充/放電 action；停止指令（pcs_stop_power）不走此檢查。
+    """
+    label = _PCS_LABEL.get(action, action)
+    if not logged_in:
+        print("[ERROR] 未登入，無法確認 PCS 控制模式，已取消 PCS 控制。")
+        return {"allowed": False, "reason": "not_logged_in", "control_mode": "unknown"}
+
+    st = _read_pcs_mode_state(client)
+    ps, ms = st["schedule_switch"], st["manual_switch"]
+    print("前置檢查（PCS 控制模式分流）：")
+
+    # 排程開關無法確認 → 未知 → fail-safe 阻擋
+    if ps is None:
+        print("PCS控制模式：未知（狀態無法確認）")
+        print(f"已取消 {label}")
+        print("[ERROR] PCS 控制模式（排程開關）狀態無法確認，已取消控制。")
+        return {"allowed": False, "reason": "schedule_switch_unknown", "control_mode": "unknown", **st}
+
+    # 智慧模式（ps==1）→ 一律阻擋人工充/放電
+    if ps == 1:
+        print("PCS控制模式：智慧模式")
+        print(f"已取消 {label}")
+        print("[ERROR] 目前為智慧模式，請關閉排程主開關並切換至手動模式後再操作。")
+        if st["have_list"] and st["enabled_plans"] == 0:
+            print("[提示] 排程主開關已開啟，但排程配置全部未啟用，請確認排程設定。")
+        return {"allowed": False, "reason": "smart_mode_blocked", "control_mode": "smart", **st}
+
+    # ps==0：需 manualModeSwitch 決定 手動 / 未開啟 / 未知
+    if ms is None:
+        print("PCS控制模式：未知（狀態無法確認）")
+        print(f"已取消 {label}")
+        print("[ERROR] PCS 手動模式開關狀態無法確認，已取消控制。")
+        return {"allowed": False, "reason": "manual_switch_unknown", "control_mode": "unknown", **st}
+    if ms == 0:
+        # schedulePlanSwitch==0 且 manualModeSwitch==0 → 未開啟模式（非手動）
+        print("PCS控制模式：未開啟模式")
+        print(f"已取消 {label}")
+        print("[ERROR] PCS目前未啟用任何控制模式，請先開啟手動模式或智慧模式。")
+        return {"allowed": False, "reason": "no_mode_enabled", "control_mode": "none", **st}
+
+    # 手動模式（ps==0 且 ms==1）→ 續做既有「電池已上電」前置檢查（不另印 header）
+    print("PCS控制模式：手動模式")
+    batt = _pcs_battery_precheck(client, logged_in, action, print_header=False)
+    batt["control_mode"] = "manual"
+    for k in ("schedule_switch", "manual_switch", "have_list", "enabled_plans", "total_plans"):
+        batt[k] = st[k]
+    return batt
+
+
+def _pcs_battery_precheck(client, logged_in, action, print_header=True):
     """
     PCS 充放電前置檢查：電池必須為「已上電」。
     使用共用解析（getDOAndDIMsg 主正/主負接觸器反饋），非畫面字串。
     回傳 {battery_power_state: on/off/unknown, allowed: bool, reason: str}，並印出檢查結果。
+    print_header=False：由上層（模式分流）已印過「前置檢查」抬頭時，不重覆印。
     """
     label = _PCS_LABEL.get(action, action)
     if not logged_in:
@@ -466,7 +548,8 @@ def _pcs_battery_precheck(client, logged_in, action):
         return {"battery_power_state": "unknown", "allowed": False, "reason": "not_logged_in"}
 
     state, raw = battery_power_state_from_dodi(_read(client, _V_DODI))
-    print("前置檢查：")
+    if print_header:
+        print("前置檢查：")
     print(f"電池上下電狀態：{state}")
     if state == "已上電":
         print(f"允許執行 {label}")
@@ -533,7 +616,8 @@ def run(action, execute, power=None, assume_yes=False, no_verify=False):
     #   PCS 充/放電 → 電池必須「已上電」；電池下電 → 目前必須「待機」（非充放電中）
     precheck = None
     if action in PRECHECK_BATTERY_ON:
-        precheck = _pcs_battery_precheck(client, logged_in, action)
+        # PCS 人工充/放電：先依控制模式分流（智慧→阻擋；手動→需手動開關+電池已上電）
+        precheck = _pcs_charge_discharge_precheck(client, logged_in, action)
     elif action == "battery_power_off":
         precheck = _battery_off_precheck(client, logged_in, action)
     blocked = bool(precheck and not precheck["allowed"])
@@ -642,7 +726,8 @@ def run(action, execute, power=None, assume_yes=False, no_verify=False):
         _u = PCS_CONTROL_MODES[spec["pcs_mode"]]["unit"] if spec.get("pcs_mode") else "kW"
         print(f"value           : {power} {_u}")
     if precheck:
-        state = precheck.get("battery_power_state") or precheck.get("battery_operation_state")
+        state = (precheck.get("battery_power_state") or precheck.get("battery_operation_state")
+                 or precheck.get("control_mode") or "-")
         print(f"precheck        : 狀態={state} / allowed={precheck.get('allowed')} / reason={precheck.get('reason')}")
     if blocked:
         print("control_resp    : BLOCKED（前置檢查未通過，未送出控制）")

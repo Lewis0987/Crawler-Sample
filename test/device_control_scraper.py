@@ -33,6 +33,8 @@ READONLY_ENDPOINTS = {
     "overview_mainControl": "/hmiGuest/unauthorizedAccess/overview/mainControlCollectsInformation",  # 電池系統 SOC/電壓/電流
     "getRunMode":       "/client/dynamic/dataOrControl/pcs/getRunMode",
     "getScheduleSwitch":"/schedule/config/getScheduleSwitch",
+    # 排程清單（每個排程一筆，含 enableFlag=1 啟用 / 2 停用）；對應前端 pcs/schedulePlan.vue 之排程模板清單。
+    "getScheduleTemplateList": "/schedule/template/list",
     "getBcuState":      "/can/v1/getBcuState",
     "getDOAndDIMsg":    "/can/v1/getDOAndDIMsg",
     "getManuallyPowerState": "/sys/control/getManuallyPowerState",
@@ -61,12 +63,17 @@ _READONLY_ALLOWLIST = set(READONLY_ENDPOINTS.values()) | set(VERIFY_ENDPOINTS.va
 _CONTROL_BLOCKLIST = {c["path"] for c in CONTROL_APIS}
 
 # ---- 對照表 ----
-# PCS「控制模式」唯一來源 = getRunMode（智慧/手動），與排程互相獨立、不可互相推導。
-# 值可能為 API 英文（auto/schedule/smart/manual）或中文（智慧模式/手動模式）。
+# PCS「控制模式」顯示規則（唯讀顯示層；依 getScheduleSwitch 兩個開關的實際組合判斷，不預設 fallback）：
+#   schedulePlanSwitch==1                    → 智慧模式
+#   schedulePlanSwitch==0 且 manualModeSwitch==1 → 手動模式
+#   schedulePlanSwitch==0 且 manualModeSwitch==0 → 未開啟模式（兩者皆關，非手動）
+#   任一欄位缺失/None/解析失敗                 → 未知（狀態無法確認）
+# ⚠️ 不再以 getRunMode 或「排程關=手動」作為 fallback。
 _RUNMODE_SMART = {"auto", "schedule", "smart", "intelligent", "智慧模式", "智慧"}
 _RUNMODE_MANUAL = {"manual", "手動模式", "手動"}
 # 機器語意 → 顯示中文
-_CONTROL_MODE_DISPLAY = {"smart": "智慧模式", "manual": "手動模式", "unknown": "未知"}
+_CONTROL_MODE_DISPLAY = {"smart": "智慧模式", "manual": "手動模式",
+                         "none": "未開啟模式", "unknown": "未知（狀態無法確認）"}
 _SCHEDULE_DISPLAY = {True: "開", False: "關", None: "暫無資料"}
 # PCS 電網模式（唯讀狀態顯示；非控制）：併網/離網 ← guest PCS 執行狀態
 _GRID_MODE_DISPLAY = {"grid_connected": "併網", "off_grid": "離網", "unknown": "未知"}
@@ -318,49 +325,88 @@ def parse_pcs_grid_mode(pcs_raw):
     return "unknown"
 
 
-def parse_pcs_modes(runmode, schedule, pcs_raw=None):
+def parse_schedule_plans(template_list):
     """
-    分開解析 PCS 各狀態（互不推導），回傳機器語意 dict：
-      - control_mode      : smart / manual / unknown         ← getRunMode（不可用排程/電網反推）
+    排程清單（/schedule/template/list）→ (是否取得清單, 總數, 啟用數)。
+    每筆排程的 enableFlag==1 視為「啟用」（前端 Switch checkedValue:1 / unCheckedValue:2）；
+    其餘（2 停用 / 0 / 缺）視為停用。
+    """
+    have = isinstance(template_list, list)
+    plans = template_list if have else []
+    total = len(plans)
+    enabled = sum(1 for p in plans if isinstance(p, dict) and p.get("enableFlag") in (1, "1"))
+    return have, total, enabled
+
+
+def _switch01(v):
+    """開關值 → 1 / 0 / None（缺失/非 0-1 → None，供 fail-safe「未知」）。"""
+    if v in (1, "1"):
+        return 1
+    if v in (0, "0"):
+        return 0
+    return None
+
+
+def parse_pcs_modes(runmode, schedule, pcs_raw=None, template_list=None):
+    """
+    分開解析 PCS 各狀態，回傳機器語意 dict：
+      - control_mode      : smart / manual / none / unknown
+            ← 依 schedulePlanSwitch + manualModeSwitch 實際組合（不預設 fallback、不用 getRunMode）：
+              schedulePlanSwitch==1 → smart；==0 & manualModeSwitch==1 → manual；
+              ==0 & manualModeSwitch==0 → none（未開啟模式）；任一 None/缺失 → unknown。
       - schedule_enabled  : True / False / None              ← getScheduleSwitch.schedulePlanSwitch（1/0）
+      - schedule_have_list/total_plans/enabled_plans         ← /schedule/template/list（enableFlag==1 啟用）
+      - schedule_idle     : True → 排程開關開但所有排程清單皆停用（排程實際不會執行）
       - grid_mode         : grid_connected / off_grid / unknown  ← guest PCS 執行狀態（唯讀狀態顯示）
       - power_control_mode: 交流有功 / 直流恆流 / 直流恆功率 / 離網交流電壓 / 未知
-            ← parse_pcs_power_control_mode()：依 API 當下實際欄位，**不套預設值**（判不到→未知）
-    schedulePlanSwitch=0 仍可能為智慧模式；各項不互相覆蓋、不互相推導。
     """
-    # 1) control_mode ← getRunMode（唯一來源）
-    rm = runmode.strip().lower() if isinstance(runmode, str) else ""
-    if rm in _RUNMODE_SMART:
-        control_mode = "smart"
-    elif rm in _RUNMODE_MANUAL:
-        control_mode = "manual"
-    else:
+    # 1) 兩個開關（1/0/None）
+    ps = ms = None
+    if isinstance(schedule, dict) and not schedule.get("_error"):
+        ps = _switch01(schedule.get("schedulePlanSwitch"))
+        ms = _switch01(schedule.get("manualModeSwitch"))
+    schedule_enabled = None if ps is None else (ps == 1)
+
+    # 2) 排程清單啟用統計
+    have_list, total_plans, enabled_plans = parse_schedule_plans(template_list)
+
+    # 3) control_mode ← 兩開關實際組合（不 fallback 手動、不使用 getRunMode）
+    if ps is None:
         control_mode = "unknown"
+    elif ps == 1:
+        control_mode = "smart"
+    elif ms is None:
+        control_mode = "unknown"
+    elif ms == 1:
+        control_mode = "manual"
+    else:                       # ps==0 且 ms==0
+        control_mode = "none"
 
-    # 2) schedule_enabled ← schedulePlanSwitch（獨立；不影響 control_mode）
-    schedule_enabled = None
-    if isinstance(schedule, dict) and "schedulePlanSwitch" in schedule:
-        schedule_enabled = schedule.get("schedulePlanSwitch") in (1, "1")
+    # 4) 排程開關開、但（已取得清單且）所有排程清單皆停用 → 排程實際不會執行
+    schedule_idle = (ps == 1) and have_list and enabled_plans == 0
 
-    # 3) grid_mode ← guest PCS 執行狀態（唯讀狀態顯示；非控制）
+    # 5) grid_mode / power_control_mode（唯讀狀態顯示；非控制）
     grid_mode = parse_pcs_grid_mode(pcs_raw)
-
-    # 4) power_control_mode ← 依 API 實際欄位（3 模式；不套預設，判不到→未知）
     power_control_mode = parse_pcs_power_control_mode(pcs_raw)
 
     return {
         "control_mode": control_mode,
         "schedule_enabled": schedule_enabled,
+        "schedule_have_list": have_list,
+        "schedule_total_plans": total_plans,
+        "schedule_enabled_plans": enabled_plans,
+        "schedule_idle": schedule_idle,
         "grid_mode": grid_mode,
         "power_control_mode": power_control_mode,
     }
 
 
-def parse_pcs(pcs_data, schedule, runmode, pcs_status_data=None):
+def parse_pcs(pcs_data, schedule, runmode, pcs_status_data=None, template_list=None):
     """
     HMI 左側 [PCS] 區塊：狀態 / 控制模式 / 排程 / 電網模式 / 功率控制模式（各自獨立解析）。
     pcs_status_data：以 zh-TW 取得的 guest PCS 原始 list（供 PCS當前狀態 badge 用中文 value）；
                      未提供時退回 pcs_data（值可能為 enum，非中文）。
+    template_list：/schedule/template/list（供控制模式判斷與「排程未啟用」警告）。
     """
     flat = _flatten_metrics(pcs_data) if pcs_data else {}
     raw = _pcs_raw(pcs_data)
@@ -382,10 +428,18 @@ def parse_pcs(pcs_data, schedule, runmode, pcs_status_data=None):
     # PCS當前狀態：100% 複製前端 pcsMode_US.vue，依 _PCS_STATUS_CONFIG 順序組 badge（中文 value）
     out["PCS當前狀態"] = parse_pcs_current_status(_pcs_metrics_list(pcs_status_data or pcs_data))
 
-    # 各狀態獨立解析（互不推導）；電網模式與功率控制模式為唯讀狀態，永遠顯示
-    modes = parse_pcs_modes(runmode, schedule, raw)
-    out["PCS控制模式"] = _CONTROL_MODE_DISPLAY[modes["control_mode"]]           # 智慧模式/手動模式/未知 ← getRunMode
+    # 各狀態解析；電網模式與功率控制模式為唯讀狀態，永遠顯示
+    modes = parse_pcs_modes(runmode, schedule, raw, template_list)
+    mode_label = _CONTROL_MODE_DISPLAY[modes["control_mode"]]                   # 智慧模式/手動模式/未知 ← 排程開關
+    if modes["control_mode"] == "smart" and modes["schedule_idle"]:
+        mode_label = "智慧模式（排程未啟用）"                                    # 排程開關開但清單全停用
+    out["PCS控制模式"] = mode_label
     out["PCS排程開關狀態"] = _SCHEDULE_DISPLAY[modes["schedule_enabled"]]        # 開/關 ← schedulePlanSwitch
+    # 排程清單摘要（唯讀；供除錯/佐證）＋ Console 警告（排程開關開但全部停用）
+    if modes["schedule_have_list"]:
+        out["PCS排程清單"] = f"共 {modes['schedule_total_plans']} 筆，啟用 {modes['schedule_enabled_plans']} 筆"
+    out["_排程警告"] = ("排程開關已啟用，但所有排程清單皆為關閉，排程目前不會執行。"
+                        if modes["schedule_idle"] else "")
     # 顯示 label 用「PCS工作模式」；底層機器語意仍為 grid_mode（systemGridTiedStatus/systemOffGridStatus）
     out["PCS工作模式"] = _GRID_MODE_DISPLAY[modes["grid_mode"]]                 # 併網/離網/未知（唯讀狀態，label=工作模式）
     out["PCS功率控制模式"] = modes["power_control_mode"]                         # 交流有功/直流恆流/直流恆功率/離網交流電壓/未知（依 API 實際）
@@ -559,7 +613,7 @@ def summarize_status(rd):
     """整合各區塊為結構化狀態摘要。"""
     return {
         "PCS": parse_pcs(rd.get("guest_pcs"), rd.get("getScheduleSwitch"), rd.get("getRunMode"),
-                         rd.get("guest_pcs_tw")),
+                         rd.get("guest_pcs_tw"), rd.get("getScheduleTemplateList")),
         "電池": parse_battery(rd.get("overview_mainControl"), rd.get("getManuallyPowerState"),
                              rd.get("getDOAndDIMsg"), rd.get("getBcuState")),
         "空調": parse_air(rd.get("guest_air")),
@@ -589,7 +643,7 @@ def summarize_verify(vd):
 # ---- UI 顯示層（formatter）：console 只印 HMI UI 有的欄位；parser / JSON / CSV 不受影響 ----
 # 每區塊只保留 HMI 實際顯示欄位；raw/debug/parser 欄位（如 battery_power_* / current_*）不印，JSON 仍完整。
 _UI_FIELDS = {
-    "PCS": ["PCS當前狀態", "PCS控制模式", "PCS排程開關狀態", "PCS工作模式",
+    "PCS": ["PCS當前狀態", "PCS控制模式", "PCS排程開關狀態", "PCS排程清單", "PCS工作模式",
             "PCS功率控制模式", "PCS手動模式開關"],
     "電池": ["電池上下電狀態", "電池當前狀態", "電池充放電狀態", "當前SOC", "當前電壓", "當前電流", "當前功率",
              "主正反饋", "主正", "主負反饋", "主負", "環流"],
@@ -623,6 +677,11 @@ def print_summary(logged_in, status):
         print(f"\n[{section}]")
         for label, value in _ui_view(section, status.get(section, {})).items():
             print(f"  {label}：{value}")
+        # PCS：排程開關開但所有排程清單皆停用 → 額外警告（唯讀提示，非控制）
+        if section == "PCS":
+            warn = status.get("PCS", {}).get("_排程警告")
+            if warn:
+                print(f"  ⚠ {warn}")
 
 
 def save_json(record, path=JSON_PATH):
