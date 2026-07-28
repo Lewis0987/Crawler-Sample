@@ -66,6 +66,9 @@ FILE_EVENTS = "events.csv"
 FILE_XLSX = "report.xlsx"
 FILE_SESSION_STATE = "session_state.json"   # Session 狀態（recording/paused/completed，供續接累積）
 FILE_CELL_SNAPSHOTS = "cell_snapshots.json"  # Cell 電壓/溫度歷史快照（session 內累積，供 Cell Volt./Temp. 產表）
+# alarm_code 穩定配號 mapping（放輸出根目錄，跨 session/regen 共用）：
+#   同一 alarm_id_raw 永遠對應同一 alarm_code；重新產生報告不改號。
+FILE_ALARM_CODE_MAP = "alarm_code_mapping.json"
 
 # Session 狀態值
 SESSION_RECORDING = "recording"
@@ -118,8 +121,8 @@ END_REASON = {
 # ======================================================================
 # 安全 / 異常監測門檻（報告只監測、只建議，**不送任何控制命令**）
 # ======================================================================
-SOC_MAX_PERCENT = 95             # SOC 上限；超過 → 建議停止
-SOC_MIN_PERCENT = 10             # SOC 下限；低於 → 建議停止
+SOC_MAX_PERCENT = 99             # SOC 上限；超過 → 建議停止
+SOC_MIN_PERCENT = 1             # SOC 下限；低於 → 建議停止
 COMM_FAIL_MAX = 3                # 連續通訊失敗次數 → 建議停止（communication_error）
 SESSION_TIMEOUT_SEC = 3600       # 單一 session 最長監測秒數 → timeout
 # 實際功率長時間偏離設定值
@@ -129,8 +132,14 @@ POWER_DEVIATION_SEC = 30         # 持續超過此秒數才觸發
 VOLTAGE_MAX_V = None
 VOLTAGE_MIN_V = None
 CURRENT_MAX_A = None             # 取絕對值比較
-# 告警級別觸發（0=嚴重、1=一般）；新增這些級別的告警 → 建議停止
+# 告警級別觸發（level 0 = 嚴重）；新增這些級別的告警 → 建議停止
 ALARM_STOP_LEVELS = {0}
+
+# 告警級別中文（完全比照 HMI 告警頁 render 規則，來源：前端 index-68732cea.js）：
+#   level===0 → serious；level===1 → medium；其他（2,3…）→ slight
+# 中文字串取自 zh_TW 語系檔 routes.custom_header.*（serious=嚴重 / medium=一般 / slight=輕微）。
+# ⚠️ 不可自行猜測：此為 UI 實際顯示規則，非「級別名稱表」。
+ALARM_LEVEL_UI = {"serious": "嚴重", "medium": "一般", "slight": "輕微"}
 
 # 觸發嚴重條件時是否讓「獨立監測模式」自動結束（True：偵測到即結束並標記對應 end_reason）。
 # 注意：這只影響「報告是否停止記錄」，**永遠不會**送出任何控制命令。

@@ -422,3 +422,36 @@ Session ID / 動作 / 設定功率 / 經過時間 / 目前 SOC / 實際功率 / 
   `--regen`、色盤讀取/驗證都**不**經過此路徑。
 - **刪除保護**：全專案唯一刪除入口 `_safe_rmtree`——目標為正式報告根目錄或其上層一律中止，正式報告目錄底下預設禁止刪除（`ALLOW_REPORT_DELETE=False`）。
 - **歷史備註**：修正前 `_selftest_cell_snapshots` 用固定 timestamp 且未先清除，故多次執行累積出 `_2`~`_6`；改為單一目錄清空重建後解除。
+
+### 12.4 告警正規化（翻譯來源 / level / alarm_id_raw / alarm_code）
+
+> 統一入口 `normalize_alarm_record(raw_alarm)`：所有告警在寫入 `alarms.csv` / Excel 前一律經過，輸出固定欄位
+> `alarm_code / alarm_id_raw / level / target_object / alarm_content / origin / alarm_start_time`。
+
+- **⭐ 翻譯來源＝後端 `Accept-Language: zh-TW`（權威、與 HMI 一致）**：告警 API
+  `GET /hmiGuest/unauthorizedAccess/alarm/list` **帶 `Accept-Language: zh-TW` 標頭**時，後端直接把
+  `typeMark / targetMark / val / triggerVal` **中文化**（`device.type.bcu→電池`、`1838F4.soc.underAlarm→SOC過低報警`、
+  `1838F4.minorAlarm→輕微報警`、`type.attr.dcInputFault→直流輸入故障` …）。
+  **不帶標頭或用底線 `zh_TW` 則回原始 i18n key**（`zh-TW` 連字號才有效；亦支援 `zh-CN` 简体、`en-US` 英文）。
+  程式以 `_PCS_LANG_HEADER = {"Accept-Language": "zh-TW"}` 加在告警抓取上（與 PCS 資料同一機制）。
+  → **不需自建對照表、不需前端 bundle / vue-i18n；翻譯全由設備後端負責，與 HMI 完全一致。**
+- **欄位對應（比照 HMI 告警詳情）**：
+  - `target_object` ＝ `typeMark`（告警物件＝裝置，如「電池」/「PCS」）。
+  - `alarm_content` ＝ `_compose_alarm_content()`：`觸發條件：{targetMark}[ {op} {triggerVal}]；當前值：{val}`
+    （`op=="=="` 不顯示 op/trigger，與 HMI render 一致）。
+  - `level` 依 UI render 規則（下）。
+- **`level` 依 UI render 規則**（前端 `index-68732cea.js`：`level===0?serious:level===1?medium:slight`）；
+  中文取自 zh_TW `routes.custom_header.*`，集中於 `CFG.ALARM_LEVEL_UI`：`0→嚴重`、`1→一般`、**`其他(2,3…)→輕微`**。
+  裸數字（舊資料殘留 `2`）以 `_repair_level_text()` 修正。
+- **`alarm_id_raw` 保留 API 原始值**：來源＝告警 API 的 `id`，全程 `str()`（避免 >15 位精度遺失），**不重新產生、不亂數、不 hash**。
+- **`alarm_code` 由 `alarm_code_mapping.json` 穩定映射**：`AlarmCodeAllocator` 以 `{alarm_id_raw: alarm_code}`
+  持久化於輸出根目錄（`CFG.FILE_ALARM_CODE_MAP`，跨 session/regen 共用）。同一來源告警永遠同碼、**不因排序改變**；
+  新 `alarm_id_raw` 才配新流水號（`ALM-YYYYMMDD-NNN`）；插入較早告警時既有碼不位移。
+- **`--regen` 舊報告補譯**：舊 `alarms.csv` 可能存有未中文化 key。regen 時 `_fetch_alarm_zh_map()` best-effort
+  以 `zh-TW` 取回當下設備告警，`load_existing()` 依 `alarm_id_raw` 補譯；id 對不到者再以「中文化 targetMark/val 簽章」
+  對應同型告警（如多筆相同 PCS 告警）。設備不可達則沿用 CSV 原值、不中斷。**不改變告警集合**。
+- **安全網（非主要路徑）**：`normalize_alarm_record` 若偵測到某欄仍是 i18n key（含 `.` 且無中文，代表後端該筆漏譯）→
+  登記 `[ALARM_MAPPING_MISSING]` 並於寫 Excel 前印除錯 Log（原始 API JSON／level／targetMark／val／alarm_id_raw／alarm_code）；
+  **絕不自行造字**。正常帶 `zh-TW` 時不會觸發。
+- **歷史更正**：先前一度誤判「`1838F4.*` 無任何中文對照來源」——實為**未帶 `Accept-Language: zh-TW` 標頭**，
+  後端本就提供完整中文（與 HMI 同源）。已修正。

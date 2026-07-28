@@ -222,6 +222,15 @@ def _fmt_hms(seconds):
     return f"{sec}s"
 
 
+def _soc_pct_str(v):
+    """SOC 變化值 → 顯示字串：原值後直接加 '%'（不乘 100、保留原精度）。
+    3→'3%'、0→'0%'、3.5→'3.5%'、3.25→'3.25%'；None → None（儲存格空白）。
+    僅為顯示格式，不改變任何計算結果。"""
+    if v is None:
+        return None
+    return f"{v:g}%"
+
+
 def _load_json_file(path):
     """讀 JSON 檔；不存在/失敗回 None。"""
     try:
@@ -468,7 +477,9 @@ def read_all(client):
     r["battery_power_status"] = state
 
     # 5) 告警（guest；抓第一頁，取 total 與 rows；完整去重在 AlarmTracker）
-    alarm = _get(EP_ALARM, params={"pageNo": 1, "pageSize": 100})
+    #    帶 Accept-Language: zh-TW → 後端把 typeMark/targetMark/val/triggerVal 直接中文化
+    #    （與 HMI 一致：device.type.bcu→電池、1838F4.soc.underAlarm→SOC過低報警、1838F4.minorAlarm→輕微報警）。
+    alarm = _get(EP_ALARM, params={"pageNo": 1, "pageSize": 100}, headers=_PCS_LANG_HEADER)
     rows = []
     total = None
     if isinstance(alarm, dict):
@@ -547,6 +558,178 @@ def _alarm_yyyymmdd(rec):
     return "00000000"
 
 
+# ---- 告警級別中文：完全比照 HMI 告警頁 render 規則（前端 index-68732cea.js）----
+#   level===0 → serious；level===1 → medium；其他（2,3…）→ slight
+#   對應 zh_TW 語系：serious=嚴重、medium=一般、slight=輕微（絕不自行猜測）
+def _alarm_level_text(level):
+    """level（數字）→ 中文級別，依 UI render 規則。非數字（已是中文）原樣返回。"""
+    try:
+        lv = int(level)
+    except (TypeError, ValueError):
+        return "" if level in (None, "") else level
+    if lv == 0:
+        return CFG.ALARM_LEVEL_UI["serious"]
+    if lv == 1:
+        return CFG.ALARM_LEVEL_UI["medium"]
+    return CFG.ALARM_LEVEL_UI["slight"]
+
+
+def _repair_level_text(v):
+    """regen 由 CSV 載入時：裸數字（0/1/2…）→ 依 UI 規則轉中文；已是中文則保留。"""
+    s = str(v).strip()
+    if s.lstrip("-").isdigit():
+        return _alarm_level_text(int(s))
+    return v
+
+
+# ---- 告警物件/內容翻譯：查不到對照 → 保留原始 key 並登記（絕不自行造字）----
+# {(field, key): 出現次數}；供 [ALARM_MAPPING_MISSING] 彙整與除錯 Log。
+_ALARM_MAPPING_MISSING = {}
+
+
+def _has_cjk(s):
+    return any("一" <= ch <= "鿿" for ch in str(s))
+
+
+def _is_untranslated_key(original, translated):
+    """翻譯結果＝原字串、且原字串長得像 i18n key（含 '.' 且無中文）→ 視為未翻譯。"""
+    return (translated == original and isinstance(original, str)
+            and "." in original and not _has_cjk(original))
+
+
+def _row_fully_translated(zh):
+    """後端 row 是否已完全中文化（typeMark/targetMark/val 皆非 i18n key）。
+    用於 regen 補譯：只有完全中文化才採用，避免用漏譯 raw key 覆蓋既有中文。"""
+    if not isinstance(zh, dict):
+        return False
+    for k in ("typeMark", "targetMark", "val"):
+        v = zh.get(k)
+        if _is_untranslated_key(v, v):
+            return False
+    return True
+
+
+def _resolve_alarm_text(value, field):
+    """
+    告警文字翻譯優先序（單一流程，report 與 scraper 共用）：
+      (1) 後端已中文化值（Accept-Language: zh-TW）→ 直接採用；
+      (2) 仍是 i18n key → 退回舊 mapping（ALARM_CODE_MAP，_code_text）；
+      (3) 舊 mapping 也無 → 保留原始 key，並登記 [ALARM_MAPPING_MISSING]（絕不自行造字）。
+    （priority(2)『已建立的 alarm zh mapping』在 regen 由 translate_map 於上游套用。）
+    """
+    if value is None or value == "":
+        return ""
+    if not _is_untranslated_key(value, value):
+        return value                          # (1) 已中文化
+    alt = _code_text(value)                    # (2) 舊 mapping fallback
+    if not _is_untranslated_key(value, alt):
+        return alt
+    _ALARM_MAPPING_MISSING[(field, value)] = _ALARM_MAPPING_MISSING.get((field, value), 0) + 1
+    return value                               # (3) 保留原始 key
+
+
+def _translate_alarm_field(key, field):
+    """targetMark/val → 中文；查不到保留原 key 並登記 mapping-missing（不猜測）。"""
+    if key is None or key == "":
+        return ""
+    txt = _code_text(key)
+    if _is_untranslated_key(key, txt):
+        k = (field, key)
+        _ALARM_MAPPING_MISSING[k] = _ALARM_MAPPING_MISSING.get(k, 0) + 1
+    return txt
+
+
+def _compose_alarm_content(target, operator, trigger, val):
+    """
+    告警內容（比照 HMI 告警詳情）：『觸發條件：{target}[ {op} {trigger}]；當前值：{val}』。
+    target/trigger/val 皆為後端已中文化的字串（Accept-Language: zh-TW）。
+    operator=="=="（等值告警）時不顯示 op/trigger，與 HMI render 一致。
+    """
+    target = "" if target is None else str(target)
+    cond = f"觸發條件：{target}"
+    op = "" if operator is None else str(operator)
+    if op and op != "==" and trigger not in (None, ""):
+        cond += f" {op} {trigger}"
+    parts = [cond]
+    if val not in (None, ""):
+        parts.append(f"當前值：{val}")
+    return "；".join(parts)
+
+
+def normalize_alarm_record(raw_alarm, origin=None):
+    """
+    統一告警正規化：API 原始 row → 報表標準欄位（寫入 Excel/CSV 前一律經過此函式）。
+    ⚠️ 前提：告警 row 以 Accept-Language: zh-TW 取得 → typeMark/targetMark/val/triggerVal 後端已中文化
+       （device.type.bcu→電池、1838F4.soc.underAlarm→SOC過低報警、1838F4.minorAlarm→輕微報警）。
+    輸出固定格式（另含 AlarmTracker 生命週期所需欄位，皆以 '_' 前綴內部欄位不輸出）：
+      alarm_code       : 於 export 階段由 alarm_id_raw 穩定配號（此處先留 None）
+      alarm_id_raw     : API 原始告警 ID（str，不重新產生、不亂數）
+      level            : 依 UI render 規則轉中文（0嚴重 / 1一般 / 其他輕微）
+      target_object    : 告警物件＝裝置（typeMark，如「電池」/「PCS」）
+      alarm_content    : 『觸發條件：{targetMark}[ {op} {triggerVal}]；當前值：{val}』（比照 HMI）
+      origin           : 資料來源（pre_existing / new）
+      alarm_start_time : 原始告警時間（epoch ms → 文字）
+    後端偶有未對照 key（仍是 i18n key）→ 保留原值並登記 [ALARM_MAPPING_MISSING]（不自行造字）。
+    """
+    rid = raw_alarm.get("id")
+    lvl = raw_alarm.get("level")
+    # 翻譯優先序：zh-TW 後端中文 →（退回）舊 mapping →（最後）原始 key＋警告（見 _resolve_alarm_text）
+    type_txt = _resolve_alarm_text(raw_alarm.get("typeMark"), "target_object/typeMark")
+    target_txt = _resolve_alarm_text(raw_alarm.get("targetMark"), "targetMark")
+    val_txt = _resolve_alarm_text(raw_alarm.get("val"), "val")
+    trig_txt = _resolve_alarm_text(raw_alarm.get("triggerVal"), "triggerVal")
+    op = raw_alarm.get("operator")
+    return {
+        "alarm_code": None,   # 於 export_rows 由 AlarmCodeAllocator 依 alarm_id_raw 穩定配號
+        "alarm_id_raw": "" if rid is None else str(rid),
+        "level": _alarm_level_text(lvl),
+        "_level_raw": lvl,
+        "target_object": type_txt,
+        "alarm_content": _compose_alarm_content(target_txt, op, trig_txt, val_txt),
+        "origin": origin,
+        "alarm_start_time": _epoch_ms_to_text(raw_alarm.get("alarmTime")),
+        "_alarm_time_ms": raw_alarm.get("alarmTime"),
+        "_raw": raw_alarm,    # 原始 API row（供除錯 Log；不輸出到 CSV/Excel）
+    }
+
+
+class AlarmCodeAllocator:
+    """
+    alarm_code 穩定配號：同一 alarm_id_raw 永遠對應同一 alarm_code；新 id 才配新流水號。
+    持久化於 <output_root>/alarm_code_mapping.json；重新產生報告沿用既有 mapping，
+    不因當下告警集合排序變動而改號（滿足唯一且穩定）。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        data = _load_json_file(path) if path else None
+        data = data if isinstance(data, dict) else {}
+        self.seq = int(data.get("seq") or 0)
+        self.map = dict(data.get("map") or {})
+        self._dirty = False
+
+    def code_for(self, alarm_id_raw, date_str):
+        key = str(alarm_id_raw or "").strip()
+        if not key:
+            return None                      # 無 id → 由呼叫端後備配號
+        if key in self.map:
+            return self.map[key]             # 既有 id → 沿用原碼
+        self.seq += 1
+        code = f"ALM-{date_str}-{self.seq:03d}"
+        self.map[key] = code
+        self._dirty = True
+        return code
+
+    def save(self):
+        if not self.path or not self._dirty:
+            return
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"seq": self.seq, "map": self.map}, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"  [警告] 寫入 alarm_code_mapping 失敗：{e}")
+
+
 class AlarmTracker:
     """
     告警生命週期追蹤（以 id 去重；id 缺時退回 targetMark+val+alarmTime）：
@@ -566,28 +749,21 @@ class AlarmTracker:
         return ("compose", row.get("targetMark"), row.get("val"), row.get("alarmTime"))
 
     def _make_record(self, a, now_str, elapsed, origin):
-        lvl = a.get("level")
-        rid = a.get("id")
-        return {
-            # 原始 ID 全程字串：Python json 對整數為任意精度 int，str() 即精確；
-            # 絕不從 float/科學記號還原（避免 >15 位精度遺失）。
-            "alarm_id_raw": "" if rid is None else str(rid),
-            "level": _level_text(lvl),
-            "_level_raw": lvl,
-            "target_object": _code_text(a.get("targetMark")),
-            "alarm_content": _code_text(a.get("val")),
-            "origin": origin,
+        # 統一經 normalize_alarm_record()：alarm_id_raw（字串精確、不亂數）、
+        # level（UI 規則）、target_object/alarm_content（查不到保留原 key + 警告）。
+        rec = normalize_alarm_record(a, origin=origin)
+        lvl = rec["_level_raw"]
+        rec.update({
             "first_seen_time": now_str,
             "first_seen_elapsed_seconds": elapsed,
-            "alarm_start_time": _epoch_ms_to_text(a.get("alarmTime")),
-            "_alarm_time_ms": a.get("alarmTime"),      # 供 alarm_code 排序（不輸出）
             "recovery_time": "",
             "duration_seconds": None,
             "is_recovery": False,
             "alarm_status": _alarm_status_text(a.get("alarmStatus")),
             "caused_stop": (lvl in CFG.ALARM_STOP_LEVELS) and origin == "new",
             "_active": _alarm_active(a.get("alarmStatus")),
-        }
+        })
+        return rec
 
     def prime_baseline(self, rows, now_str, elapsed):
         for a in rows or []:
@@ -619,10 +795,12 @@ class AlarmTracker:
                 rec["alarm_status"] = _alarm_status_text(a.get("alarmStatus"))
         return new
 
-    def export_rows(self):
+    def export_rows(self, code_map_path=None):
         """
         輸出 alarms.csv/Excel 列（依 ALARM_FIELDS）。
-        alarm_code = ALM-YYYYMMDD-NNN：依告警時間排序、session 內流水號（3 位，從 001）；
+        alarm_code = ALM-YYYYMMDD-NNN：由 AlarmCodeAllocator 依 alarm_id_raw 穩定配號——
+        同一來源告警永遠對應同一 code，新 id 才配新流水號，重新產生不改號
+        （持久化於 code_map_path；未提供路徑或無 id 時後備用排序序號）。
         YYYYMMDD 優先取 alarm_start_time 日期，無效則取 first_seen_time 日期。
         （alarm_code 僅供顯示/查找，不參與去重；去重仍以 alarm_id_raw / _key 為準。）
         """
@@ -632,26 +810,62 @@ class AlarmTracker:
                 return (0, int(v))
             except (TypeError, ValueError):
                 return (1, r.get("first_seen_elapsed_seconds") or 0)
+        allocator = AlarmCodeAllocator(code_map_path) if code_map_path else None
         out = []
         for i, rec in enumerate(sorted(self.records.values(), key=_sortkey), 1):
-            rec["alarm_code"] = f"ALM-{_alarm_yyyymmdd(rec)}-{i:03d}"
+            date = _alarm_yyyymmdd(rec)
+            idr = str(rec.get("alarm_id_raw") or "").strip()
+            code = allocator.code_for(idr, date) if allocator else None
+            if not code:                                   # 無 mapping 路徑或無 id → 後備位置序號
+                code = f"ALM-{date}-{i:03d}"
+            rec["alarm_code"] = code
             out.append({k: rec.get(k) for k in CFG.ALARM_FIELDS})
+        if allocator:
+            allocator.save()
         return out
 
-    def load_existing(self, rows):
-        """resume：把既有 alarms.csv 列重建為 records（保留歷史、維持去重、不重複新增）。"""
+    def load_existing(self, rows, translate_map=None):
+        """
+        resume/regen：把既有 alarms.csv 列重建為 records（保留歷史、維持去重、不重複新增）。
+        translate_map（可選）= {alarm_id_raw: 後端中文化 row}：用於 regen 舊報告時，
+        以「當下設備（Accept-Language: zh-TW）」補譯既有紀錄的 target_object/alarm_content/level，
+        不改變告警集合（僅依 alarm_id_raw 對應補譯；找不到者維持 CSV 原值）。
+        """
+        translate_map = translate_map or {}
+        # 次要對照：以「後端中文化 targetMark/val」為簽章，讓已從設備消失（無法用 id 對應）
+        # 但同型的舊紀錄也能補譯成新格式（例如多筆相同的 PCS「直流輸入故障」）。
+        by_sig = {}
+        for row in translate_map.values():
+            by_sig[(str(row.get("targetMark")), str(row.get("val")))] = row
         for a in rows or []:
             rid = str(a.get("alarm_id_raw") or "").strip()
             key = ("id", rid) if rid else ("compose", a.get("target_object"),
                                            a.get("alarm_content"), a.get("alarm_start_time"))
             if key in self.records:
                 continue
+            zh = translate_map.get(rid) if rid else None
+            if zh is None:      # id 對不到 → 試以既有中文 targetMark/val 簽章對應
+                zh = by_sig.get((str(a.get("target_object")), str(a.get("alarm_content"))))
+            # 僅在 live row「確實完全中文化」時才採用，避免用後端偶發漏譯的 raw key
+            # 覆蓋 CSV 既有的中文內容（zh-TW 優先，但不可用未中文化蓋掉已存在中文）。
+            if zh is not None and _row_fully_translated(zh):
+                norm = normalize_alarm_record(zh, origin=a.get("origin") or "pre_existing")
+                t_obj, t_cnt, lvl_txt = norm["target_object"], norm["alarm_content"], norm["level"]
+            else:
+                # 無補譯來源（或 live 未完全中文化）：沿用 CSV 值。裸數字級別依 UI 規則修正；
+                # target_object/alarm_content 若仍是未翻譯 key（如 1838F4.*）→ 登記 mapping-missing。
+                t_obj = a.get("target_object")
+                t_cnt = a.get("alarm_content")
+                lvl_txt = _repair_level_text(a.get("level"))
+                for fld, val in (("target_object", t_obj), ("alarm_content", t_cnt)):
+                    if _is_untranslated_key(val, val):
+                        _ALARM_MAPPING_MISSING[(fld, val)] = _ALARM_MAPPING_MISSING.get((fld, val), 0) + 1
             self.records[key] = {
                 "alarm_id_raw": rid,
-                "level": a.get("level"),
+                "level": lvl_txt,
                 "_level_raw": None,
-                "target_object": a.get("target_object"),
-                "alarm_content": a.get("alarm_content"),
+                "target_object": t_obj,
+                "alarm_content": t_cnt,
                 "origin": a.get("origin") or "pre_existing",
                 "first_seen_time": a.get("first_seen_time"),
                 "first_seen_elapsed_seconds": _to_float(a.get("first_seen_elapsed_seconds")) or 0,
@@ -663,6 +877,7 @@ class AlarmTracker:
                 "alarm_status": a.get("alarm_status"),
                 "caused_stop": str(a.get("caused_stop")) in ("True", "true", "1"),
                 "_active": str(a.get("alarm_status") or "") == "告警中",
+                "_raw": None,
             }
 
     @property
@@ -1555,7 +1770,7 @@ class ReportSession:
             caused = lvl in CFG.ALARM_STOP_LEVELS
             self.log_event("alarm_new", "critical" if caused else "warning",
                            f"id={a.get('id')} {_code_text(a.get('targetMark'))} "
-                           f"{_code_text(a.get('val'))} level={_level_text(lvl)}")
+                           f"{_code_text(a.get('val'))} level={_alarm_level_text(lvl)}")
             if caused:
                 self.stop_recommended = True
                 if "alarm_stop" not in self.stop_reasons:
@@ -1851,6 +2066,44 @@ class ReportSession:
     def _path(self, name):
         return os.path.join(self.folder, name)
 
+    def _alarm_code_map_path(self):
+        """alarm_code 穩定 mapping 檔（放輸出根目錄＝session 資料夾的上層，跨 session/regen 共用）。"""
+        return os.path.join(os.path.dirname(os.path.abspath(self.folder)), CFG.FILE_ALARM_CODE_MAP)
+
+    def _log_alarm_mapping_diagnostics(self, alarm_rows):
+        """
+        寫入 Excel 前的告警除錯 Log：
+          - 對每個找不到對照的 i18n key 印 [ALARM_MAPPING_MISSING] key=...（去重）。
+          - 對每筆「未翻譯」告警印原始 API JSON / level / targetMark / val /
+            alarm_id_raw / alarm_code / 翻譯後結果，方便追查（不影響輸出內容）。
+        """
+        if _ALARM_MAPPING_MISSING:
+            print("  [告警翻譯稽核] 有未對照的 i18n key（Excel 暫保留原始 key，未自行造字）：")
+            for (field, key), n in sorted(_ALARM_MAPPING_MISSING.items()):
+                print(f"    [ALARM_MAPPING_MISSING] field={field} key={key}  (出現 {n} 次)")
+        # 逐筆列出未翻譯的告警明細
+        abnormal = [a for a in alarm_rows
+                    if _is_untranslated_key(a.get("target_object"), a.get("target_object"))
+                    or _is_untranslated_key(a.get("alarm_content"), a.get("alarm_content"))]
+        if not abnormal:
+            return
+        print(f"  [告警翻譯稽核] 未翻譯告警 {len(abnormal)} 筆明細：")
+        rec_by_id = {}
+        for rec in self.alarm_tracker.records.values():
+            rec_by_id[str(rec.get("alarm_id_raw") or "")] = rec
+        for a in abnormal:
+            rec = rec_by_id.get(str(a.get("alarm_id_raw") or ""))
+            raw = rec.get("_raw") if rec else None
+            print(f"    - alarm_code={a.get('alarm_code')} alarm_id_raw={a.get('alarm_id_raw')}")
+            print(f"      level(翻譯後)={a.get('level')!r} target_object={a.get('target_object')!r} "
+                  f"alarm_content={a.get('alarm_content')!r}")
+            if isinstance(raw, dict):
+                print(f"      原始 API：level={raw.get('level')!r} targetMark={raw.get('targetMark')!r} "
+                      f"val={raw.get('val')!r}")
+                print(f"      raw JSON={json.dumps(raw, ensure_ascii=False)}")
+            else:
+                print("      原始 API JSON：（regen 由 CSV 載入，無原始 row）")
+
     def _init_csv(self, name, fields):
         with open(self._path(name), "w", encoding="utf-8-sig", newline="") as f:
             csv.DictWriter(f, fieldnames=fields).writeheader()
@@ -2021,7 +2274,7 @@ class ReportSession:
 
     def _write_alarms(self):
         """alarms.csv：於 finalize 一次寫入（含 baseline/new、recovery/duration）。"""
-        rows = self.alarm_tracker.export_rows()
+        rows = self.alarm_tracker.export_rows(self._alarm_code_map_path())
         try:
             with open(self._path(CFG.FILE_ALARMS), "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=CFG.ALARM_FIELDS, extrasaction="ignore", restval="")
@@ -2430,8 +2683,8 @@ class ReportSession:
             ("平均電流(A)", stats.get("average_current_a")),
             ("最大電流(A)", stats.get("max_current_a")),
             ("最小電流(A)", stats.get("min_current_a")),
-            ("SOC增加(充電)", cs["soc_change"]),
-            ("SOC下降(放電)", (round(-ds["soc_change"], 2) if ds["soc_change"] is not None else None)),
+            ("SOC增加(充電)", _soc_pct_str(cs["soc_change"])),
+            ("SOC下降(放電)", _soc_pct_str(round(-ds["soc_change"], 2) if ds["soc_change"] is not None else None)),
             ("本次充電量(kWh)", stats.get("charged_energy_kwh")),
             ("本次放電量(kWh)", stats.get("discharged_energy_kwh")),
             ("本次淨電量(kWh)", stats.get("net_energy_kwh")),
@@ -2614,7 +2867,8 @@ class ReportSession:
         # ================= Sheet 7：Alarm（維持既有：alarm_id_raw 文字、凍結、篩選）=================
         wa = wb.create_sheet("Alarm")
         wa.append(CFG.ALARM_FIELDS)
-        alarm_rows = self.alarm_tracker.export_rows()
+        alarm_rows = self.alarm_tracker.export_rows(self._alarm_code_map_path())
+        self._log_alarm_mapping_diagnostics(alarm_rows)   # 寫入 Excel 前的告警翻譯稽核 Log
         for a in alarm_rows:
             wa.append([a.get(k) for k in CFG.ALARM_FIELDS])
         _hdr_row(wa, 1, len(CFG.ALARM_FIELDS))
@@ -3462,6 +3716,28 @@ def _print_final(sess, stats):
     print(f"輸出資料夾      : {sess.folder}")
 
 
+def _fetch_alarm_zh_map():
+    """
+    best-effort：以 Accept-Language: zh-TW 取回當下設備告警（guest，免登入），
+    回傳 {alarm_id_raw(str): 後端中文化 row}，供 regen 補譯舊報告的未中文化 key。
+    設備不可達 / 失敗 → 回 {}（不中斷 regen）。
+    """
+    try:
+        from api_client import ApiClient
+        cl = ApiClient()
+        resp = cl.get(EP_ALARM, params={"pageNo": 1, "pageSize": 200}, headers=_PCS_LANG_HEADER)
+        rows = []
+        if isinstance(resp, dict):
+            rows = resp.get("rows") or resp.get("list") or resp.get("records") or []
+        m = {str(a["id"]): a for a in rows if isinstance(a, dict) and a.get("id") is not None}
+        if m:
+            print(f"[REGEN] 已取回 {len(m)} 筆中文化告警（Accept-Language: zh-TW）供補譯既有紀錄")
+        return m
+    except Exception as e:
+        print(f"[REGEN] 略過告警中文補譯（設備不可達或失敗）：{type(e).__name__}")
+        return {}
+
+
 def regenerate_report(folder, backup_name=None):
     """
     用『唯一的 _write_xlsx』重產指定 session 資料夾的 report.xlsx（與 finalize/selftest 同一函式）。
@@ -3483,7 +3759,11 @@ def regenerate_report(folder, backup_name=None):
 
     sess = ReportSession.resume(folder, object())            # 僅 __init__（不 start、不寫檔）
     sess.samples = sess._load_all_samples()
-    sess.alarm_tracker.load_existing(sess._load_csv_rows(CFG.FILE_ALARMS))
+    # 舊報告的 alarms.csv 可能存有未中文化的 i18n key（如 1838F4.soc.underAlarm）。
+    # best-effort：若設備可達，以 Accept-Language: zh-TW 取回中文化告警，依 alarm_id_raw 補譯
+    # 既有紀錄（不改變告警集合）；設備不可達則沿用 CSV 原值（不中斷 regen）。
+    zh_map = _fetch_alarm_zh_map()
+    sess.alarm_tracker.load_existing(sess._load_csv_rows(CFG.FILE_ALARMS), translate_map=zh_map)
     has_cell_file = os.path.exists(os.path.join(folder, CFG.FILE_CELL_SNAPSHOTS))
     sess._load_cell_snapshots()                              # 讀回歷史 Cell 快照（不重抓最新值）
     if not has_cell_file:
@@ -3493,6 +3773,12 @@ def regenerate_report(folder, backup_name=None):
     sess.start_state = summ.get("start_state") or sess.start_state
     sess.end_state = summ.get("end_state")
     sess.end_reason = sess_blk.get("end_reason") or "completed"
+
+    # 一併刷新 alarms.csv：level 依 UI 規則（裸數字 → 中文）、alarm_code 由 alarm_id_raw 穩定配號；
+    # 欄位完全不變、僅修正值，使 CSV 與 report.xlsx 一致（原始量測資料 samples 不動）。
+    if os.path.exists(os.path.join(folder, CFG.FILE_ALARMS)):
+        sess._write_alarms()
+        print("[REGEN] 已一併刷新 alarms.csv（level/alarm_code 依最新規則，欄位不變）")
 
     xlsx = os.path.join(folder, CFG.FILE_XLSX)
     bak = os.path.join(folder, backup_name)

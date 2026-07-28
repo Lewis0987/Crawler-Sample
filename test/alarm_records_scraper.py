@@ -48,6 +48,10 @@ def _fit(s, width):
 ALARM_LIST_API = "/hmiGuest/unauthorizedAccess/alarm/list"
 PAGE_SIZE = 100        # 每頁筆數（分頁抓全部用）
 MAX_PAGES = 200        # 安全上限，避免異常時無限迴圈
+# 後端依此標頭直接中文化 typeMark/targetMark/val/triggerVal（與 charge_discharge_report 同一機制、
+# 與 HMI 一致）：device.type.bcu→電池、1838F4.soc.underAlarm→SOC過低報警、1838F4.minorAlarm→輕微報警。
+# ⚠️ 必須用連字號 zh-TW（底線 zh_TW 無效，會回原始 i18n key）。
+ALARM_LANG_HEADER = {"Accept-Language": "zh-TW"}
 
 # 統一輸出目錄：專案根目錄下的 output/（不論從哪個資料夾執行都一致），不存在則自動建立
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
@@ -106,21 +110,43 @@ def _alarm_status_text(v):
     return "告警中" if _is_active(v) else "已恢復"
 
 
-# 告警級別中文（依前端頁面對照：0=嚴重、1=一般）。未知值保留原字串。
-LEVEL_MAP = {0: "嚴重", 1: "一般", "0": "嚴重", "1": "一般"}
-
-
+# 告警級別中文：完全比照 HMI 告警頁 render 規則（前端 index-68732cea.js）：
+#   level===0 → 嚴重(serious)；===1 → 一般(medium)；其他（2,3…）→ 輕微(slight)。
+# 中文取自 zh_TW 語系 routes.custom_header.*。⚠️ 非「級別名稱表」，是 UI 實際顯示規則。
 def _level_text(v):
-    """level → 中文級別；查不到就保留原值。"""
-    return LEVEL_MAP.get(v, v)
+    """level → 中文級別，依 UI render 規則；非數字（已是中文）原樣返回。"""
+    try:
+        lv = int(v)
+    except (TypeError, ValueError):
+        return v
+    if lv == 0:
+        return "嚴重"
+    if lv == 1:
+        return "一般"
+    return "輕微"
 
 
-def fetch_all_alarm_records(client):
-    """分頁抓全部告警。回傳 (total, rows_all)。"""
+def _normalize(a):
+    """
+    委派 charge_discharge_report.normalize_alarm_record（單一翻譯/正規化流程，Console/JSON/CSV/Excel 共用，
+    不另建 mapping）。lazy import 以打破 report ↔ scraper 相互匯入的循環。
+    """
+    from charge_discharge_report import normalize_alarm_record
+    return normalize_alarm_record(a)
+
+
+def fetch_all_alarm_records(client, lang=True):
+    """
+    分頁抓全部告警。回傳 (total, rows_all)。
+    lang=True → 帶 Accept-Language: zh-TW（後端直接回中文，供 JSON/CSV/內容）；
+    lang=False → 不帶（回原始 i18n key，僅供取原始 typeMark 推導裝置代碼 BCU/PCS）。
+    """
+    headers = ALARM_LANG_HEADER if lang else None
     rows_all = []
     total = None
     for page in range(1, MAX_PAGES + 1):
-        resp = client.get(ALARM_LIST_API, params={"pageNo": page, "pageSize": PAGE_SIZE})
+        resp = client.get(ALARM_LIST_API, params={"pageNo": page, "pageSize": PAGE_SIZE},
+                          headers=headers)
         if not isinstance(resp, dict):
             break
         rows = resp.get("rows") or resp.get("list") or resp.get("records") or []
@@ -134,9 +160,35 @@ def fetch_all_alarm_records(client):
     return total, rows_all
 
 
-def summarize_alarm_records(total, rows):
-    """統計：總數、啟用中(alarmStatus=True)筆數、前幾筆精簡預覽。"""
+def _device_code(typemark_raw):
+    """裝置代碼（BCU / PCS…）：用『原始 typeMark』（device.type.bcu）經既有 ALARM_CODE_MAP → BCU；
+    查不到取末段大寫（device.type.bcu → BCU）。⚠️ 不翻成「電池」，與 UI/API 的裝置代碼一致。"""
+    code = _code_text(typemark_raw)
+    if code and code != typemark_raw:
+        return code
+    s = str(typemark_raw or "")
+    return s.rsplit(".", 1)[-1].upper() if s else s
+
+
+def _console_alarm_message(target, val, operator):
+    """
+    Console 專用：只保留『主要告警訊息（Alarm Message）』，不含「觸發條件：」/「當前值：」前後綴。
+    等值告警(==) → 觸發條件(targetMark) 即主訊息（如 SOC過低報警）；
+    其餘(!= / < / > …) → 當前值(val) 為實際狀態（如 直流輸入欠壓）。
+    （不影響 report/CSV/JSON，那裡仍保留完整「觸發條件…；當前值…」。）
+    """
+    target = (target or "").strip()
+    val = (val or "").strip()
+    if operator == "==":
+        return target or val
+    return val or target
+
+
+def summarize_alarm_records(total, rows, raw_type=None):
+    """統計：總數、啟用中(alarmStatus=True)筆數、前幾筆精簡預覽（Console 專用精簡格式）。
+    raw_type = {id: 原始 typeMark}（未中文化）→ 供 Console 顯示裝置代碼 BCU/PCS。"""
     active = sum(1 for a in rows if isinstance(a, dict) and _is_active(a.get("alarmStatus")))
+    raw_type = raw_type or {}
 
     # 預覽依前端表格排序（alarmTime DESC）取前 5 筆，欄位順序與前端一致：
     # 告警物件 / 告警內容 / 告警級別 / 告警狀態 / 告警時間
@@ -144,10 +196,13 @@ def summarize_alarm_records(total, rows):
     valid.sort(key=lambda r: int(r.get("alarmTime") or 0), reverse=True)
     preview = []
     for a in valid[:5]:
+        rid = str(a.get("id") or "")
+        # 物件：裝置代碼（BCU/PCS）取自原始 typeMark；無 raw 時退回本列（zh-TW）typeMark
+        obj = _device_code(raw_type.get(rid, a.get("typeMark")))
         preview.append({
-            "告警物件": _code_text(a.get("typeMark")),      # 優先 text，_code_text 查不到自動退回原值
-            "告警內容": _code_text(a.get("val")),
-            "告警級別": _level_text(a.get("level")),
+            "告警物件": obj,
+            "告警內容": _console_alarm_message(a.get("targetMark"), a.get("val"), a.get("operator")),
+            "告警級別": _level_text(a.get("level")),     # 與 report 同規則（0嚴重/1一般/其他輕微）
             "告警狀態": _alarm_status_text(a.get("alarmStatus")),
             "告警時間": _epoch_ms_to_text(a.get("alarmTime")),
         })
@@ -155,24 +210,25 @@ def summarize_alarm_records(total, rows):
 
 
 def build_alarm_rows(rows):
-    """CSV：每筆告警一列，取 ROW_FIELDS，並補上可讀時間 *Text。"""
+    """CSV：每筆告警一列。前導 5 欄（告警物件/內容/級別/狀態/時間）一律經 _normalize（與 report 同源）。"""
     out = []
     for a in rows:
         if not isinstance(a, dict):
             continue
+        n = _normalize(a)
         row = {k: a.get(k, "") for k in ROW_FIELDS}
-        row["alarmTimeText"] = _epoch_ms_to_text(a.get("alarmTime"))
+        row["alarmTimeText"] = n["alarm_start_time"]
         row["createTimeText"] = _epoch_ms_to_text(a.get("createTime"))
         row["alarmStatusText"] = _alarm_status_text(a.get("alarmStatus"))
-        row["typeMarkText"] = _code_text(a.get("typeMark"))
-        row["targetMarkText"] = _code_text(a.get("targetMark"))
-        row["valText"] = _code_text(a.get("val"))
-        # 前導人可讀 5 欄（順序與 console 一致；明細欄位仍保留在後）
-        row["告警物件"] = row["typeMarkText"]
-        row["告警內容"] = row["valText"]
-        row["告警級別"] = _level_text(a.get("level"))
+        row["typeMarkText"] = n["target_object"]
+        row["targetMarkText"] = a.get("targetMark", "")   # 後端已中文化（zh-TW）
+        row["valText"] = n["alarm_content"]
+        # 前導人可讀 5 欄（順序與 console 一致；與 report 之 target_object/alarm_content/level 完全相同）
+        row["告警物件"] = n["target_object"]
+        row["告警內容"] = n["alarm_content"]
+        row["告警級別"] = n["level"]
         row["告警狀態"] = row["alarmStatusText"]
-        row["告警時間"] = row["alarmTimeText"]
+        row["告警時間"] = n["alarm_start_time"]
         out.append(row)
     return out
 
@@ -216,7 +272,16 @@ def save_csv(rows, path=CSV_PATH):
 
 def main():
     client = ApiClient()
-    total, rows = fetch_all_alarm_records(client)
+    total, rows = fetch_all_alarm_records(client)           # zh-TW（供 JSON/CSV/內容）
+
+    # 另抓一份未中文化清單，僅為 Console 取『裝置代碼 BCU/PCS』（原始 typeMark）；失敗則略過。
+    raw_type = {}
+    try:
+        _, raw_rows = fetch_all_alarm_records(client, lang=False)
+        raw_type = {str(r["id"]): r.get("typeMark") for r in raw_rows
+                    if isinstance(r, dict) and r.get("id") is not None}
+    except Exception as e:
+        print(f"  [提示] 略過裝置代碼原始抓取（Console 物件退回中文）：{type(e).__name__}")
 
     record = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -227,7 +292,7 @@ def main():
     }
     save_json(record)
 
-    summ = summarize_alarm_records(total, rows)
+    summ = summarize_alarm_records(total, rows, raw_type)
     print_summary(summ)
     save_csv(build_alarm_rows(rows))
 
