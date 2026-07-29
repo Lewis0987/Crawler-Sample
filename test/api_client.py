@@ -27,7 +27,12 @@ import sm2_util  # 新模式：Python 端即時 SM2 加密（sm-crypto doEncrypt
 
 # ============ 共用設定 ============
 BASE_URL = "http://192.168.128.110:8080/admin-api"   # 如 8853 有代理可改成 :8853
-DEFAULT_TIMEOUT = 8
+# 網路逾時（connect, read）秒——任何 API 呼叫都不得無限等待。
+# connect：連不上（IP/Port/網路）時最多等 5 秒；read：連上但伺服器不回應時最多等 15 秒。
+CONNECT_TIMEOUT_SEC = 5
+READ_TIMEOUT_SEC = 15
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT_SEC, READ_TIMEOUT_SEC)
+DEFAULT_TIMEOUT = REQUEST_TIMEOUT
 DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
@@ -253,6 +258,19 @@ class ApiClient:
             resp = self.session.get(url, params=params, timeout=self.timeout, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+        # 逐一分類（ConnectTimeout 需在 ConnectionError 之前；皆不會無限等待）
+        except requests.exceptions.ConnectTimeout:
+            print(f"  [警告] GET {path} 連線逾時（connect > {CONNECT_TIMEOUT_SEC}s）")
+            return None
+        except requests.exceptions.ReadTimeout:
+            print(f"  [警告] GET {path} 讀取逾時（read > {READ_TIMEOUT_SEC}s）")
+            return None
+        except requests.exceptions.ConnectionError:
+            print(f"  [警告] GET {path} 連線失敗（無法連上設備 API）")
+            return None
+        except requests.exceptions.HTTPError as e:
+            print(f"  [警告] GET {path} HTTP 錯誤：{e}")
+            return None
         except requests.exceptions.RequestException as e:
             print(f"  [警告] GET {path} 失敗：{e}")
             return None
@@ -357,6 +375,17 @@ class ApiClient:
                 _log(f"msg: {debug.get('msg')}")
                 _log(f"Content-Type: {debug.get('content_type')}")
                 _log(f"response preview: {preview}")
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout) as e:
+            debug["error"] = f"{type(e).__name__}: {e}"
+            _log("HMI login failed")
+            _log(f"msg: HMI 登入逾時（connect {CONNECT_TIMEOUT_SEC}s / read {READ_TIMEOUT_SEC}s），"
+                 f"請確認 {url} 是否可連線。")
+            _log(f"exception: {type(e).__name__}")
+        except requests.exceptions.ConnectionError as e:
+            debug["error"] = f"ConnectionError: {e}"
+            _log("HMI login failed")
+            _log(f"msg: 無法連線至設備 API（{url}），請確認 IP、Port 與網路。")
+            _log("exception: ConnectionError")
         except requests.exceptions.RequestException as e:
             debug["error"] = f"{type(e).__name__}: {e}"
             _log("HMI login failed")

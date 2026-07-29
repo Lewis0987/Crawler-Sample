@@ -92,6 +92,10 @@ VERIFY_TIMEOUT = {
 VERIFY_TIMEOUT_DEFAULT = 60
 VERIFY_INTERVAL = 2      # 每幾秒 verify 一次
 
+# 唯讀查詢子程序（device_control_scraper.py）的硬性逾時（秒）——父程序最後防線。
+# 子程序內每支 API 亦各自逾時（見 api_client.REQUEST_TIMEOUT=(5,15)）；父程序不得無限等待。
+SUBPROCESS_TIMEOUT_SEC = 60
+
 
 def _verify_timeout(action):
     """依 action 取對應設備的 verify timeout（秒）。"""
@@ -409,12 +413,15 @@ def show_action_result():
 
 
 def refresh_status_silent():
-    """靜默執行唯讀 scraper 刷新狀態，回傳 status_summary（不印任何東西）。"""
+    """靜默執行唯讀 scraper 刷新狀態，回傳 status_summary（不印任何東西）。含硬性逾時，逾時即放棄。"""
     try:
         subprocess.run(
             [sys.executable, "-X", "utf8", SCRAPER],
             cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=SUBPROCESS_TIMEOUT_SEC,
         )
+    except subprocess.TimeoutExpired:
+        return {}                       # 逾時：subprocess.run 已終止子程序，直接放棄
     except Exception:
         return {}
     return (_load_json(READONLY_RESULT) or {}).get("status_summary") or {}
@@ -1296,23 +1303,101 @@ def handle_choice(choice):
     return True
 
 
-def refresh_status():
-    """執行唯讀 scraper 刷新狀態，只印登入 4 行，回傳 status_summary。"""
+def _terminate_child(proc):
+    """
+    安全清理子程序（Windows 亦適用）：terminate → 等待 → kill → communicate 回收 stdout/stderr。
+    回傳 (stdout, stderr)。避免逾時/取消後殘留背景 Python 程序。
+    """
+    out = err = ""
     try:
-        proc = subprocess.run(
-            [sys.executable, "-X", "utf8", SCRAPER],
-            cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        out, err = proc.communicate(timeout=5)          # 等待自行結束並回收管線
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()                                 # 仍未結束 → 強制 kill
+        except Exception:
+            pass
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return out or "", err or ""
+
+
+def _run_readonly_with_countdown(args, wait_label, timeout=SUBPROCESS_TIMEOUT_SEC):
+    """
+    以 Popen + 每秒輪詢執行唯讀子程序，同一行顯示倒數（非阻塞式 subprocess.run）。
+    回傳 (returncode, stdout, stderr, status)；status ∈ done / timeout / interrupted / launch_error。
+    逾時或使用者 Ctrl+C 皆會清理子程序（terminate→kill→communicate），不殘留、不卡住。
+    """
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", *args],
+            cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
         )
     except Exception as e:
-        print(f"[錯誤] 無法刷新狀態：{e}")
-        return {}
-    for line in (proc.stdout or "").splitlines():
+        print(f"✗ 無法啟動查詢子程序：{e}")
+        return None, "", "", "launch_error"
+
+    _clear = "\r" + " " * 44 + "\r"
+    try:
+        waited = 0
+        while waited < timeout:
+            rc = proc.poll()
+            if rc is not None:                          # 子程序已結束
+                out, err = proc.communicate()
+                print(_clear, end="")
+                return rc, out or "", err or "", "done"
+            print(f"\r[{waited:02d}/{timeout}] {wait_label}", end="", flush=True)
+            time.sleep(1)
+            waited += 1
+        # 逾時：清理子程序，不再等待
+        print(_clear, end="")
+        print(f"✗ 等待逾時（{timeout} 秒）")
+        print("正在終止查詢程序...")
+        out, err = _terminate_child(proc)
+        print("✓ 查詢程序已終止")
+        return None, out, err, "timeout"
+    except (KeyboardInterrupt, EOFError):
+        print(_clear, end="")
+        print("使用者取消設備狀態查詢。")
+        _terminate_child(proc)
+        return None, "", "", "interrupted"
+
+
+def refresh_status():
+    """
+    執行唯讀 scraper 刷新狀態（Popen + 倒數 + 硬性逾時 + 子程序清理 + Ctrl+C 友善處理）。
+    回傳 status_summary；失敗/逾時/取消一律回 {}，絕不無限卡住。
+    """
+    rc, out, err, status = _run_readonly_with_countdown([SCRAPER], "正在取得設備狀態...")
+    # 印登入 4 行（若有）
+    for line in (out or "").splitlines():
         if line.startswith(("嘗試登入", "[ENV] loaded", "HMI login")):
             print(line)
-    if proc.returncode != 0:
-        print("[錯誤] 狀態查詢失敗")
-        for l in (proc.stderr or "").strip().splitlines()[-5:]:
+
+    if status == "launch_error":
+        return {}
+    if status == "interrupted":
+        return {}                                       # 已印「使用者取消」，不印 Traceback
+    if status == "timeout":
+        print(f"✗ 設備狀態在 {SUBPROCESS_TIMEOUT_SEC} 秒內沒有回應，查詢已取消。")
+        print("  請確認 192.168.128.110:8080 是否可連線（IP / Port / 網路）。")
+        return {}
+    if rc != 0:
+        print("✗ 設備狀態查詢失敗。")
+        print(f"Exit Code：{rc}")
+        for l in [x for x in (err or "").strip().splitlines() if x][-5:]:
             print("   ", l)
+        return {}
+
+    print("✓ 設備狀態取得成功")
     data = _load_json(READONLY_RESULT) or {}
     return data.get("status_summary") or {}
 
