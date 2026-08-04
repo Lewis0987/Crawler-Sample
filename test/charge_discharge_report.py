@@ -343,6 +343,24 @@ def resolve_direction(charging_flag, discharging_flag, power_kw, idle_kw=CFG.IDL
     return normalize_power_direction(power_kw, idle_kw), "power_fallback"
 
 
+def pcs_is_fault(r):
+    """
+    PCS 是否故障（**語言無關的唯一判斷入口**；報告模組與 Menu 共用，不再各自比對中文字串）。
+      1) r["pcs_fault_flag"] 為 True/False → 直接採用
+         （來源：guest PCS `systemFaultStatus.oldValue`，1=故障 / 0=正常，與 Accept-Language 無關）
+      2) 旗標為 None（欄位缺失 / 舊 reading / 通訊失敗）→ 退回中文 badge 子字串比對，
+         維持舊行為不變（不會因新增旗標而漏判）。
+    ⚠️ 只看 systemFaultStatus；systemFailedStatus（失效）/ systemAlarmStatus（告警）
+       不併入此判斷，維持與原「故障 in PCS當前狀態 badge」完全相同的語意。
+    """
+    if not isinstance(r, dict):
+        return False
+    flag = r.get("pcs_fault_flag")
+    if flag is not None:
+        return bool(flag)
+    return "故障" in str(r.get("pcs_status", ""))          # fallback：旗標缺失才用（舊行為）
+
+
 def normalize_current_direction(current_a, idle_a=CFG.IDLE_KW):
     """電流方向（量測慣例，充=正/放=負）；門檻沿用 idle。"""
     if current_a is None:
@@ -451,6 +469,9 @@ def read_all(client):
 
     r["pcs_charging_flag"] = _flag("systemChargingStatus")
     r["pcs_discharging_flag"] = _flag("systemDischargingStatus")
+    # PCS 故障旗標（語言無關）：systemFaultStatus.oldValue（1=故障 / 0=正常 / None=缺失）。
+    # 所有故障判斷一律經 pcs_is_fault() 讀此欄位，不再依賴中文 badge 字串（避免語系/文案調整失效）。
+    r["pcs_fault_flag"] = _flag("systemFaultStatus")
     r["actual_active_power_kw"] = _mv("totalActivePowerOfAcBus")
     r["actual_reactive_power_kvar"] = _mv("totalReactivePowerOfAcBus")
     r["dc_voltage_v"] = _mv("dcInputVoltage")
@@ -466,6 +487,9 @@ def read_all(client):
     pcs_raw = {mk: md.get("value") for mk, md in marks.items()}
     modes = parse_pcs_modes(runmode if isinstance(runmode, str) else "", schedule, pcs_raw)
     r["pcs_control_mode"] = _CONTROL_MODE_DISPLAY.get(modes["control_mode"], "未知")
+    # 機器語意（語言無關）：smart / manual / none / unknown。供監看層判斷用，
+    # 不要拿上面的中文顯示字串做比較（同 pcs_fault_flag 的理由：語系/文案可能調整）。
+    r["pcs_control_mode_code"] = modes["control_mode"]
     r["pcs_work_mode"] = _GRID_MODE_DISPLAY.get(modes["grid_mode"], "未知")
     r["pcs_power_control_mode"] = modes["power_control_mode"]
     r["pcs_schedule_enabled"] = modes["schedule_enabled"]
@@ -917,7 +941,8 @@ class SafetyMonitor:
                 hits.append(("soc_under_min", "critical", f"SOC {soc}% ≤ 下限 {CFG.SOC_MIN_PERCENT}%"))
 
         # PCS 故障 / 停止 / 電池下電
-        if "故障" in str(r.get("pcs_status", "")):
+        # 故障判斷改讀 systemFaultStatus.oldValue（pcs_is_fault；語言無關），不再比對中文 badge 字串。
+        if pcs_is_fault(r):
             hits.append(("pcs_fault", "critical", f"PCS 狀態：{r.get('pcs_status')}"))
         if r.get("battery_power_status") == "已下電":
             hits.append(("battery_off", "critical", "電池已下電"))
@@ -3175,6 +3200,7 @@ def _selftest_cell_snapshots(check, output_root):
             "calculated_power_kw": round(v * i / 1000, 3),
             "pcs_status": "執行", "pcs_control_mode": "智慧模式", "pcs_work_mode": "併網",
             "pcs_power_control_mode": "交流有功", "pcs_manual_switch": 0,
+            "pcs_fault_flag": False,                              # systemFaultStatus.oldValue=0（正常）
             "pcs_schedule_enabled": True, "battery_power_status": "已上電",
             "device_daily_charge_kwh": 4.6, "device_daily_discharge_kwh": 3.7,
             "alarm_rows": [], "alarm_total": 0,
@@ -3319,6 +3345,7 @@ def selftest():
             "calculated_power_kw": round(v * i / 1000, 3),
             "pcs_status": "執行", "pcs_control_mode": "智慧模式", "pcs_work_mode": "併網",
             "pcs_power_control_mode": "交流有功", "pcs_manual_switch": 0, "pcs_schedule_enabled": True,
+            "pcs_fault_flag": False,                              # systemFaultStatus.oldValue=0（正常）
             "battery_power_status": "已上電",
             "device_daily_charge_kwh": 4.6, "device_daily_discharge_kwh": 3.7,   # 合成設備今日累計
             "alarm_rows": alarms or [], "alarm_total": len(alarms or []),
@@ -3640,6 +3667,36 @@ def selftest():
             check("Arming：charge 且 |I|≥門檻 → 確認進入（可建立 Session）", armed_chg is True)
         except Exception as e:
             check(f"Arming 驗證發生例外：{e}", False)
+
+        # ---- PCS 故障判斷：語言無關（讀 systemFaultStatus.oldValue，非中文 badge 字串）----
+        print("\n[驗證：pcs_fault_flag 語言無關故障判斷]")
+        try:
+            # 1) 旗標 True，但 badge 完全不含「故障」（英文 enum / 未翻譯）→ 仍須判為故障
+            r_en = reading(5.0, 60, "charge")
+            r_en.update(pcs_fault_flag=True, pcs_status="running / gridTied / fault")
+            check("旗標=True 且 badge 為英文（無『故障』字樣）→ 判定故障", pcs_is_fault(r_en) is True)
+            # 2) 旗標 False，但 badge 誤含「故障」字樣 → 以旗標為準，不判故障
+            r_f = reading(5.0, 60, "charge")
+            r_f.update(pcs_fault_flag=False, pcs_status="執行 / 併網 / 充電（故障已復歸）")
+            check("旗標=False 且 badge 含『故障』字樣 → 以旗標為準，不判故障",
+                  pcs_is_fault(r_f) is False)
+            # 3) 旗標缺失（None，如舊 reading）→ 退回中文子字串比對（維持舊行為）
+            r_none = reading(5.0, 60, "charge")
+            r_none.update(pcs_fault_flag=None, pcs_status="執行 / 併網 / 故障")
+            check("旗標=None → 退回中文比對（舊行為不變）", pcs_is_fault(r_none) is True)
+            r_none2 = reading(5.0, 60, "charge")
+            r_none2.update(pcs_fault_flag=None, pcs_status="執行 / 併網 / 充電")
+            check("旗標=None 且 badge 無『故障』→ 不判故障", pcs_is_fault(r_none2) is False)
+            check("非 dict 輸入 → 不判故障（不丟例外）", pcs_is_fault(None) is False)
+            # 4) SafetyMonitor 需依旗標觸發 pcs_fault（英文 badge 亦然）
+            hits = SafetyMonitor(10.0).check(r_en, 5.0)
+            check("SafetyMonitor 依旗標觸發 pcs_fault（英文 badge）",
+                  any(h[0] == "pcs_fault" for h in hits))
+            hits_ok = SafetyMonitor(10.0).check(r_f, 5.0)
+            check("SafetyMonitor 旗標=False 不觸發 pcs_fault",
+                  not any(h[0] == "pcs_fault" for h in hits_ok))
+        except Exception as e:
+            check(f"pcs_fault_flag 驗證發生例外：{e}", False)
     finally:
         read_all = orig
         _fetch_cell_packs = orig_fetch
