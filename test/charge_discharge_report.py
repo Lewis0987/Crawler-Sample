@@ -38,8 +38,12 @@ import os
 import csv
 import sys
 import json
+import glob
+import math
 import time
+import shutil
 import argparse
+import contextlib
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
@@ -361,6 +365,31 @@ def pcs_is_fault(r):
     return "故障" in str(r.get("pcs_status", ""))          # fallback：旗標缺失才用（舊行為）
 
 
+def pcs_is_idle_state(r):
+    """
+    PCS 是否**已離開充/放電**（idle 狀態；語言無關的唯一判斷入口）。
+    用途：供 idle 連續累積（_idle_streak → should_auto_end）判斷設備是否已不在充放電。
+    判斷順序：
+      1) pcs_running_flag is False → 已停止（systemOnOrOffStatus.oldValue==0：stop）
+      2) pcs_standby_flag  is True → 待機（systemStandbyStatus.oldValue==1：standby）
+         待機本質上已離開充放電，故計入 idle。
+      3) 兩旗標**皆**為 None（欄位缺失／舊 reading／通訊失敗）
+         → 退回中文 badge 子字串比對，維持舊行為（不因新增旗標而漏判）。
+      4) 只有其中一個旗標可讀且不足以判定 → 回 False（保守：寧可不收尾，也不提早切斷報告）。
+
+    ⚠️ 全專案「停止／待機」的中文字串 fallback **只允許存在於本函式**；
+       其他地方一律呼叫本函式。日後要移除 fallback 只需改這一處。
+    ⚠️ 本函式只回答「是否離開充放電」，**不**決定是否結束報告（那是 should_auto_end 的職責）。
+    """
+    if not isinstance(r, dict):
+        return False
+    running = r.get("pcs_running_flag")
+    standby = r.get("pcs_standby_flag")
+    if running is not None or standby is not None:          # 旗標優先（語言無關）
+        return running is False or standby is True
+    return "停" in str(r.get("pcs_status", ""))             # fallback：兩旗標皆缺失才用（舊行為）
+
+
 def normalize_current_direction(current_a, idle_a=CFG.IDLE_KW):
     """電流方向（量測慣例，充=正/放=負）；門檻沿用 idle。"""
     if current_a is None:
@@ -472,6 +501,12 @@ def read_all(client):
     # PCS 故障旗標（語言無關）：systemFaultStatus.oldValue（1=故障 / 0=正常 / None=缺失）。
     # 所有故障判斷一律經 pcs_is_fault() 讀此欄位，不再依賴中文 badge 字串（避免語系/文案調整失效）。
     r["pcs_fault_flag"] = _flag("systemFaultStatus")
+    # PCS 啟停／待機旗標（語言無關）：
+    #   systemOnOrOffStatus.oldValue  1=running / 0=stop
+    #   systemStandbyStatus.oldValue  1=standby / 0=false
+    # 所有「是否已離開充放電」判斷一律經 pcs_is_idle_state() 讀這兩個欄位。
+    r["pcs_running_flag"] = _flag("systemOnOrOffStatus")
+    r["pcs_standby_flag"] = _flag("systemStandbyStatus")
     r["actual_active_power_kw"] = _mv("totalActivePowerOfAcBus")
     r["actual_reactive_power_kvar"] = _mv("totalReactivePowerOfAcBus")
     r["dc_voltage_v"] = _mv("dcInputVoltage")
@@ -1632,6 +1667,422 @@ def create_cell_sheet(wb, sheet_name, data_type, snapshots, *, number_format, st
 
 
 # ======================================================================
+# 電表報告（ESS_Meter_Report.xlsx）— 獨立於 report.xlsx，不改既有工作表
+# ======================================================================
+# 資料源：電表 Log CSV（Timestamp, kW, kWh+, kWh-），1 秒取樣，kWh 為累計器直讀。
+# 與 report.xlsx 的 PCS 遙測（5 秒、kWh 由積分而來）刻意分開兩個檔案。
+#
+# 版型全部來自 templates/ESS_Report_Template.xlsx（5 張工作表、3 張圖已排好），
+# 本模組只負責：清範例 → 寫 Raw Data → 更新 Table → 算 KPI → 依當次資料設 Y 軸 → 更新圖表範圍。
+# 模板本身只由 tools/make_ess_report_template.py 重建，正式流程只讀不寫。
+#
+# 符號慣例與本模組一致：kW > 0 充電、kW < 0 放電（見 normalize_power_direction）。
+# 注意 meter Log 沒有 PCS 狀態旗標，方向只能靠符號；report.xlsx 是以旗標優先、符號為 fallback
+# （resolve_direction）。兩者的方向判斷依據不同，比對請交由獨立的 Verification 工具，
+# 本流程不做任何充放電方向分析。
+_METER_EXCEL_EPOCH = datetime(1899, 12, 30)
+
+
+def _meter_serial(ts):
+    """datetime → Excel 序列值（圖表 X 軸上下限用）。"""
+    return (ts - _METER_EXCEL_EPOCH).total_seconds() / 86400.0
+
+
+def meter_nice_floor(x):
+    """{1,2,5}x10^k 中不大於 x 的最大值。"""
+    if x <= 0:
+        return 1.0
+    mag = 10.0 ** math.floor(math.log10(x))
+    for m in (5.0, 2.0, 1.0):
+        if m * mag <= x:
+            return m * mag
+    return mag / 10.0
+
+
+def meter_padded_bounds(lo, hi, frac):
+    """
+    Y 軸上下限＝資料範圍加上 frac 的 padding，再向外對齊整數刻度。
+
+    padding 以「資料跨距」為基準，不是資料值的百分比：累計電量停在 ~90,000 時，
+    值的 5% 是 4,500，等於真實跨距（~18,000）的四分之一，會把要解決的壓平問題帶回來。
+
+    向外對齊的原因：Excel 由軸最小值往上依 major unit 標記刻度，未對齊的最小值會產生
+    88,221 / 90,221 / 92,221 這種標籤。向外對齊只會「增加」padding，結果一定含 data±frac。
+
+    保護：
+      * max == min → 退回 |value| 的 frac（下限 2%），永不產生零寬度軸
+      * 不強制含 0；只有資料本身觸及 0 時 0 才會出現在軸上
+    """
+    lo, hi = float(min(lo, hi)), float(max(lo, hi))
+    span = hi - lo
+    if span > 0:
+        pad = span * frac
+    else:
+        pad = abs(hi) * max(frac, 0.02) or 1.0
+    lo, hi = lo - pad, hi + pad
+    step = meter_nice_floor((hi - lo) / 20.0)
+    return math.floor(lo / step) * step, math.ceil(hi / step) * step
+
+
+def meter_decimate(rows, target):
+    """
+    圖表降採樣：每個 bucket 保留 kW 的最小與最大值，另強制保留首筆與末筆。
+    回傳保留的索引（已排序）。相對固定每 N 筆抽樣，本法不會漏掉尖峰。
+    """
+    n = len(rows)
+    if n <= target:
+        return list(range(n))
+    buckets = max(1, (target - 2) // 2)
+    keep = {0, n - 1}
+    step = n / buckets
+    for b in range(buckets):
+        lo, hi = int(b * step), min(n, int((b + 1) * step))
+        if hi <= lo:
+            continue
+        seg = range(lo, hi)
+        keep.add(min(seg, key=lambda i: rows[i][1]))
+        keep.add(max(seg, key=lambda i: rows[i][1]))
+    return sorted(keep)
+
+
+def find_meter_csv(folder):
+    """
+    在 session 資料夾找電表 Log：優先正規檔名 meter_log.csv，否則取 meter*.csv 第一個
+    （保留原始檔名可追溯來源）。找不到回傳 None → 不產生電表報告。
+    """
+    p = os.path.join(folder, CFG.FILE_METER_CSV)
+    if os.path.exists(p):
+        return p
+    hits = sorted(glob.glob(os.path.join(folder, CFG.METER_CSV_GLOB)))
+    return hits[0] if hits else None
+
+
+def load_meter_csv(path):
+    """
+    讀電表 Log CSV → (rows, bad, backward)
+      rows     : [(datetime, kW, kWh+, kWh-)]，依 Timestamp 穩定排序（同時間保留原順序）
+      bad      : [(csv_行號, 原因)]，空值/欄數異常/時間或數值無法解析
+      backward : 累計器倒退紀錄（不自行補償或猜測 reset 後的值）
+    """
+    rows, bad = [], []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rdr = csv.reader(f)
+        try:
+            next(rdr)                                    # 標題列
+        except StopIteration:
+            return rows, bad, []
+        for ln, r in enumerate(rdr, start=2):
+            if not r or all(not c.strip() for c in r):
+                bad.append((ln, "blank"))
+                continue
+            if len(r) != 4:
+                bad.append((ln, "field-count=%d" % len(r)))
+                continue
+            ts = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    ts = datetime.strptime(r[0].strip(), fmt)
+                    break
+                except ValueError:
+                    continue
+            if ts is None:
+                bad.append((ln, "bad-timestamp"))
+                continue
+            try:
+                vals = (float(r[1]), float(r[2]), float(r[3]))
+            except ValueError:
+                bad.append((ln, "bad-number"))
+                continue
+            rows.append((ts,) + vals)
+
+    rows.sort(key=lambda x: x[0])                         # stable：同 Timestamp 保留原順序
+    backward = []
+    for idx, name in ((2, "kWh+"), (3, "kWh-")):
+        for i in range(1, len(rows)):
+            prev, cur = rows[i - 1][idx], rows[i][idx]
+            if cur < prev - 1e-9:
+                backward.append({"counter": name, "row": i + 1, "ts": rows[i][0],
+                                 "prev": prev, "cur": cur, "drop": prev - cur})
+    return rows, bad, backward
+
+
+def meter_kpi(rows):
+    """
+    以「完整」Raw Data 計算 KPI（不使用降採樣資料）。
+    充電量/放電量取自電表累計器差值，不由 kW 積分。
+    """
+    kws = [r[1] for r in rows]
+    pos = [v for v in kws if v > 0]
+    neg = [v for v in kws if v < 0]
+    ts0, ts1 = rows[0][0], rows[-1][0]
+    k = {
+        "report_date": ts0.date(),
+        "start": ts0,
+        "end": ts1,
+        "duration_days": (ts1 - ts0).total_seconds() / 86400.0,
+        "max_charge": max(pos) if pos else 0.0,
+        "max_discharge": abs(min(neg)) if neg else 0.0,
+        "avg": sum(kws) / len(kws),
+        "kp0": rows[0][2], "kp1": rows[-1][2],
+        "kn0": rows[0][3], "kn1": rows[-1][3],
+    }
+    k["charge"] = k["kp1"] - k["kp0"]
+    k["discharge"] = k["kn1"] - k["kn0"]
+    k["net"] = k["charge"] - k["discharge"]
+    return k
+
+
+def _meter_template_path():
+    return os.path.join(_PROJECT_ROOT, CFG.METER_TEMPLATE_SUBDIR, CFG.METER_TEMPLATE_NAME)
+
+
+def write_meter_report(folder, csv_path=None, template_path=None):
+    """
+    由電表 Log 產生 <folder>/ESS_Meter_Report.xlsx（複製模板、不動模板原檔）。
+
+    回傳三態（Phase 3.7 統一契約，與 _write_xlsx 一致）：
+      dict  = 成功，供 report.xlsx 的 Summary 參照區塊使用
+              {xlsx_name, csv_name, row_count, start, end, chart_points, rejected, backward}
+      False = 檔案占用（Excel 開啟中）等**可重試**的存檔失敗
+      None  = 不適用，**不應重試**（無 openpyxl / 無電表 CSV / 無模板 / 讀檔失敗 / 無有效資料列）
+    不會拋出例外中斷主流程；任何問題都印訊息。
+    """
+    try:                                                  # 與 _write_xlsx 相同：openpyxl 缺席不影響其餘輸出
+        from openpyxl import load_workbook
+    except ImportError:
+        print(f"  [Meter] 未安裝 openpyxl，略過 {CFG.FILE_METER_XLSX}。")
+        return None
+    csv_path = csv_path or find_meter_csv(folder)
+    if not csv_path or not os.path.exists(csv_path):
+        return None
+    template_path = template_path or _meter_template_path()
+    if not os.path.exists(template_path):
+        print(f"  [Meter] 找不到模板 {template_path} → 略過 {CFG.FILE_METER_XLSX}")
+        print(f"          可執行 tools/{os.path.basename(_meter_template_path())[:-5]}.py 重建模板。")
+        return None
+
+    try:
+        rows, bad, backward = load_meter_csv(csv_path)
+    except OSError as e:
+        print(f"  [Meter] 讀取 {os.path.basename(csv_path)} 失敗：{e}")
+        return None
+    if not rows:
+        print(f"  [Meter] {os.path.basename(csv_path)} 無有效資料列 → 略過 {CFG.FILE_METER_XLSX}")
+        return None
+
+    for b in bad[:10]:
+        print(f"  [Meter] 略過第 {b[0]} 列（{b[1]}）")
+    if len(bad) > 10:
+        print(f"  [Meter] 另有 {len(bad) - 10} 列被略過")
+    for h in backward:
+        print("  [METER_COUNTER_BACKWARD] %s 第 %d 列 %s  %.3f → %.3f（倒退 %.3f）"
+              % (h["counter"], h["row"], h["ts"], h["prev"], h["cur"], h["drop"]))
+    if backward:
+        print("  [Meter] 偵測到累計器倒退：本次不自行補償或猜測 reset 後的累積值，"
+              "電量 KPI 仍以首末差值呈現，請人工判讀。")
+
+    n = len(rows)
+    kpi = meter_kpi(rows)                                 # 完整資料
+    idx = meter_decimate(rows, CFG.METER_CHART_POINTS)    # 圖表用
+    crows = [rows[i] for i in idx]
+    m = len(crows)
+    out = os.path.join(folder, CFG.FILE_METER_XLSX)
+
+    try:
+        shutil.copy2(template_path, out)                  # 模板原檔不動
+        wb = load_workbook(out)
+        _meter_fill(wb, rows, crows, kpi, os.path.basename(csv_path))
+        wb.save(out)
+    except PermissionError:
+        # ⚠️ 這一條**刻意**回傳 False 而非 None（Phase 3.7）：False = 檔案占用，屬可重試失敗。
+        #    其餘 5 條 return None（無 openpyxl / 無 CSV / 無模板 / 讀檔失敗 / 無有效資料列）
+        #    一律維持 None = 不適用，不得重試 —— 否則沒有電表 Log 的 Session 每次收尾都要白等。
+        print(f"  [警告] 寫入 {CFG.FILE_METER_XLSX} 失敗：檔案可能正被 Excel 開啟而鎖定。")
+        return False
+    except Exception as e:
+        print(f"  [警告] 產生 {CFG.FILE_METER_XLSX} 失敗：{e}")
+        return None
+
+    print(f"  [Meter] ✓ {CFG.FILE_METER_XLSX}：{n} 筆（來源 {os.path.basename(csv_path)}），"
+          f"圖表 {m} 點，{kpi['start']} ~ {kpi['end']}")
+    return {"xlsx_name": CFG.FILE_METER_XLSX, "csv_name": os.path.basename(csv_path),
+            "row_count": n, "start": kpi["start"], "end": kpi["end"],
+            "chart_points": m, "rejected": len(bad), "backward": len(backward)}
+
+
+def _meter_fill(wb, rows, crows, kpi, csv_name):
+    """把資料填入模板副本：Raw Data / Table / 降採樣區 / 三張圖範圍 / Summary KPI。"""
+    from openpyxl.utils import get_column_letter
+    n, m = len(rows), len(crows)
+    ws = wb[CFG.METER_SHEET_RAW]
+
+    # 1) 清掉模板範例資料（A:D）
+    tbl = ws.tables[CFG.METER_TABLE_NAME]
+    old_last = int(tbl.ref.split(":")[1][1:])
+    for r in range(2, old_last + 1):
+        for c in range(1, 5):
+            ws.cell(row=r, column=c).value = None
+
+    # 2) 寫入完整資料（Raw Data 保留全部，不降採樣）
+    for i, (ts, kw, kp, kn) in enumerate(rows, start=2):
+        ws.cell(row=i, column=1, value=ts).number_format = CFG.METER_NF_DT
+        ws.cell(row=i, column=2, value=kw).number_format = CFG.METER_NF_KW
+        ws.cell(row=i, column=3, value=kp).number_format = CFG.METER_NF_COUNTER
+        ws.cell(row=i, column=4, value=kn).number_format = CFG.METER_NF_COUNTER
+
+    # 3) Table 範圍（含 autoFilter）
+    tbl.ref = "A1:D%d" % (n + 1)
+    if tbl.autoFilter is not None:
+        tbl.autoFilter.ref = tbl.ref
+
+    # 4) 0 kW 基準線的兩個端點（F3/F4）
+    ws.cell(row=3, column=6, value=kpi["start"]).number_format = CFG.METER_NF_DT
+    ws.cell(row=4, column=6, value=kpi["end"]).number_format = CFG.METER_NF_DT
+    ws.cell(row=3, column=7, value=0).number_format = CFG.METER_NF_KW
+    ws.cell(row=4, column=7, value=0).number_format = CFG.METER_NF_KW
+
+    # 5) 降採樣後的圖表資料（I:L，同一張 Raw Data 工作表）
+    c0, r0 = CFG.METER_CHART_COL_FIRST, CFG.METER_CHART_ROW_FIRST
+    # 標題列（r0-1）必寫：圖表 series 名稱以 strRef 指向這幾格，留空會讓圖例變成空白
+    for k, txt in enumerate(("Chart Timestamp", "kW", "kWh+", "kWh-")):
+        ws.cell(row=r0 - 1, column=c0 + k, value=txt)
+    for i, (ts, kw, kp, kn) in enumerate(crows, start=r0):
+        ws.cell(row=i, column=c0 + 0, value=ts).number_format = CFG.METER_NF_DT
+        ws.cell(row=i, column=c0 + 1, value=kw).number_format = CFG.METER_NF_KW
+        ws.cell(row=i, column=c0 + 2, value=kp).number_format = CFG.METER_NF_COUNTER
+        ws.cell(row=i, column=c0 + 3, value=kn).number_format = CFG.METER_NF_COUNTER
+    clast = r0 + m - 1
+    ws.cell(row=1, column=c0,
+            value="Chart Data — decimated for plotting (Raw Data A:D keeps all "
+                  "%d rows; source %s)" % (n, csv_name))
+
+    # 6) 圖表範圍：全部指向 I:L 的降採樣區
+    def repoint(series, ycol):
+        series.xVal.numRef.f = "'%s'!$%s$%d:$%s$%d" % (
+            CFG.METER_SHEET_RAW, get_column_letter(c0), r0,
+            get_column_letter(c0), clast)
+        series.yVal.numRef.f = "'%s'!$%s$%d:$%s$%d" % (
+            CFG.METER_SHEET_RAW, get_column_letter(ycol), r0,
+            get_column_letter(ycol), clast)
+        if series.tx is not None and series.tx.strRef is not None:
+            series.tx.strRef.f = "'%s'!$%s$2" % (CFG.METER_SHEET_RAW,
+                                                 get_column_letter(ycol))
+
+    pt = wb[CFG.METER_SHEET_POWER]._charts[0]
+    ec = wb[CFG.METER_SHEET_ENERGY]._charts[0]
+    pe = wb[CFG.METER_SHEET_COMBO]._charts[0]
+    pe2 = [c for c in pe._charts if c is not pe][0]        # 次要軸群組（kWh+/kWh-）
+
+    repoint(pt.series[0], c0 + 1)                          # kW（series[1] 是 0 kW 基準線，不動）
+    repoint(ec.series[0], c0 + 2)
+    repoint(ec.series[1], c0 + 3)
+    repoint(pe.series[0], c0 + 1)
+    repoint(pe2.series[0], c0 + 2)
+    repoint(pe2.series[1], c0 + 3)
+
+    # 7) X 軸鎖定實際資料視窗（每小時一個刻度）
+    for ch in (pt, ec, pe):
+        ch.x_axis.scaling.min = _meter_serial(kpi["start"])
+        ch.x_axis.scaling.max = _meter_serial(kpi["end"])
+        ch.x_axis.majorUnit = 1.0 / 24.0
+
+    # 8) Y 軸：關閉 Auto Scale，依當次資料重算（模板存的是範例資料算出的界限）
+    kwv = [r[1] for r in crows]
+    env = [r[2] for r in crows] + [r[3] for r in crows]
+    p_lo, p_hi = meter_padded_bounds(min(kwv), max(kwv), CFG.METER_PAD_POWER)
+    e_lo, e_hi = meter_padded_bounds(min(env), max(env), CFG.METER_PAD_ENERGY)
+    for ax, lo, hi in ((pt.y_axis, p_lo, p_hi), (pe.y_axis, p_lo, p_hi),
+                       (ec.y_axis, e_lo, e_hi), (pe2.y_axis, e_lo, e_hi)):
+        ax.scaling.min = lo
+        ax.scaling.max = hi
+        ax.scaling.orientation = "minMax"
+
+    # 9) 圖表工作表副標題：標明來源、範圍與降採樣
+    span = "%s → %s" % (kpi["start"].strftime("%Y-%m-%d %H:%M:%S"),
+                        kpi["end"].strftime("%Y-%m-%d %H:%M:%S"))
+    subs = {
+        CFG.METER_SHEET_POWER:
+            "Source: '%s'!I:J (decimated %d of %d pts)   ·   %s   ·   "
+            "kW > 0 charging / kW < 0 discharging" % (CFG.METER_SHEET_RAW, m, n, span),
+        CFG.METER_SHEET_ENERGY:
+            "Source: '%s'!I,K:L (decimated %d of %d pts)   ·   %s   ·   "
+            "cumulative meter counters" % (CFG.METER_SHEET_RAW, m, n, span),
+        CFG.METER_SHEET_COMBO:
+            "Source: '%s'!I:L (decimated %d of %d pts)   ·   %s   ·   "
+            "left Y = kW, right Y = kWh" % (CFG.METER_SHEET_RAW, m, n, span),
+    }
+    for sheet, txt in subs.items():
+        wb[sheet].cell(row=2, column=1).value = txt
+
+    # 10) Summary KPI（以完整資料算出的值）
+    s = wb[CFG.METER_SHEET_SUMMARY]
+    for addr, val in (("B6", kpi["report_date"]), ("B7", kpi["start"]),
+                      ("B8", kpi["end"]), ("B9", kpi["duration_days"]),
+                      ("B11", kpi["max_charge"]), ("B12", kpi["max_discharge"]),
+                      ("B13", kpi["avg"]), ("B15", kpi["charge"]),
+                      ("B16", kpi["discharge"]), ("B17", kpi["net"]),
+                      ("B19", kpi["kp0"]), ("B20", kpi["kp1"]),
+                      ("B21", kpi["kn0"]), ("B22", kpi["kn1"])):
+        s[addr] = val
+    s["A2"] = ("Energy Storage System  ·  Meter Log Analysis  ·  source %s  ·  "
+               "%d rows" % (csv_name, n))
+
+
+# ======================================================================
+# Finalize 輸出重試（Phase 3.7）
+# ======================================================================
+# finalize() 未傳入 client_lock 時使用（standalone run_all / selftest）→ 等同無鎖。
+_NULL_LOCK = contextlib.nullcontext()
+
+
+def _retry_file_op(label, fn, retries=None, wait_sec=None, sleep_fn=None):
+    """
+    檔案輸出的有限次重試。回傳 (status, value, attempts)，**任何情況都不向外拋例外**
+    —— finalize 不因單一輸出失敗而中斷，其餘輸出照常產生。
+
+    可重試（判定為「檔案正被占用」，最常見是 Excel 開著該檔）：
+      - fn() 拋 OSError（PermissionError 為其子類，Windows 鎖檔即屬此類）
+      - fn() 回傳 False —— 既有函式（_write_xlsx / write_meter_report）已自行 catch
+        OSError 並以 False 表示存檔失敗，外層 except 接不到，故需一併視為可重試。
+
+    不重試：
+      - fn() 回傳 None   → OUTPUT_SKIPPED：不適用而非錯誤（無 openpyxl / 無電表 Log / 無模板）
+      - fn() 拋其他例外  → OUTPUT_FAILED：程式邏輯錯誤，重試不會成功，只會拖慢收尾
+
+    成功時 value = fn() 的回傳值（True 或 meter info dict）。
+    sleep_fn 供離線測試注入（避免實際等待）。
+    """
+    _max = max(1, int(CFG.FINALIZE_RETRY_MAX if retries is None else retries))
+    _wait = CFG.FINALIZE_RETRY_WAIT_SEC if wait_sec is None else wait_sec
+    _sleep = sleep_fn or time.sleep
+    attempts = 0
+    last = ""
+    for attempt in range(1, _max + 1):
+        attempts = attempt
+        try:
+            v = fn()
+        except OSError as e:                       # 含 PermissionError → 可重試
+            last = f"{type(e).__name__}: {e}"
+        except Exception as e:                     # 程式錯誤 → 第一次就放棄
+            print(f"  [輸出] {label} 失敗（{type(e).__name__}: {e}）：非檔案占用類錯誤，不重試。")
+            return CFG.OUTPUT_FAILED, None, attempts
+        else:
+            if v is None:                          # 不適用（非錯誤）
+                return CFG.OUTPUT_SKIPPED, None, attempts
+            if v is not False:                     # True 或 info dict → 成功
+                if attempt > 1:
+                    print(f"  [輸出] {label} 第 {attempt} 次嘗試成功。")
+                return CFG.OUTPUT_OK, v, attempts
+            last = "存檔失敗（檔案可能正被 Excel 開啟而鎖定）"
+        if attempt < _max:
+            print(f"  [輸出] {label} 第 {attempt}/{_max} 次失敗：{last}")
+            print(f"         → 請關閉正在開啟該檔的程式；{_wait:g} 秒後重試。")
+            _sleep(_wait)
+    print(f"  [輸出] {label} 重試 {_max} 次仍失敗：{last}")
+    return CFG.OUTPUT_FAILED_LOCKED, None, attempts
+
+
+# ======================================================================
 # 報告 Session
 # ======================================================================
 class ReportSession:
@@ -1647,6 +2098,12 @@ class ReportSession:
         self.events = []
         # Cell 快照（起訖＋方向切換擷取；session 內累積、不覆蓋，供 Cell Volt./Temp. 產表）
         self.cell_snapshots = []
+        # 電表報告資訊（ESS_Meter_Report.xlsx 產生後填入；None＝本 session 無電表 Log）
+        self.meter_info = None
+        # 各輸出檔的產生結果 {key: CFG.OUTPUT_*}（Phase 3.7）。
+        # 由 _write_outputs() 收集、_finalize_cleanup() 判讀、_persist_state() 寫入
+        # session_state.json。**不寫入 summary.json**（避免變更 Summary schema）。
+        self.output_status = {}
         self._modes_snapshotted = set()     # 已擷取過 start 快照的模式（判 *_start vs mode_changed_to_*）
         self._last_snapshot_mode = None     # 最近一筆快照的模式（避免同模式重複觸發）
         self.energy = EnergyAccumulator()
@@ -1655,7 +2112,11 @@ class ReportSession:
         self.end_reason = "unknown"
         self.stop_recommended = False
         self.stop_reasons = []
-        self._idle_streak = 0
+        self._idle_streak = 0                # 連續 idle 取樣次數（Debug / 統計用，非停止依據）
+        # idle 起始時間（**time.monotonic()**，非系統時間 → 電腦時間被調整也不受影響）。
+        # ⚠️ 刻意**不持久化**到 session_state.json：monotonic 值跨行程無意義；
+        #    resume 後一律從 None 重新起算，避免把孤兒期間的空檔誤判成「idle 已持續很久」。
+        self._idle_since = None
         self._last_dir_event = None          # 最近一次已記錄的 charge/idle/discharge_start 方向
         self._last_rack_max = None           # Rack 最高溫 fallback：某次 API 無值時沿用上一筆有效值
         self._last_rack_min = None           # Rack 最低溫 fallback
@@ -1819,10 +2280,16 @@ class ReportSession:
                       else f"{direction}_start")
             self._capture_cell_snapshot(r, direction, power, reason)
         # idle 連續判定（供自動結束）
-        if direction == "idle" or "停" in str(r.get("pcs_status", "")):
+        # 「已離開充放電」一律經 pcs_is_idle_state()（語言無關；中文 fallback 只在該函式內）。
+        # 同時維護兩者：_idle_since（monotonic 時間，**停止判定依據**）與
+        #               _idle_streak（次數，僅供 Debug / 統計 / 驗證）。
+        if direction == "idle" or pcs_is_idle_state(r):
             self._idle_streak += 1
+            if self._idle_since is None:
+                self._idle_since = time.monotonic()      # 首次進入 idle → 起算
         else:
             self._idle_streak = 0
+            self._idle_since = None                      # 離開 idle → 重新起算
 
         row = self._sample_row(r, elapsed, power, direction, direction_source, len(new_al))
         self.samples.append(row)
@@ -1898,22 +2365,89 @@ class ReportSession:
         if self.cell_snapshots:
             self._last_snapshot_mode = self.cell_snapshots[-1].get("mode")
 
-    def should_auto_end(self):
-        """回傳 (end?, reason) —— 依 config 判斷是否自動結束（不送控制）。"""
-        if CFG.AUTO_END_ON_CRITICAL and self.stop_recommended:
-            reason = ("communication_error" if "communication_error" in self.stop_reasons
-                      else "alarm_stop" if "alarm_stop" in self.stop_reasons
-                      else "pcs_stop" if "battery_off" in self.stop_reasons or "pcs_fault" in self.stop_reasons
-                      else "pcs_stop")
-            return True, reason
-        if self._idle_streak >= CFG.IDLE_END_SAMPLES:
-            return True, "pcs_stop"
-        if self._elapsed() >= CFG.SESSION_TIMEOUT_SEC:
+    def idle_held_seconds(self):
+        """
+        idle（已離開充放電）已持續秒數；未處於 idle 回 0.0。
+        以 time.monotonic() 計算，**不受系統時間調整影響**。
+        """
+        if self._idle_since is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._idle_since)
+
+    def should_auto_end(self, schedule_ctx=None):
+        """
+        **全專案唯一的自動停止判定入口**（Menu / Dashboard / 背景取樣器一律呼叫本函式，
+        不得自行判斷）。回傳 (end?, reason)；只做判斷，**不送任何控制命令、不寫任何檔案**。
+
+        schedule_ctx（Phase 3.5，選填）：由監看層計算的排程感知資訊
+            {"in_window": bool, "current_plan": str|None,
+             "next_plan_in_sec": float|None, "source": "ok"|"unknown"}
+          - None 或 source != "ok" → **完全退回 Phase 3.4 行為**（僅看 idle 門檻）
+          - 僅在 CFG.AUTO_NEXT_PLAN_GAP_SEC > 0 時才會影響判定；
+            該值預設 0（停用）→ ctx 只被計算與顯示，不改變任何結果。
+          - 本函式**不自行讀取排程 API**：排程讀取屬監看層職責，決策留在這裡。
+
+        判定優先序：
+          ① 白名單 critical（CFG.AUTO_END_STOP_REASONS）
+               communication_error → communication_error
+               pcs_fault           → fault_stop      （與 Menu 命名統一）
+               battery_off         → battery_off
+             ⚠️ 其餘 critical 條件一律**不結束**，只保留於 stop_reasons / events / Summary：
+                alarm_stop（設備既有告警在 resume 時會被記為新增，不應中斷記錄）
+                soc_over_max（充電充飽＝排程正常完成 → 應走 ② 以 auto_stop 收尾）
+                soc_under_min（放電放到下限，同理）
+          ② idle 持續 ≥ CFG.AUTO_HOLD_STOP_SEC（monotonic 時間制）→ auto_stop
+          ③ CFG.AUTO_END_TIMEOUT_SEC > 0 且經過時間超過 → timeout（0＝不限）
+
+        註：_idle_streak（次數）僅供 Debug / 統計，**不參與**本判定。
+        """
+        if CFG.AUTO_END_ON_CRITICAL:
+            for cond in CFG.AUTO_END_STOP_REASONS:          # 依 config 順序＝優先序
+                if cond in self.stop_reasons:
+                    return True, CFG.AUTO_END_REASON_MAP.get(cond, cond)
+        if self.idle_held_seconds() >= CFG.AUTO_HOLD_STOP_SEC:
+            # 排程感知（Phase 3.5）：下一段啟用排程即將開始 → 暫不收尾，維持同一份 Session。
+            # AUTO_NEXT_PLAN_GAP_SEC = 0（預設）時整段跳過 → 與 Phase 3.4 行為完全相同。
+            _gap = getattr(CFG, "AUTO_NEXT_PLAN_GAP_SEC", 0) or 0
+            if (_gap > 0 and isinstance(schedule_ctx, dict)
+                    and schedule_ctx.get("source") == "ok"):
+                _nxt = schedule_ctx.get("next_plan_in_sec")
+                if _nxt is not None and _nxt <= _gap:
+                    return False, None          # 下段排程將至 → 不切成兩份報告
+            return True, "auto_stop"
+        if CFG.AUTO_END_TIMEOUT_SEC and self._elapsed() >= CFG.AUTO_END_TIMEOUT_SEC:
             return True, "timeout"
         return False, None
 
-    def finalize(self, end_reason):
-        """結束 Session（status=completed）並產生完整累積報告。"""
+    def finalize(self, end_reason, client_lock=None):
+        """
+        結束 Session 並產生完整累積報告。回傳 stats（公開行為與呼叫方式維持不變）。
+
+        三階段（Phase 3.7）：
+          ① _prepare_finalize()   **唯一**網路階段（read_all + session_end Cell 快照）
+          ② _write_outputs()      純本地輸出；Excel / Plot / Meter 具有限次重試
+          ③ _finalize_cleanup()   判定輸出完整性 → 記事件 → status=completed → 落盤
+
+        client_lock：呼叫端（device_control_menu）注入的共用 client 鎖，**只**套用在①。
+        ②③不持鎖 → Excel/CSV/Chart 產出（數秒）期間不再阻塞前景 Dashboard 讀取。
+        鎖範圍寫死在此處而非由呼叫端自行包覆，外部就不可能誤把②一起鎖進去。
+        未傳入時（standalone run_all / selftest）等同無鎖，行為與 Phase 3.6 相同。
+        """
+        with (client_lock if client_lock is not None else _NULL_LOCK):
+            self._prepare_finalize(end_reason)
+        stats = self._write_outputs()
+        self._finalize_cleanup(stats)
+        return stats
+
+    def _prepare_finalize(self, end_reason):
+        """
+        finalize 第①階段——**唯一**會做網路 I/O 的階段（read_all + Cell 快照）。
+        呼叫端只需在這個階段持有 client 鎖。
+
+        ⚠️ 這裡**不**設定 status=completed：completed 的語意是「finalize 流程已走完」，
+           若在此就標記，②寫輸出的數秒內 session_state.json 已宣告 completed，但 Excel
+           其實還沒產出（甚至可能失敗），對外狀態與實際不一致。改由③統一標記。
+        """
         self.end_reason = end_reason or "unknown"
         r = read_all(self.client)
         self.end_state = self._state_from_reading(r)
@@ -1923,11 +2457,57 @@ class ReportSession:
         p_end = (r.get("actual_active_power_kw") if CFG.POWER_SOURCE == "pcs"
                  else r.get("calculated_power_kw"))
         self._capture_cell_snapshot(r, d_end, p_end, "session_end")
-        self.status = CFG.SESSION_COMPLETED
         self.log_event("session_end", "info",
                        f"reason={self.end_reason}({CFG.END_REASON.get(self.end_reason,'')}) "
                        f"samples={len(self.samples)}")
+        return self.end_state
+
+    def _write_outputs(self):
+        """
+        finalize 第②階段：產生所有輸出檔並收集 output_status。**全程零網路 I/O**
+        （不得出現 self.client / read_all() / _fetch_cell_packs()，有守門測試檢查）。
+
+        與 pause() 共用同一份輸出實作 _regenerate_outputs()，不分裂成兩套；本階段只額外
+        負責「重試 + 收集狀態」。任何單項失敗都不中斷其餘輸出、也不向外拋例外。
+        """
+        self.output_status = {}
         return self._regenerate_outputs()
+
+    def _finalize_cleanup(self, stats):
+        """
+        finalize 第③階段（純本地、瞬時）：判定輸出完整性 → 記事件 → 標記 completed → 落盤。
+
+        status=completed 的語意是「finalize 流程已走完」，**不代表所有輸出檔都成功**。
+        輸出完整性一律由 output_status（session_state.json）與 finalize_ok /
+        finalize_partial 事件表示。任何情況下原始資料（samples / events / alarms /
+        統計 JSON）都已完整保留 —— 缺的只會是 Excel 這類可再產生的衍生檔。
+        """
+        bad = {k: v for k, v in (self.output_status or {}).items()
+               if v in (CFG.OUTPUT_FAILED_LOCKED, CFG.OUTPUT_FAILED)}
+        if bad:
+            detail = " ".join(f"{k}={v}" for k, v in sorted(bad.items()))
+            self.log_event("finalize_partial", "warning", f"輸出未全部成功：{detail}")
+        else:
+            self.log_event("finalize_ok", "info", "所有輸出檔產生完成")
+        self.status = CFG.SESSION_COMPLETED
+        self._persist_state(stats)
+        if bad:
+            print(f"  [輸出] ⚠ Session 已結束（completed），但下列輸出未成功：{detail}")
+            print("         原始資料完整保留；關閉占用該檔的程式後，可用 --regen 補產。")
+        return self.output_status
+
+    def mark_paused(self):
+        """
+        **只**把狀態標記為 paused 並寫 session_state.json —— 不重產報表、不做任何網路 I/O。
+
+        供行程結束時的 atexit 保底使用：必須快且不可能卡住退出流程。
+        與 pause() 的差別：pause() 會呼叫 _regenerate_outputs()（重算統計、重寫
+        alarms/summary/statistics 與**整份 Excel**，需數秒），不適合放在 atexit。
+        兩者都讓 Session 停在 paused，下次啟動皆可由 find_active_session() 續接。
+        """
+        self.status = CFG.SESSION_PAUSED
+        self._persist_state()
+        return self.status
 
     def pause(self):
         """暫停 Session（status=paused，可續接）並更新報告快照；不寫 session_end。"""
@@ -1943,9 +2523,32 @@ class ReportSession:
         self._write_cell_snapshots()         # Cell 快照持久化（含 pause/finalize 當下的最新累積）
         self._write_statistics(stats)
         self._write_summary(stats)
+        self._write_meter_report()           # 電表報告（獨立檔案）；須在 _write_xlsx 前，Summary 參照區塊要用其結果
         self._write_xlsx(stats)
         self._persist_state(stats)
         return stats
+
+    def _record_output(self, key, status):
+        """記錄單一輸出檔的產生結果（Phase 3.7；供 _finalize_cleanup 判讀）。"""
+        if not isinstance(getattr(self, "output_status", None), dict):
+            self.output_status = {}
+        self.output_status[key] = status
+        return status
+
+    def _write_meter_report(self):
+        """
+        有電表 Log 才產生 ESS_Meter_Report.xlsx（與 Cell 工作表相同的條件式作法：
+        沒有資料就完全不產生，不留空檔）。結果存入 self.meter_info 供 report.xlsx
+        的 Summary 參照區塊使用；失敗不影響 report.xlsx。
+
+        檔案占用（write_meter_report 回傳 False）→ 有限次重試；無電表 Log 等
+        「不適用」情形（回傳 None）→ 直接 skipped，不浪費重試等待。
+        self.meter_info 一律正規化為 dict 或 None（絕不留下 False），下游判讀不受影響。
+        """
+        st, val, _n = _retry_file_op(CFG.FILE_METER_XLSX, lambda: write_meter_report(self.folder))
+        self._record_output("meter_xlsx", st)
+        self.meter_info = val or None
+        return self.meter_info
 
     # ---------- 取樣 → 結構 ----------
     def _elapsed(self):
@@ -2189,6 +2792,9 @@ class ReportSession:
             "device_ip": self.device_ip,
             "report_version": CFG.REPORT_VERSION,
             "schema_version": CFG.SCHEMA_VERSION,
+            # 各輸出檔產生結果（Phase 3.7）。completed 只代表 finalize 流程走完，
+            # 輸出是否齊全一律看這裡；summary.json 刻意不加此欄位（不動 Summary schema）。
+            "output_status": dict(getattr(self, "output_status", None) or {}),
         }
         self._dump_json(CFG.FILE_SESSION_STATE, state)
 
@@ -2653,7 +3259,11 @@ class ReportSession:
         r = _kv(ws, r, 1, "結束時間", sess["end_time"])
         r = _kv(ws, r, 1, "總持續時間", _fmt_hms(stats.get("duration_seconds")))
         r = _kv(ws, r, 1, "完成原因", f"{sess['end_reason']}（{sess['end_reason_text']}）")
-        r = _kv(ws, r, 1, "控制模式", sess["control_mode"])
+        # 「控制模式」＝ PCS 控制模式（智慧/手動/未開啟），來源 pcs_control_mode（取自 start_state）。
+        # ⚠️ 不可用 sess["control_mode"] —— 那是 control_mode_label，語意為「功率控制方式」
+        #    （交流有功/直流恆流/直流恆功率，同時是 CFG.MODE_SETPOINT 的查表 key），
+        #    與下一列的「PCS模式」重複。舊報告若無此欄位則退回顯示「未知」。
+        r = _kv(ws, r, 1, "控制模式", sess.get("pcs_control_mode") or "未知")
         r = _kv(ws, r, 1, "PCS模式", sess["pcs_mode"])
         r += 1
         r = _section(ws, r, 1, "本次充放電統計（Σ功率×Δt 積分）")
@@ -2728,6 +3338,21 @@ class ReportSession:
             ws.cell(row=kpi_hdr + i, column=2, value=v)
         if kpi_rows:
             _table(ws, f"A{kpi_hdr}:B{kpi_hdr + len(kpi_rows)}", "tbl_kpi")
+
+        # ---- Meter Report 參照區塊（只在本 session 有電表 Log 時出現）----
+        # 刻意「只放參照資訊、不放 Meter KPI」：電表 kWh 是累計器直讀，report.xlsx 的 kWh 是
+        # kW 梯形積分，兩者並列於同一 Summary 會被誤讀為互相驗證過的數字。
+        # 電表 KPI 一律只出現在 ESS_Meter_Report.xlsx。
+        mi = getattr(self, "meter_info", None)
+        if mi:
+            r = kpi_hdr + len(kpi_rows) + 2
+            r = _section(ws, r, 1, "Meter Report")
+            r = _kv(ws, r, 1, "Report 檔名", mi["xlsx_name"])
+            r = _kv(ws, r, 1, "Meter CSV", mi["csv_name"])
+            r = _kv(ws, r, 1, "有效資料筆數", mi["row_count"])
+            r = _kv(ws, r, 1, "起始時間", mi["start"].strftime("%Y-%m-%d %H:%M:%S"))
+            r = _kv(ws, r, 1, "結束時間", mi["end"].strftime("%Y-%m-%d %H:%M:%S"))
+
         _autofit(ws, 2, minw=16, maxw=52)             # 含 KPI 內容後統一調欄寬
 
         # ================= 紀錄頁（充放電/充電/放電）共用建構 =================
@@ -2939,17 +3564,27 @@ class ReportSession:
             # 僅 CFG.TAB_COLORS 有列出的工作表(Summary)上色；其餘設 None → 不寫 tabColor（Excel 預設白色）
             wsx.sheet_properties.tabColor = CFG.TAB_COLORS.get(wsx.title)
 
-        try:
+        # 只重試 wb.save（Phase 3.7）：整份 workbook 已建好，鎖檔是暫時性的，
+        # 沒有必要重建所有工作表與圖表 —— 重試成本因此固定在一次存檔。
+        def _save():
             wb.save(self._path(CFG.FILE_XLSX))
-        except OSError as e:
-            print(f"  [警告] 寫入 {CFG.FILE_XLSX} 失敗：{e}")
-            print(f"         → 檔案可能正被 Excel 開啟而鎖定，請關閉 {CFG.FILE_XLSX} 後重試。")
+            return True
+
+        st = self._record_output("xlsx", _retry_file_op(CFG.FILE_XLSX, _save)[0])
+        if st != CFG.OUTPUT_OK:
+            # 沒有存檔就談不上 plotVisOnly；明確標 skipped，避免沿用上一輪（例如 pause 時）
+            # 成功的舊值而讓 output_status 對不上實際檔案。
+            self._record_output("plot_vis", CFG.OUTPUT_SKIPPED)
+            print(f"         → 請關閉 {CFG.FILE_XLSX} 後，以 --regen 補產。")
             return False
         # 讓隱藏欄(AN 稀疏標籤)的類別標籤仍繪出 → 圖表 plotVisOnly 設為 0（openpyxl 預設寫 1，需存檔後改）
-        try:
+        # _force_plot_visible_all() 直接拋 OSError（zip 讀寫 / os.replace 被占用）→ 由 retry wrapper 接手。
+        def _plot_vis():
             _force_plot_visible_all(self._path(CFG.FILE_XLSX))
-        except Exception as e:
-            print(f"  [提醒] 設定 plotVisOnly=0 失敗（隱藏欄 X 軸標籤可能不顯示）：{e}")
+            return True
+
+        if self._record_output("plot_vis", _retry_file_op("plotVisOnly", _plot_vis)[0]) != CFG.OUTPUT_OK:
+            print("  [提醒] 設定 plotVisOnly=0 失敗（隱藏欄 X 軸標籤可能不顯示）；xlsx 本身已產生。")
         return True
 
 
@@ -3200,7 +3835,10 @@ def _selftest_cell_snapshots(check, output_root):
             "calculated_power_kw": round(v * i / 1000, 3),
             "pcs_status": "執行", "pcs_control_mode": "智慧模式", "pcs_work_mode": "併網",
             "pcs_power_control_mode": "交流有功", "pcs_manual_switch": 0,
-            "pcs_fault_flag": False,                              # systemFaultStatus.oldValue=0（正常）
+            # ---- 語言無關狀態旗標（依 direction 推導，使 fixture 對三種方向都具測試意義）----
+            "pcs_fault_flag": False,                 # systemFaultStatus.oldValue=0（正常）
+            "pcs_running_flag": True,                # systemOnOrOffStatus.oldValue=1（執行中）
+            "pcs_standby_flag": direction == "idle",  # systemStandbyStatus：idle 即待機
             "pcs_schedule_enabled": True, "battery_power_status": "已上電",
             "device_daily_charge_kwh": 4.6, "device_daily_discharge_kwh": 3.7,
             "alarm_rows": [], "alarm_total": 0,
@@ -3345,7 +3983,10 @@ def selftest():
             "calculated_power_kw": round(v * i / 1000, 3),
             "pcs_status": "執行", "pcs_control_mode": "智慧模式", "pcs_work_mode": "併網",
             "pcs_power_control_mode": "交流有功", "pcs_manual_switch": 0, "pcs_schedule_enabled": True,
-            "pcs_fault_flag": False,                              # systemFaultStatus.oldValue=0（正常）
+            # ---- 語言無關狀態旗標（依 direction 推導，使 fixture 對三種方向都具測試意義）----
+            "pcs_fault_flag": False,                 # systemFaultStatus.oldValue=0（正常）
+            "pcs_running_flag": True,                # systemOnOrOffStatus.oldValue=1（執行中）
+            "pcs_standby_flag": direction == "idle",  # systemStandbyStatus：idle 即待機
             "battery_power_status": "已上電",
             "device_daily_charge_kwh": 4.6, "device_daily_discharge_kwh": 3.7,   # 合成設備今日累計
             "alarm_rows": alarms or [], "alarm_total": len(alarms or []),
@@ -3435,6 +4076,21 @@ def selftest():
               stats["sample_count"] == 15 and summ.get("statistics", {}).get("sample_count") == 15)
         st = _load_json_file(os.path.join(folder, CFG.FILE_SESSION_STATE)) or {}
         check("session_state.status=completed", st.get("status") == CFG.SESSION_COMPLETED)
+        # ---- Phase 3.7：實際 finalize 產出的 output_status / finalize_ok ----
+        _os_blk = st.get("output_status")
+        check("session_state.json 含 output_status（Phase 3.7）", isinstance(_os_blk, dict))
+        check(f"output_status.xlsx = ok（實際 {(_os_blk or {}).get('xlsx')}）",
+              (_os_blk or {}).get("xlsx") == CFG.OUTPUT_OK)
+        check(f"output_status.plot_vis = ok（實際 {(_os_blk or {}).get('plot_vis')}）",
+              (_os_blk or {}).get("plot_vis") == CFG.OUTPUT_OK)
+        check("summary.json **不含** output_status（Summary schema 未變更）",
+              "output_status" not in summ and "output_status" not in summ.get("session", {}))
+        with open(os.path.join(folder, CFG.FILE_EVENTS), encoding="utf-8-sig") as _ef:
+            _evt = [row["event_type"] for row in csv.DictReader(_ef)]
+        check("events.csv 記有 finalize_ok（輸出全數成功）", "finalize_ok" in _evt)
+        check("events.csv 無 finalize_partial（本次未缺檔）", "finalize_partial" not in _evt)
+        check("finalize_ok 排在 session_end 之後（③在①之後）",
+              "session_end" in _evt and _evt.index("finalize_ok") > _evt.index("session_end"))
 
         # ---- report.xlsx 分頁標籤顏色驗證（tabColor 需符合 CFG.TAB_COLORS）----
         print("\n[驗證：Excel 分頁標籤顏色]")
@@ -3466,6 +4122,43 @@ def selftest():
             check("Summary 無星號評分(★/☆)", not any(("★" in t or "☆" in t) for t in texts))
         except Exception as e:
             check(f"Summary Health 驗證發生例外：{e}", False)
+
+        # ---- Summary「控制模式」/「PCS模式」欄位 mapping（兩者語意不可重複）----
+        print("\n[驗證：Summary 控制模式 / PCS模式 欄位 mapping]")
+        try:
+            wsm = load_workbook(os.path.join(folder, CFG.FILE_XLSX))["Summary"]
+            _sm = _load_json_file(os.path.join(folder, CFG.FILE_SUMMARY)) or {}
+            _sess_blk = _sm.get("session") or {}
+
+            def _label_value(label):
+                """取 Summary 工作表中『標籤』右側那一格的值。"""
+                for row in wsm.iter_rows():
+                    for c in row:
+                        if str(c.value).strip() == label:
+                            return wsm.cell(row=c.row, column=c.column + 1).value
+                return None
+
+            _v_ctrl = _label_value("控制模式")
+            _v_pcs = _label_value("PCS模式")
+            check(f"「控制模式」取自 summary.session.pcs_control_mode"
+                  f"（Excel={_v_ctrl!r} / JSON={_sess_blk.get('pcs_control_mode')!r}）",
+                  _v_ctrl == _sess_blk.get("pcs_control_mode"))
+            check(f"「PCS模式」取自 summary.session.pcs_mode"
+                  f"（Excel={_v_pcs!r} / JSON={_sess_blk.get('pcs_mode')!r}）",
+                  _v_pcs == _sess_blk.get("pcs_mode"))
+            check("「控制模式」**不再**顯示 control_mode_label（功率控制方式）",
+                  _v_ctrl != _sess_blk.get("control_mode")
+                  or _sess_blk.get("pcs_control_mode") == _sess_blk.get("control_mode"))
+            check(f"合成資料下「控制模式」為智慧模式（{_v_ctrl!r}）", _v_ctrl == "智慧模式")
+            check(f"合成資料下「PCS模式」為交流有功（{_v_pcs!r}）", _v_pcs == "交流有功")
+            # summary.json / session_state.json 欄位本身不得因本次修正而改變
+            check("summary.session.control_mode 仍保留（未刪欄位，向下相容）",
+                  "control_mode" in _sess_blk)
+            _st_blk = _load_json_file(os.path.join(folder, CFG.FILE_SESSION_STATE)) or {}
+            check("session_state.control_mode 仍為 control_mode_label（未被改寫）",
+                  _st_blk.get("control_mode") == _sess_blk.get("control_mode"))
+        except Exception as e:
+            check(f"Summary 控制模式 mapping 驗證發生例外：{e}", False)
 
         # ---- report.xlsx 圖表結構驗證（整合圖：每紀錄頁 1 張、3 series＝電流+Rack溫度、無 timestamp）----
         print("\n[驗證：Excel 圖表結構]")
@@ -3697,9 +4390,386 @@ def selftest():
                   not any(h[0] == "pcs_fault" for h in hits_ok))
         except Exception as e:
             check(f"pcs_fault_flag 驗證發生例外：{e}", False)
+
+        # ---- PCS idle 狀態判斷：語言無關（讀啟停/待機 oldValue，非中文 badge）----
+        # 四組 fixture：Running / Standby / Stop / 英文 badge，避免 Accept-Language 改變再次失效。
+        print("\n[驗證：pcs_is_idle_state 語言無關 idle 判斷]")
+        try:
+            def _r_state(running, standby, badge):
+                x = reading(5.0, 60, "charge")
+                x.update(pcs_running_flag=running, pcs_standby_flag=standby,
+                         pcs_status=badge)
+                return x
+
+            # ① Running：執行中且非待機 → 未離開充放電
+            check("Running（running=True/standby=False，中文 badge）→ 不算 idle",
+                  pcs_is_idle_state(_r_state(True, False, "執行 / 併網 / 充電")) is False)
+            # ② Standby：badge 不含「停止」→ 舊寫法會漏判，新寫法須認定為 idle
+            check("Standby（standby=True，badge 無『停止』字樣）→ 算 idle（舊寫法會漏判）",
+                  pcs_is_idle_state(_r_state(True, True, "執行 / 併網")) is True)
+            # ③ Stop：已停止
+            check("Stop（running=False，中文 badge『停止』）→ 算 idle",
+                  pcs_is_idle_state(_r_state(False, False, "停止")) is True)
+            # ④ 英文 badge：完全不含中文，旗標仍須生效
+            check("英文 badge（running=False，'stop / gridTied'）→ 算 idle（不依賴中文）",
+                  pcs_is_idle_state(_r_state(False, False, "stop / gridTied")) is True)
+            check("英文 badge（running=True/standby=False，'running / gridTied / charging'）"
+                  "→ 不算 idle",
+                  pcs_is_idle_state(_r_state(True, False, "running / gridTied / charging"))
+                  is False)
+            # 單一旗標可讀但不足以判定 → 保守回 False（不提早切斷報告）
+            check("running=None + standby=False → 保守不算 idle",
+                  pcs_is_idle_state(_r_state(None, False, "執行 / 併網")) is False)
+            # fallback：兩旗標皆缺失（舊 reading）→ 退回中文比對，維持舊行為
+            check("兩旗標皆 None + 中文『停止』→ 退回比對，算 idle（舊行為）",
+                  pcs_is_idle_state(_r_state(None, None, "停止 / 併網")) is True)
+            check("兩旗標皆 None + 中文無『停止』→ 不算 idle",
+                  pcs_is_idle_state(_r_state(None, None, "執行 / 併網 / 充電")) is False)
+            check("非 dict 輸入 → 不算 idle（不丟例外）", pcs_is_idle_state(None) is False)
+            # 集中化守門：「停止／待機」中文子字串比對只允許出現在 pcs_is_idle_state() 內。
+            # 掃描範圍＝正式執行路徑（排除 _selftest_cell_snapshots / selftest 兩個測試區塊，
+            # 否則會掃到本區塊自己的斷言字串）。以行首 "\ndef <name>(" 為切點。
+            with open(os.path.abspath(__file__), encoding="utf-8") as _fh:
+                _src = _fh.read()
+            _prod = (_src[:_src.index("\ndef _self" + "test_cell_snapshots(")]
+                     + _src[_src.index("\ndef _print" + "_final("):])
+            _needle = chr(34) + "停" + chr(34) + " in"          # 即 '"停" in'
+            _fn = _prod[_prod.index("def pcs_is_idle_state("):
+                        _prod.index("def normalize_current_direction(")]
+            check(f"正式執行路徑中 '{_needle}' 僅 1 處（實際 {_prod.count(_needle)} 處）",
+                  _prod.count(_needle) == 1)
+            check("該處位於 pcs_is_idle_state() 內（fallback 已集中）", _needle in _fn)
+            check("正式執行路徑無其他「待機／停止」決策用字串比對",
+                  (chr(34) + "待機" + chr(34) + " in") not in _prod
+                  and (chr(34) + "停止" + chr(34) + " in") not in _prod)
+        except Exception as e:
+            check(f"pcs_is_idle_state 驗證發生例外：{e}", False)
+
+        # ---- should_auto_end()：唯一停止決策點（白名單 + 時間制 idle + reason 統一）----
+        print("\n[驗證：should_auto_end 停止判定]")
+        try:
+            def _sess_for_end(stop_reasons=(), idle_ago=None, elapsed_ago=0.0):
+                """
+                建立僅供判定測試的 Session（不 start、不寫檔）：
+                  stop_reasons：注入 stop_reasons 清單
+                  idle_ago    ：idle 已持續秒數（以 monotonic 回推設定 _idle_since；None＝非 idle）
+                  elapsed_ago ：讓 _elapsed() 回傳的秒數（以假時鐘回推 start_dt）
+                """
+                s = ReportSession("auto", None, "交流有功", object(), output_root,
+                                  now_fn=lambda: clk["dt"])
+                s.start_dt = clk["dt"] - timedelta(seconds=elapsed_ago)
+                s.stop_reasons = list(stop_reasons)
+                s.stop_recommended = bool(stop_reasons)
+                s._idle_since = (None if idle_ago is None
+                                 else time.monotonic() - idle_ago)
+                return s
+
+            # ① 白名單 critical → 結束，且 reason 已統一
+            check("communication_error → (True, communication_error)",
+                  _sess_for_end(["communication_error"]).should_auto_end()
+                  == (True, "communication_error"))
+            check("pcs_fault → (True, fault_stop)（原為 pcs_stop，已與 Menu 統一）",
+                  _sess_for_end(["pcs_fault"]).should_auto_end() == (True, "fault_stop"))
+            check("battery_off → (True, battery_off)（原落到 pcs_stop）",
+                  _sess_for_end(["battery_off"]).should_auto_end() == (True, "battery_off"))
+            # ② 非白名單 critical → 一律不結束
+            check("alarm_stop → 不結束（只記錄）",
+                  _sess_for_end(["alarm_stop"]).should_auto_end() == (False, None))
+            check("soc_over_max（充飽＝排程正常完成）→ 不結束",
+                  _sess_for_end(["soc_over_max"]).should_auto_end() == (False, None))
+            check("soc_under_min（放到下限）→ 不結束",
+                  _sess_for_end(["soc_under_min"]).should_auto_end() == (False, None))
+            check("voltage_over / power_deviation 等 → 不結束",
+                  _sess_for_end(["voltage_over", "power_deviation"]).should_auto_end()
+                  == (False, None))
+            # 優先序
+            check("alarm_stop + pcs_fault 同時 → fault_stop（白名單優先）",
+                  _sess_for_end(["alarm_stop", "pcs_fault"]).should_auto_end()
+                  == (True, "fault_stop"))
+            check("communication_error + pcs_fault 同時 → communication_error（優先序 1）",
+                  _sess_for_end(["pcs_fault", "communication_error"]).should_auto_end()
+                  == (True, "communication_error"))
+            check("白名單 critical 優先於 idle 門檻",
+                  _sess_for_end(["pcs_fault"], idle_ago=9999).should_auto_end()
+                  == (True, "fault_stop"))
+            # ③ idle 時間制門檻
+            _hold = CFG.AUTO_HOLD_STOP_SEC
+            check(f"idle 持續 {_hold - 0.1:.1f}s（未達 {_hold}s）→ 不結束",
+                  _sess_for_end(idle_ago=_hold - 0.1).should_auto_end() == (False, None))
+            check(f"idle 持續 {_hold}s → (True, auto_stop)",
+                  _sess_for_end(idle_ago=_hold).should_auto_end() == (True, "auto_stop"))
+            check("非 idle（_idle_since=None）→ 不結束",
+                  _sess_for_end(idle_ago=None).should_auto_end() == (False, None))
+            check("idle_held_seconds()：未 idle 回 0.0",
+                  _sess_for_end(idle_ago=None).idle_held_seconds() == 0.0)
+            _s_hold = _sess_for_end(idle_ago=30.0)
+            check(f"idle_held_seconds()：約 30s（實際 {_s_hold.idle_held_seconds():.1f}s）",
+                  29.0 <= _s_hold.idle_held_seconds() <= 31.0)
+            # 以假時鐘大幅推進「系統時間」，idle 秒數不得受影響（證明用 monotonic）
+            _clk_bak = clk["dt"]
+            clk["dt"] = clk["dt"] + timedelta(hours=5)
+            check("系統時間推進 5 小時，idle_held_seconds 不變（monotonic 而非系統時間）",
+                  29.0 <= _s_hold.idle_held_seconds() <= 31.0)
+            clk["dt"] = _clk_bak
+            # ④ AUTO_END_TIMEOUT_SEC
+            check(f"AUTO_END_TIMEOUT_SEC={CFG.AUTO_END_TIMEOUT_SEC}（0＝不限）→ 長時間不觸發 timeout",
+                  CFG.AUTO_END_TIMEOUT_SEC == 0
+                  and _sess_for_end(elapsed_ago=99999).should_auto_end() == (False, None))
+            _bak_to = CFG.AUTO_END_TIMEOUT_SEC
+            try:
+                CFG.AUTO_END_TIMEOUT_SEC = 600
+                check("AUTO_END_TIMEOUT_SEC=600 且 elapsed=601s → (True, timeout)",
+                      _sess_for_end(elapsed_ago=601).should_auto_end() == (True, "timeout"))
+                check("AUTO_END_TIMEOUT_SEC=600 且 elapsed=599s → 不結束",
+                      _sess_for_end(elapsed_ago=599).should_auto_end() == (False, None))
+            finally:
+                CFG.AUTO_END_TIMEOUT_SEC = _bak_to
+            # ⑤ _idle_streak 保留但不參與判定
+            _s_streak = _sess_for_end(idle_ago=None)
+            _s_streak._idle_streak = 9999
+            check("_idle_streak 極大但 _idle_since=None → 仍不結束（次數不再是依據）",
+                  _s_streak.should_auto_end() == (False, None))
+            check("_idle_streak 欄位仍保留（供 Debug / 統計）",
+                  hasattr(_s_streak, "_idle_streak"))
+            # ⑥ resume 後 _idle_since 重新起算、且不寫入 session_state.json
+            check("新建 Session 的 _idle_since 為 None（不沿用）",
+                  _sess_for_end().  _idle_since is None)
+            _st_keys = _load_json_file(os.path.join(folder, CFG.FILE_SESSION_STATE)) or {}
+            check("session_state.json 不含 _idle_since（monotonic 不可持久化）",
+                  "_idle_since" not in _st_keys)
+            _resumed = ReportSession.resume(folder, object(), now_fn=lambda: clk["dt"])
+            check("resume() 後 _idle_since 為 None（重新計時）", _resumed._idle_since is None)
+        except Exception as e:
+            check(f"should_auto_end 驗證發生例外：{e}", False)
     finally:
         read_all = orig
         _fetch_cell_packs = orig_fetch
+
+    # ---- Finalize 輸出重試（Phase 3.7）：只重試檔案占用、且必須驗證「實際呼叫次數」----
+    print("\n[驗證：Finalize 輸出重試]")
+    try:
+        check(f"CFG.FINALIZE_RETRY_MAX = 3（實際 {CFG.FINALIZE_RETRY_MAX}）",
+              CFG.FINALIZE_RETRY_MAX == 3)
+        _W = CFG.FINALIZE_RETRY_WAIT_SEC
+
+        def _probe(seq):
+            """依 seq 逐次回傳/拋出；回傳 (status, value, attempts, calls, waits)。"""
+            box = {"n": 0}
+            waits = []
+
+            def _fn():
+                box["n"] += 1
+                item = seq[min(box["n"] - 1, len(seq) - 1)]
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+            _st, _v, _a = _retry_file_op("probe", _fn, sleep_fn=waits.append)
+            return _st, _v, _a, box["n"], waits
+
+        # ① PermissionError ×2 → 第 3 次成功：實際呼叫必須是 3
+        s, v, a, n, w = _probe([PermissionError(13, "locked"), PermissionError(13, "locked"), True])
+        check(f"重試①：PermissionError×2 後成功 → 實際呼叫 {n} 次（須為 3）", n == 3)
+        check(f"重試①：attempts 回報 {a}（須為 3）", a == 3)
+        check(f"重試①：狀態 ok、值 True（實際 {s}/{v}）", s == CFG.OUTPUT_OK and v is True)
+        check(f"重試①：等待 2 次 × {_W}s（實際 {w}）", w == [_W, _W])
+
+        # ② 回傳 False（既有函式自行吞掉 OSError 的表示法）同樣可重試
+        s, v, a, n, w = _probe([False, False, True])
+        check(f"重試②：False×2 後成功 → 實際呼叫 {n} 次（須為 3）", n == 3)
+        check(f"重試②：狀態 ok（實際 {s}）", s == CFG.OUTPUT_OK)
+
+        # ③ 重試耗盡 → failed_locked、呼叫滿 MAX 次、**不拋例外**
+        s, v, a, n, w = _probe([PermissionError(13, "locked")])
+        check(f"重試③：始終鎖檔 → 呼叫 {n} 次（= MAX {CFG.FINALIZE_RETRY_MAX}）",
+              n == CFG.FINALIZE_RETRY_MAX)
+        check(f"重試③：狀態 failed_locked（實際 {s}）", s == CFG.OUTPUT_FAILED_LOCKED)
+        check(f"重試③：等待 {len(w)} 次（= MAX-1）", len(w) == CFG.FINALIZE_RETRY_MAX - 1)
+
+        # ④ 回傳 None = 不適用 → skipped，**只呼叫 1 次、完全不等待**
+        #    （write_meter_report 的「無電表 Log」走這條；若誤判為可重試，每次收尾都白等）
+        s, v, a, n, w = _probe([None])
+        check(f"重試④：None → skipped（實際 {s}）", s == CFG.OUTPUT_SKIPPED)
+        check(f"重試④：只呼叫 {n} 次、等待 {len(w)} 次（皆須為 1/0）", n == 1 and w == [])
+
+        # ⑤ 程式邏輯錯誤 → failed，只呼叫 1 次，不重試也不拋出
+        s, v, a, n, w = _probe([TypeError("bug")])
+        check(f"重試⑤：TypeError → failed（實際 {s}）", s == CFG.OUTPUT_FAILED)
+        check(f"重試⑤：只呼叫 {n} 次、不等待（不重試程式錯誤）", n == 1 and w == [])
+        for _exc in (KeyError("k"), AttributeError("a"), ValueError("v")):
+            _s2, _v2, _a2, _n2, _w2 = _probe([_exc])
+            check(f"重試⑤：{type(_exc).__name__} 不重試（呼叫 {_n2} 次）",
+                  _n2 == 1 and _s2 == CFG.OUTPUT_FAILED)
+
+        # ⑥ 成功值為 dict（write_meter_report 的成功型別）→ 視為 ok 並原樣帶回
+        s, v, a, n, w = _probe([{"xlsx_name": "m.xlsx"}])
+        check("重試⑥：dict 回傳視為成功並原樣帶回",
+              s == CFG.OUTPUT_OK and v == {"xlsx_name": "m.xlsx"} and n == 1)
+    except Exception as e:
+        check(f"Finalize 輸出重試驗證發生例外：{e}", False)
+
+    # ---- Finalize 三階段與 client_lock 範圍（Phase 3.7）----
+    print("\n[驗證：Finalize 三階段 / client_lock 只包網路階段]")
+    try:
+        class _RecLock:
+            """記錄持有深度的假鎖：用來證明 ②③ 執行期間並未持有 client 鎖。"""
+
+            def __init__(self):
+                self.depth = 0
+                self.entered = 0
+
+            def __enter__(self):
+                self.depth += 1
+                self.entered += 1
+                return self
+
+            def __exit__(self, *_a):
+                self.depth -= 1
+                return False
+
+        class _FakeSess:
+            """只實作三階段的替身：驗證 finalize() 本身的編排，不觸網、不寫檔。"""
+
+            def __init__(self, lk):
+                self._lk = lk
+                self.order = []
+                self.depth_at = {}
+                self.status = CFG.SESSION_RECORDING
+                self.status_seen = {}
+
+            def _prepare_finalize(self, end_reason):
+                self.order.append("prepare")
+                self.depth_at["prepare"] = self._lk.depth
+                self.end_reason = end_reason
+
+            def _write_outputs(self):
+                self.order.append("write")
+                self.depth_at["write"] = self._lk.depth
+                self.status_seen["write"] = self.status
+                return {"duration_seconds": 12.5}
+
+            def _finalize_cleanup(self, stats):
+                self.order.append("cleanup")
+                self.depth_at["cleanup"] = self._lk.depth
+                self.status_seen["cleanup_in"] = self.status
+                self.stats_seen = stats
+                self.status = CFG.SESSION_COMPLETED
+
+        _lk = _RecLock()
+        _fs = _FakeSess(_lk)
+        _out = ReportSession.finalize(_fs, "auto_stop", client_lock=_lk)
+        check(f"三階段依序各執行一次（實際 {_fs.order}）",
+              _fs.order == ["prepare", "write", "cleanup"])
+        check("① _prepare_finalize 期間持有 client_lock", _fs.depth_at.get("prepare") == 1)
+        check("② _write_outputs 期間**未**持有 client_lock（Excel/CSV 不鎖 client）",
+              _fs.depth_at.get("write") == 0)
+        check("③ _finalize_cleanup 期間**未**持有 client_lock",
+              _fs.depth_at.get("cleanup") == 0)
+        check("client_lock 只進入一次（僅①）", _lk.entered == 1 and _lk.depth == 0)
+        check("finalize() 回傳 _write_outputs() 的 stats", _out == {"duration_seconds": 12.5})
+        check("③ 收到 ② 產出的 stats", getattr(_fs, "stats_seen", None) == _out)
+        check("end_reason 於①寫入", _fs.end_reason == "auto_stop")
+        # status=completed 必須在③才成立（②寫輸出期間對外仍不可宣告 completed）
+        check("② 執行時 status 尚非 completed（completed 代表流程走完，非輸出全成功）",
+              _fs.status_seen.get("write") == CFG.SESSION_RECORDING)
+        check("③ 進入時 status 仍非 completed", _fs.status_seen.get("cleanup_in") == CFG.SESSION_RECORDING)
+        check("③ 結束後 status = completed", _fs.status == CFG.SESSION_COMPLETED)
+
+        # 不傳 client_lock（standalone run_all / selftest）→ 等同無鎖，行為一致
+        _lk2 = _RecLock()
+        _fs2 = _FakeSess(_lk2)
+        _out2 = ReportSession.finalize(_fs2, "completed")
+        check("未傳 client_lock 仍正常完成三階段（standalone 相容）",
+              _fs2.order == ["prepare", "write", "cleanup"] and _out2 == _out)
+        check("未傳 client_lock 時不曾進入任何鎖", _lk2.entered == 0)
+
+        # _finalize_cleanup 的實際判讀：有失敗項 → finalize_partial 且 status 仍 completed
+        class _EvSess:
+            _finalize_cleanup = ReportSession._finalize_cleanup
+
+            def __init__(self, ostatus):
+                self.output_status = ostatus
+                self.status = CFG.SESSION_RECORDING
+                self.events = []
+
+            def log_event(self, t, sev, detail=""):
+                self.events.append((t, sev, detail))
+
+            def _persist_state(self, stats=None):
+                self.persisted = self.status
+
+        _p = _EvSess({"xlsx": CFG.OUTPUT_FAILED_LOCKED, "meter_xlsx": CFG.OUTPUT_SKIPPED})
+        _p._finalize_cleanup({})
+        check("缺檔時記 finalize_partial（severity=warning）",
+              _p.events and _p.events[0][0] == "finalize_partial" and _p.events[0][1] == "warning")
+        check("finalize_partial 明列失敗項目", "xlsx=failed_locked" in _p.events[0][2])
+        check("finalize_partial 不列 skipped 項目（skipped 非失敗）",
+              "meter_xlsx" not in _p.events[0][2])
+        check("重試耗盡後 Session 仍為 completed（原始資料完整，不退回 recording）",
+              _p.status == CFG.SESSION_COMPLETED and _p.persisted == CFG.SESSION_COMPLETED)
+        _q = _EvSess({"xlsx": CFG.OUTPUT_OK, "plot_vis": CFG.OUTPUT_OK})
+        _q._finalize_cleanup({})
+        check("全數成功時記 finalize_ok（severity=info）",
+              _q.events and _q.events[0][0] == "finalize_ok" and _q.events[0][1] == "info")
+        _r = _EvSess({"xlsx": CFG.OUTPUT_FAILED})
+        _r._finalize_cleanup({})
+        check("OUTPUT_FAILED 亦計入 finalize_partial", _r.events[0][0] == "finalize_partial")
+
+        # 守門：②③ 不得出現任何網路呼叫（縮小 _CLIENT_LOCK 的正確性前提）
+        import re as _re
+        _src_all = open(__file__, encoding="utf-8").read()
+
+        def _fn_src(name):
+            """取出單一方法的**執行程式碼**：剝除 docstring 與註解，
+            否則說明文字裡提到的名稱會被守門誤判為實際呼叫。"""
+            _i = _src_all.index(f"\n    def {name}(")
+            _j = _src_all.index("\n    def ", _i + 10)
+            _b = _src_all[_i:_j]
+            _b = _re.sub(r'"""[\s\S]*?"""', "", _b)      # docstring
+            _b = _re.sub(r"#.*", "", _b)                  # 行內註解
+            return _b
+
+        for _stage in ("_write_outputs", "_finalize_cleanup"):
+            _body = _fn_src(_stage)
+            check(f"守門：{_stage}() 內無 self." + "client",
+                  ("self." + "client") not in _body)
+            check(f"守門：{_stage}() 內無 read" + "_all(", ("read" + "_all(") not in _body)
+            check(f"守門：{_stage}() 內無 _fetch_cell" + "_packs(",
+                  ("_fetch_cell" + "_packs(") not in _body)
+        _prep = _fn_src("_prepare_finalize")
+        check("守門：_prepare_finalize() 確為網路階段（含 read_all）", ("read" + "_all(") in _prep)
+        check("守門：_prepare_finalize() 不設定 completed（改由③）",
+              "SESSION_COMPLETED" not in _prep)
+        check("守門：_finalize_cleanup() 才設定 completed", "SESSION_COMPLETED" in _fn_src("_finalize_cleanup"))
+        check("守門：xlsx 失敗時 plot_vis 標 skipped（不沿用上一輪舊值）",
+              "_record_output(" + '"plot_vis", CFG.OUTPUT_SKIPPED)' in _fn_src("_write_xlsx"))
+
+        # ---- _sync_output_status()：--regen 補產後同步，避免 failed_locked 永久殘留 ----
+        _sd = os.path.join(output_root, "_p37_sync")
+        os.makedirs(_sd, exist_ok=True)
+        _before = {"session_id": "X", "status": CFG.SESSION_COMPLETED,
+                   "cumulative_charge_energy_kwh": 1.25,
+                   "output_status": {"xlsx": CFG.OUTPUT_FAILED_LOCKED}}
+        with open(os.path.join(_sd, CFG.FILE_SESSION_STATE), "w", encoding="utf-8") as _f:
+            json.dump(_before, _f, ensure_ascii=False)
+        check("_sync_output_status() 回報成功",
+              _sync_output_status(_sd, {"xlsx": CFG.OUTPUT_OK, "plot_vis": CFG.OUTPUT_OK}) is True)
+        _after = _load_json_file(os.path.join(_sd, CFG.FILE_SESSION_STATE)) or {}
+        check("補產後 output_status 已更新為 ok（不再殘留 failed_locked）",
+              _after.get("output_status") == {"xlsx": CFG.OUTPUT_OK, "plot_vis": CFG.OUTPUT_OK})
+        check("_sync_output_status() 不改動 status（regen 不得改變生命週期狀態）",
+              _after.get("status") == CFG.SESSION_COMPLETED)
+        check("_sync_output_status() 不改動其他欄位（累積電量原樣保留）",
+              _after.get("cumulative_charge_energy_kwh") == 1.25 and _after.get("session_id") == "X")
+        check("無 session_state.json 時回 False（不拋例外）",
+              _sync_output_status(os.path.join(output_root, "_p37_none"), {}) is False)
+        _regen_src = _src_all[_src_all.index("\ndef regenerate_report("):]
+        _regen_src = _regen_src[:_regen_src.index("\ndef ", 10)]
+        check("守門：regenerate_report() 補產後會同步 output_status",
+              "_sync_output_status(folder, sess.output_status)" in _regen_src)
+        check("守門：regenerate_report() 未改用 _persist_state（那會覆寫整份狀態檔）",
+              "_persist_state" not in _regen_src)
+    except Exception as e:
+        check(f"Finalize 三階段驗證發生例外：{e}", False)
 
     # ---- Cell Volt. / Cell Temp. 工作表（主報告：phase③ finalize 產出）----
     print("\n[驗證：Cell Volt. / Cell Temp. 工作表]")
@@ -3795,6 +4865,51 @@ def _fetch_alarm_zh_map():
         return {}
 
 
+def attach_meter_csv(folder, csv_path):
+    """
+    把外部電表 Log 複製進 session 資料夾（保留原始檔名以維持可追溯性），供 --regen 產生
+    ESS_Meter_Report.xlsx。已存在同名檔則不覆蓋。回傳資料夾內的路徑，失敗回傳 None。
+    """
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder):
+        print(f"[METER] 找不到 session 資料夾：{folder}")
+        return None
+    if not os.path.exists(csv_path):
+        print(f"[METER] 找不到電表 Log：{csv_path}")
+        return None
+    dst = os.path.join(folder, os.path.basename(csv_path))
+    if os.path.abspath(csv_path) == dst:
+        return dst
+    if os.path.exists(dst):
+        print(f"[METER] 已存在，不覆蓋：{os.path.basename(dst)}")
+        return dst
+    shutil.copy2(csv_path, dst)
+    print(f"[METER] 已複製電表 Log → {os.path.basename(dst)}")
+    return dst
+
+
+def _sync_output_status(folder, output_status):
+    """
+    **只**更新 session_state.json 的 output_status，其餘欄位原樣保留（Phase 3.7）。
+
+    供 --regen 補產後同步用。刻意不走 sess._persist_state()：那會用 regen 由 CSV
+    重建的 session 覆寫整份狀態檔（status / 起訖時間 / 累積電量），而 regen 的職責
+    是重產報表，**不得改變 Session 的生命週期狀態**。
+    """
+    p = os.path.join(folder, CFG.FILE_SESSION_STATE)
+    st = _load_json_file(p)
+    if not isinstance(st, dict):
+        return False
+    st["output_status"] = dict(output_status or {})
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"  [警告] 更新 {CFG.FILE_SESSION_STATE} 的 output_status 失敗：{e}")
+        return False
+    return True
+
+
 def regenerate_report(folder, backup_name=None):
     """
     用『唯一的 _write_xlsx』重產指定 session 資料夾的 report.xlsx（與 finalize/selftest 同一函式）。
@@ -3844,6 +4959,9 @@ def regenerate_report(folder, backup_name=None):
         shutil.copy2(xlsx, bak)
         print(f"[REGEN] 已備份原報表 → {os.path.basename(bak)}")
 
+    # 電表報告：資料夾內有 meter Log 就一併重產（須在 _write_xlsx 前，Summary 參照區塊要用其結果）
+    sess._write_meter_report()
+
     orig_now = _now_str
     if sess_blk.get("end_time"):
         _now_str = lambda: sess_blk["end_time"]              # Summary「結束時間」顯示原值
@@ -3851,6 +4969,9 @@ def regenerate_report(folder, backup_name=None):
         ok = sess._write_xlsx(stats)                         # 唯一 Excel 產生函式；回傳是否成功寫入
     finally:
         _now_str = orig_now
+    # 同步 output_status（Phase 3.7）：否則先前 Retry 耗盡寫下的 failed_locked 會永久殘留，
+    # 使用者關掉 Excel 補產成功後，狀態檔仍宣稱缺檔 —— 那比沒有這個欄位更糟。
+    _sync_output_status(folder, sess.output_status)
     if not ok:
         print(f"[REGEN] ✗ report.xlsx 寫入失敗（未更新）：{xlsx}")
         print("        請先關閉 Excel 中開啟的 report.xlsx，再重新執行 --regen。")
@@ -3876,12 +4997,17 @@ def main():
                     help="以最新 _write_xlsx 重產指定 session 資料夾的 report.xlsx（備份原檔、不動原始資料）")
     ap.add_argument("--backup-name", default=None,
                     help="--regen 時原 report.xlsx 的備份檔名（預設 report_backup_YYYYMMDD_HHMMSS.xlsx）")
+    ap.add_argument("--meter-csv", metavar="CSV", default=None,
+                    help="搭配 --regen：先把電表 Log 複製進 session 資料夾，再產生 "
+                         "ESS_Meter_Report.xlsx（原始檔名保留；不覆蓋既有同名檔）")
     args = ap.parse_args()
 
     if args.selftest:
         selftest()
         return
     if args.regen:
+        if args.meter_csv:
+            attach_meter_csv(args.regen, args.meter_csv)
         regenerate_report(args.regen, backup_name=args.backup_name)
         return
     run_live(args.action, args.power, args.mode, args.duration, args.interval,

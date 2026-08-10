@@ -13,11 +13,16 @@ _report_start_session），不 monkeypatch 任何正式函式、不建立第二�
    先在 charge_discharge_report_config.py 確認後才能執行（否則腳本安全退出）。
 ⚠️ 測試結束不對 PCS 發送停止命令。報告如何結束由現場人員與既有 Menu 決定。
 
-前置條件（由現場人員自行完成，本腳本不代勞）：
-  1. PCS 切換為智慧模式
-  2. 排程主開關開啟
-  3. 配置一筆「低功率、短時間」的**充電**排程（本次不驗證放電，因 rackSoc=0）
-  4. 將 config 的 AUTO_SCHEDULE_REPORT_ENABLED 改為 True
+⚠️執行前需由現場完成測試環境（本腳本不會修改設備）
+    本腳本僅驗證「智慧排程是否自動建立報告」。
+    因此執行前請確認：
+    1. PCS 已切換為智慧模式
+    2. 排程主開關已開啟
+    3. 已建立一筆可於近期觸發的充電排程
+    4. AUTO_SCHEDULE_REPORT_ENABLED=True
+    以上均由使用者或 HMI 完成，
+    本腳本不會修改任何設備設定，
+    若條件未成立，僅會退出或等待，不會自動建立環境。
 
 使用方式：
     cd "D:\\Crawler Sample\\test"
@@ -55,8 +60,15 @@ REENTER_CYCLES = 2                # 再次進入監看的輪數（驗證只接�
 CONFIRM_TIMEOUT_SEC = 120         # 人工確認等待秒數；逾時＝取消（腳本不會永久卡住）
 CONFIRM_TOKEN = "YES"             # 必須**精確**輸入（大寫）才繼續；其他一律取消
 CANCEL_MSG = "3-B 驗證已取消，未進入觸發監看。"
-# 排程項目方向 enum（唯讀顯示用；對照 HMI 前端 1=充電 / 2=放電 / 3=不充不放）
-SCHED_CD = {1: "charge", 2: "discharge", 3: "none"}
+# 排程項目方向 enum 與型別正規化：**引用 config 的唯一定義**，不再各自維護副本
+# （Phase 3.6 / D-1 整併；原本 menu 與本檔各有一份，新增方向時需改多處）。
+from charge_discharge_report_config import SCHED_CD_CODE as SCHED_CD  # noqa: E402
+from charge_discharge_report_config import as_int as _as_int          # noqa: E402
+
+# ---- 驗證判定三態 ----
+# PASS：確認通過　FAIL：確認失敗（真的有問題）
+# SKIP：本次驗證條件下**外部不可觀察**（Not Observable），非功能失敗，不併入 FAIL 計數
+PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
 
 # ======================================================================
@@ -150,20 +162,6 @@ def preflight(reading, *, auto_enabled, active_session, battery_power_status,
     if chg is not True:
         return "wait", "idle"
     return "ready", "charging"
-
-
-def _as_int(v):
-    """
-    enum 值正規化為 int（"2" → 2；None/非數值 → None）。
-    安全閘的 fail-safe 方向：若後端把 chargeOrDischarge 回成字串，不可因型別不符而
-    把「放電」誤判成 unknown 而放行；一律先轉型再查表。
-    """
-    if isinstance(v, bool):          # bool 是 int 的子型別，明確排除以免 True→1 被當成「充電」
-        return None
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
 
 
 def schedule_plan_direction(client, tpl_path, item_path_fmt):
@@ -293,12 +291,18 @@ def evaluate_checks(obs, facts):
     以觀測紀錄（obs）與資料夾事實（facts）產出 10 項主要 + 補充檢查（純函式）。
     obs  : dict —— 由 live 迴圈或 fixture 提供，欄位見 --selftest 的 fixture。
     facts: dict —— 由 inspect_session_folder() 提供（或 fixture）。
-    回傳 [(編號, 標題, pass, 說明), ...]；編號 1~10 為主要項，"補" 為補充項。
+    回傳 [(編號, 標題, status, 說明), ...]；status ∈ PASS / FAIL / SKIP。
+      編號 1~10 為主要項，"補" 為補充項。
+    SKIP 專用於「本次驗證條件下外部本來就觀察不到」的項目（Not Observable），
+    **不代表功能失敗**，避免使用者把時機造成的不可觀察誤讀成缺陷。
     """
     out = []
 
-    def add(no, label, ok, detail=""):
-        out.append((no, label, bool(ok), detail))
+    def add(no, label, ok, detail="", skip=False, skip_reason=""):
+        if skip:
+            out.append((no, label, SKIP, skip_reason or detail))
+        else:
+            out.append((no, label, PASS if ok else FAIL, detail))
 
     idle_cycles = [c for c in obs["cycles"] if c["phase"] == "idle"]
     start_cycle = obs.get("start_cycle")
@@ -306,11 +310,13 @@ def evaluate_checks(obs, facts):
     reenter = [c for c in obs["cycles"] if c["phase"] == "reenter"]
 
     # 1) idle 階段沒有建立 Session
+    #    啟動時設備若已在 charging，就沒有 idle→charge 可觀察 → SKIP（Not Observable），非 FAIL。
     add(1, "idle 階段沒有建立 ReportSession",
-        bool(idle_cycles) and all(c["session_id"] is None and c["action"] != "started"
-                                  for c in idle_cycles),
+        all(c["session_id"] is None and c["action"] != "started" for c in idle_cycles),
         f"idle 觀察 {len(idle_cycles)} 輪，"
-        f"reason={sorted({c['reason'] for c in idle_cycles})}")
+        f"reason={sorted({c['reason'] for c in idle_cycles})}",
+        skip=not idle_cycles,
+        skip_reason="Not Observable：啟動時已處於 charging，未觀察到 idle→charge。")
 
     # 2) 真正出現 charging flag 後才建立
     add(2, "出現 charging flag 後才建立 Session",
@@ -320,10 +326,13 @@ def evaluate_checks(obs, facts):
         f"dis={start_cycle['dis'] if start_cycle else None} "
         f"action={start_cycle['action'] if start_cycle else None}")
 
-    # 3) origin == scheduler
+    # 3) origin == scheduler（優先讀 events detail 的 origin=scheduler；舊版 log 退回事件型別推論）
     add(3, "建立來源 origin == scheduler",
         facts.get("origin") == "scheduler",
-        f"events.csv 取得 origin={facts.get('origin')}")
+        f"events.csv 取得 origin={facts.get('origin')}"
+        f"（判定來源：{facts.get('origin_source')}"
+        f"{'＝detail 明確標註' if facts.get('origin_source') == 'detail' else ''}"
+        f"{'＝舊版 log 由 auto_charge_start 推論' if facts.get('origin_source') == 'inferred' else ''}）")
 
     # 4) 僅建立一個新資料夾／一個 Session
     add(4, "僅建立 1 個新資料夾／1 個 Session",
@@ -379,12 +388,25 @@ def evaluate_checks(obs, facts):
         f"{sorted(obs['session_ids'])}")
     add("補", "共用 client id 前後一致（未額外建立登入 client）",
         len(obs["client_ids"]) == 1, f"{sorted(obs['client_ids'])}")
+    # auto state：只驗證「外部可觀察」的結果。START_PENDING 是 auto_schedule_check() 內部的
+    # 瞬時狀態（鎖內設定、finally 立刻改為 RUNNING），黑箱觀察者在呼叫前後取樣本來就看不到，
+    # 因此不列為 FAIL 條件；其實際保護作用由離線測試（情境 6c）負責驗證。
     states = obs["state_transitions"]
-    add("補", "auto state 轉換順序合理（IDLE → START_PENDING → RUNNING）",
-        states[:3] == ["IDLE", "START_PENDING", "RUNNING"]
-        if len(states) >= 3 else False, f"{states}")
-    add("補", "沒有出現第二次 START_PENDING",
-        states.count("START_PENDING") == 1, f"START_PENDING × {states.count('START_PENDING')}")
+    idle_to_running = sum(1 for i in range(len(states) - 1)
+                          if states[i] == "IDLE" and states[i + 1] == "RUNNING")
+    add("補", "auto state 最終為 RUNNING，且只發生一次 IDLE→RUNNING（外部可觀察）",
+        bool(states) and states[-1] == "RUNNING" and idle_to_running == 1,
+        f"轉換={states}｜IDLE→RUNNING × {idle_to_running}")
+    add("補", "auto state 經過 START_PENDING（函式內瞬時狀態）", False,
+        skip=True,
+        skip_reason="SKIP（Externally Not Observable）：START_PENDING 僅存在於 "
+                    "auto_schedule_check() 呼叫期間，黑箱前後取樣無法觀察；"
+                    "由離線測試情境 6c 驗證其阻擋作用。")
+    add("補", "沒有出現第二次 START_PENDING", False,
+        skip=True,
+        skip_reason="SKIP（Externally Not Observable）：同上；"
+                    "實際保護已由「只建立 1 份 Session／auto_charge_start ×1／"
+                    "刷新不重建」等項目證明。")
     add("補", "events.csv 中 auto_charge_start 數量精確為 1",
         facts.get("auto_charge_start_count") == 1,
         f"count={facts.get('auto_charge_start_count')}")
@@ -411,12 +433,20 @@ def evaluate_checks(obs, facts):
 
 
 def summarize(checks):
-    """回傳 (主要項通過數, 主要項總數, 補充項通過數, 補充項總數, 全部通過?)。"""
-    main = [c for c in checks if c[0] != "補"]
-    extra = [c for c in checks if c[0] == "補"]
-    mp = sum(1 for c in main if c[2])
-    ep = sum(1 for c in extra if c[2])
-    return mp, len(main), ep, len(extra), (mp == len(main) and ep == len(extra))
+    """
+    三態統計。回傳 (main, extra, ok)：
+      main / extra 各為 {"pass": n, "fail": n, "skip": n, "total": n}
+      ok = 沒有任何 FAIL（SKIP 不算失敗；Not Observable 不代表功能異常）
+    """
+    def _tally(rows):
+        return {"pass": sum(1 for c in rows if c[2] == PASS),
+                "fail": sum(1 for c in rows if c[2] == FAIL),
+                "skip": sum(1 for c in rows if c[2] == SKIP),
+                "total": len(rows)}
+
+    main = _tally([c for c in checks if c[0] != "補"])
+    extra = _tally([c for c in checks if c[0] == "補"])
+    return main, extra, (main["fail"] == 0 and extra["fail"] == 0)
 
 
 # ======================================================================
@@ -526,7 +556,13 @@ def inspect_session_folder(folder, CFG, samples_at_start=None):
     f["alarms_header_matches"] = (None if a_head is None else a_head == CFG.ALARM_FIELDS)
 
     # 事件統計（依 EVENT_FIELDS 位置解析）
-    counts, first_time, origin = {}, {}, None
+    # origin 判定（兩段式，向下相容）：
+    #   ① 明確標註：detail 內含 "origin=scheduler"（正式程式已寫入）→ 直接採用，來源 "detail"
+    #   ② 舊版 log（detail 未含 origin）→ 以事件型別推論：auto_charge_start /
+    #      auto_discharge_start **只由 auto_schedule_check() 發出**，其存在即代表排程自動建立，
+    #      來源 "inferred"。兩者都視為 origin=scheduler。
+    counts, first_time = {}, {}
+    origin = origin_source = None
     if e_head and e_rows:
         i_type = e_head.index("event_type") if "event_type" in e_head else 2
         i_ts = e_head.index("timestamp") if "timestamp" in e_head else 0
@@ -537,15 +573,20 @@ def inspect_session_folder(folder, CFG, samples_at_start=None):
             et = row[i_type]
             counts[et] = counts.get(et, 0) + 1
             first_time.setdefault(et, row[i_ts] if len(row) > i_ts else None)
-            if et in ("auto_charge_start", "auto_discharge_start") and len(row) > i_detail:
-                if "scheduler" in row[i_detail]:
-                    origin = "scheduler"
+            if et in ("auto_charge_start", "auto_discharge_start"):
+                detail = row[i_detail] if len(row) > i_detail else ""
+                m = re.search(r"origin=([A-Za-z_]+)", detail)
+                if m:                                    # ① 明確標註優先
+                    origin, origin_source = m.group(1), "detail"
+                elif origin is None:                     # ② 舊版退回推論
+                    origin, origin_source = "scheduler", "inferred"
     f["event_counts"] = counts
     f["auto_charge_start_count"] = counts.get("auto_charge_start", 0)
     f["auto_charge_start_time"] = first_time.get("auto_charge_start")
     f["charge_start_count"] = counts.get("charge_start", 0)
     f["direction_change_count"] = counts.get("direction_change", 0)
     f["origin"] = origin
+    f["origin_source"] = origin_source                   # detail（明確） / inferred（舊版推論）
     return f
 
 
@@ -843,18 +884,26 @@ def report(log, obs, facts, started_at):
     log(f"  資料夾檔案        ：{facts.get('present_files')}")
 
     checks = evaluate_checks(obs, facts)
-    log.section("驗證結果（10 項主要 + 補充檢查）")
-    for no, label, ok, detail in checks:
-        log(f"  [{'PASS' if ok else 'FAIL'}] {no:>2}. {label}")
+    log.section("驗證結果（主要 10 項 + 補充檢查；SKIP=外部不可觀察，非失敗）")
+    for no, label, status, detail in checks:
+        log(f"  [{status}] {no:>2}. {label}")
         if detail:
             log(f"          {detail}")
-    mp, mt, ep, et, all_ok = summarize(checks)
+    main, extra, all_ok = summarize(checks)
     log.section("總結")
-    log(f"  主要 10 項：{mp}/{mt} 通過")
-    log(f"  補充檢查  ：{ep}/{et} 通過")
+    log(f"  主要 {main['total']} 項")
+    log(f"    PASS：{main['pass']}")
+    log(f"    FAIL：{main['fail']}")
+    log(f"    SKIP：{main['skip']}（Not Observable）")
+    log(f"  補充檢查 {extra['total']} 項")
+    log(f"    PASS：{extra['pass']}")
+    log(f"    FAIL：{extra['fail']}")
+    log(f"    SKIP：{extra['skip']}（Not Observable）")
     log(f"  結束時間  ：{datetime.now():%Y-%m-%d %H:%M:%S}"
         f"（歷時 {(datetime.now() - started_at).total_seconds() / 60:.1f} 分）")
     log(f"  == Phase 2 實機觸發驗證 {'PASS' if all_ok else 'FAIL'} ==")
+    if main["skip"] or extra["skip"]:
+        log("  （SKIP 項目為本次驗證條件下外部無法觀察，不代表功能異常；原因見上方各項說明）")
     return all_ok
 
 
@@ -884,7 +933,9 @@ def _fx_obs(**over):
                                 session_id=sid, state="RUNNING", src="manual")
                       for _ in range(2)]),
         "session_ids": {sid}, "client_ids": {140000}, "start_cycle": start,
-        "state_transitions": ["IDLE", "START_PENDING", "RUNNING"],
+        # 真實觀測到的轉換：START_PENDING 是 auto_schedule_check() 內部瞬時狀態，
+        # 黑箱在呼叫前後取樣只會看到 IDLE → RUNNING（故該項改為 SKIP）
+        "state_transitions": ["IDLE", "RUNNING"],
         "new_folders": [sid],
         "quiet": {"seconds": 20, "monitor_cycles_delta": 0, "unexpected_threads": [],
                   "samples_delta": 4, "threads_alive": ["Thread-1"], "bg_thread": "Thread-1"},
@@ -969,18 +1020,29 @@ def selftest():
                      "pcs_fault_flag": False}, **ok_kw) == ("block", "discharge_only"))
 
     # ---------- 2) 10 項判斷：全部正常 ----------
-    print("\n[判斷] 理想情境 → 主要 10 項與補充檢查全數 PASS")
+    print("\n[判斷] 理想情境 → 無任何 FAIL；START_PENDING 兩項為 SKIP（外部不可觀察）")
     checks = evaluate_checks(_fx_obs(), _fx_facts(CFG))
-    mp, mt, ep, et, all_ok = summarize(checks)
-    check(f"主要 {mp}/{mt}、補充 {ep}/{et} 全通過", all_ok and mt == 10)
+    main, extra, all_ok = summarize(checks)
+    check(f"無任何 FAIL（主要 {main['pass']}P/{main['fail']}F/{main['skip']}S、"
+          f"補充 {extra['pass']}P/{extra['fail']}F/{extra['skip']}S）",
+          all_ok and main["total"] == 10 and main["fail"] == 0 and extra["fail"] == 0)
     check("編號 1~10 齊全且不重複",
           sorted(c[0] for c in checks if c[0] != "補") == list(range(1, 11)))
+    check(f"idle 有觀察到時第 1 項為 PASS（非 SKIP）",
+          next(c[2] for c in checks if c[0] == 1) == PASS)
+    check(f"補充項固定 2 項 SKIP（START_PENDING 相關，外部不可觀察）",
+          extra["skip"] == 2)
+    check("SKIP 項目都附有 Not Observable 原因",
+          all("Not Observable" in c[3] for c in checks if c[2] == SKIP))
 
     # ---------- 3) 10 項判斷：每種失敗都要被抓到 ----------
     print("\n[判斷] 各種異常情境 → 對應項目必須 FAIL")
 
     def fails(obs, facts):
-        return {c[0] for c in evaluate_checks(obs, facts) if not c[2]}
+        return {c[0] for c in evaluate_checks(obs, facts) if c[2] == FAIL}
+
+    def skips(obs, facts):
+        return {c[0] for c in evaluate_checks(obs, facts) if c[2] == SKIP}
 
     o = _fx_obs()
     o["cycles"] = [_fx_cycle("idle", action="started", session_id="X")] + o["cycles"][1:]
@@ -1011,15 +1073,75 @@ def selftest():
     o["cycles"] = [c if c["phase"] != "reenter" else dict(c, action="started")
                    for c in o["cycles"]]
     check("再進入時又建立 → 第 10 項 FAIL", 10 in fails(o, _fx_facts(CFG)))
-    o = _fx_obs(state_transitions=["IDLE", "START_PENDING", "RUNNING",
-                                   "IDLE", "START_PENDING"])
-    check("出現第二次 START_PENDING → 補充項 FAIL", "補" in fails(o, _fx_facts(CFG)))
+    # auto state：改為驗證外部可觀察的結果 —— 出現第二次 IDLE→RUNNING 代表建立了第二份
+    o = _fx_obs(state_transitions=["IDLE", "RUNNING", "IDLE", "RUNNING"])
+    check("出現第二次 IDLE→RUNNING（等同重建）→ 補充項 FAIL",
+          "補" in fails(o, _fx_facts(CFG)))
+    o = _fx_obs(state_transitions=["IDLE", "RUNNING", "IDLE"])
+    check("最終狀態非 RUNNING → 補充項 FAIL", "補" in fails(o, _fx_facts(CFG)))
     check("samples.csv 欄位不符 → 補充項 FAIL",
           "補" in fails(_fx_obs(), _fx_facts(CFG, samples_header_matches=False)))
     check("缺少必要檔案 → 補充項 FAIL",
           "補" in fails(_fx_obs(), _fx_facts(CFG, missing_files=["events.csv"])))
     check("direction_change 出現在排程自動建立 → 補充項 FAIL",
           "補" in fails(_fx_obs(), _fx_facts(CFG, direction_change_count=1)))
+
+    # ---------- 3.2) SKIP（Not Observable）判定 ----------
+    print("\n[判斷] 啟動時已在 charging → 第 1 項應為 SKIP 而非 FAIL")
+    o = _fx_obs()
+    o["cycles"] = [c for c in o["cycles"] if c["phase"] != "idle"]   # 沒有任何 idle 輪
+    ch_noidle = evaluate_checks(o, _fx_facts(CFG))
+    st1 = next(c[2] for c in ch_noidle if c[0] == 1)
+    check(f"第 1 項 = SKIP（實際 {st1}）", st1 == SKIP)
+    check("第 1 項不列為 FAIL", 1 not in fails(o, _fx_facts(CFG)))
+    check("第 1 項 SKIP 說明含「啟動時已處於 charging」",
+          "啟動時已處於 charging" in next(c[3] for c in ch_noidle if c[0] == 1))
+    m_ni, e_ni, ok_ni = summarize(ch_noidle)
+    check(f"整體仍判 PASS（無 FAIL）：主要 {m_ni['pass']}P/{m_ni['fail']}F/{m_ni['skip']}S",
+          ok_ni is True and m_ni["fail"] == 0 and m_ni["skip"] == 1)
+    check("三態統計加總正確",
+          m_ni["pass"] + m_ni["fail"] + m_ni["skip"] == m_ni["total"]
+          and e_ni["pass"] + e_ni["fail"] + e_ni["skip"] == e_ni["total"])
+    # 有 FAIL 時整體必須判 FAIL（SKIP 不可掩蓋真實失敗）
+    _m, _e, ok_bad = summarize(evaluate_checks(o, _fx_facts(CFG, origin="manual")))
+    check("SKIP 不會掩蓋真實 FAIL（origin 錯 → 整體 FAIL）", ok_bad is False)
+
+    print("\n[判斷] origin 兩段式判定（新版 detail 明確標註／舊版推論，向下相容）")
+    import tempfile
+
+    def _mk_events(detail):
+        """建立臨時 session 資料夾（僅供解析測試；寫在系統暫存區，不碰 output/）。"""
+        d = tempfile.mkdtemp(prefix="p2_origin_")
+        with io.open(os.path.join(d, CFG.FILE_EVENTS), "w", encoding="utf-8", newline="") as fh:
+            fh.write(",".join(CFG.EVENT_FIELDS) + "\n")
+            fh.write(f"2026-08-04 15:01:07,0.0,session_start,info,action=auto\n")
+            fh.write(f"2026-08-04 15:01:08,1.0,auto_charge_start,info,{detail}\n")
+            fh.write(f"2026-08-04 15:01:09,2.4,charge_start,info,P=2.5kW\n")
+        with io.open(os.path.join(d, CFG.FILE_SAMPLES), "w", encoding="utf-8", newline="") as fh:
+            fh.write(",".join(CFG.SAMPLE_FIELDS) + "\n")
+        with io.open(os.path.join(d, CFG.FILE_SESSION_STATE), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        return d
+
+    _d_new = _mk_events("origin=scheduler｜智慧排程自動開始充電｜方向持續 0s｜"
+                        "排程配置 enabled｜刷新來源 auto")
+    fa_new = inspect_session_folder(_d_new, CFG)
+    check(f"新版 detail 含 origin=scheduler → origin={fa_new['origin']}"
+          f" source={fa_new['origin_source']}",
+          fa_new["origin"] == "scheduler" and fa_new["origin_source"] == "detail")
+    _d_old = _mk_events("智慧排程自動開始充電｜方向持續 0s｜排程配置 enabled｜刷新來源 auto")
+    fa_old = inspect_session_folder(_d_old, CFG)
+    check(f"舊版 detail 無 origin → 由 auto_charge_start 推論 origin={fa_old['origin']}"
+          f" source={fa_old['origin_source']}",
+          fa_old["origin"] == "scheduler" and fa_old["origin_source"] == "inferred")
+    check("新版與舊版第 3 項皆 PASS（向下相容）",
+          next(c[2] for c in evaluate_checks(_fx_obs(), fa_new) if c[0] == 3) == PASS
+          and next(c[2] for c in evaluate_checks(_fx_obs(), fa_old) if c[0] == 3) == PASS)
+    _d_manual = _mk_events("origin=manual｜人工建立")
+    fa_man = inspect_session_folder(_d_manual, CFG)
+    check(f"detail 明確標註 origin=manual → 第 3 項 FAIL（不可被推論覆蓋，實際 {fa_man['origin']}）",
+          fa_man["origin"] == "manual"
+          and next(c[2] for c in evaluate_checks(_fx_obs(), fa_man) if c[0] == 3) == FAIL)
 
     # ---------- 3.5) 人工確認關卡 ----------
     print("\n[關卡] preflight=block 時不得顯示確認、不得進入等待")

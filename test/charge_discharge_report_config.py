@@ -39,7 +39,7 @@ SCHEMA_VERSION = "1.4.0"     # 輸出資料結構版本（欄位/檔案結構變
 # False（預設）：Dashboard 仍每 15 秒讀取並顯示監看狀態，auto_schedule_check() 照常判斷
 #                並印出 Debug，但**不建立任何 ReportSession**（實機唯讀觀察階段用）。
 # True         ：條件全部成立時才允許自動建立報告（實機唯讀觀察通過後再由使用者手動改為 True）。
-AUTO_SCHEDULE_REPORT_ENABLED = False
+AUTO_SCHEDULE_REPORT_ENABLED = True
 
 # True ：每次刷新都印一行完整監看 Debug（實機唯讀觀察階段用，可看見每 15 秒確實在更新）
 # False：只在監看狀態「改變」時才印（日常使用，避免洗畫面）
@@ -87,6 +87,48 @@ FILE_CELL_SNAPSHOTS = "cell_snapshots.json"  # Cell 電壓/溫度歷史快照（
 #   同一 alarm_id_raw 永遠對應同一 alarm_code；重新產生報告不改號。
 FILE_ALARM_CODE_MAP = "alarm_code_mapping.json"
 
+# ======================================================================
+# 電表報告（ESS_Meter_Report.xlsx）— 獨立檔案，與 report.xlsx 並存
+# ======================================================================
+# 資料源與 report.xlsx 完全不同，刻意分成兩個檔案：
+#   report.xlsx            PCS/BMS API 遙測，5 秒取樣，kWh 由 kW 梯形積分而來
+#   ESS_Meter_Report.xlsx  電表 Log，1 秒取樣，kWh+/kWh- 為電表累計器直讀值
+# 兩者不混在同一份 Summary，避免「積分值」與「電表值」被誤讀為互相驗證過。
+# report.xlsx 的 Summary 只放一個 Meter Report 參照區塊（檔名/CSV/筆數/起訖時間），不放 KPI。
+FILE_METER_XLSX = "ESS_Meter_Report.xlsx"
+FILE_METER_CSV = "meter_log.csv"        # session 資料夾內的正規檔名
+METER_CSV_GLOB = "meter*.csv"           # 也接受保留原始檔名的 meter Log（保留可追溯性）
+
+# 模板位置（相對專案根）；只由 tools/make_ess_report_template.py 重建，正式流程只讀不寫
+METER_TEMPLATE_SUBDIR = "templates"
+METER_TEMPLATE_NAME = "ESS_Report_Template.xlsx"
+
+# 模板內的工作表／範圍（與 templates/ESS_Report_Template.xlsx 一致）
+METER_SHEET_SUMMARY = "Summary"
+METER_SHEET_RAW = "Raw Data"
+METER_SHEET_POWER = "Power Trend"
+METER_SHEET_ENERGY = "Energy Counter"
+METER_SHEET_COMBO = "Power + Energy"
+METER_TABLE_NAME = "RawData"
+METER_CHART_COL_FIRST = 9               # I 欄：降採樣後的 Chart Timestamp/kW/kWh+/kWh-
+METER_CHART_ROW_FIRST = 3
+
+# 圖表降採樣：Excel 二維圖表單一 series 上限 32,000 點，完整 meter Log 會超過。
+# 採 min/max per bucket（保留首筆、末筆與每個 bucket 的 kW 極值），不是固定每 N 筆抽樣。
+# Raw Data 一律保留完整資料；KPI 一律以完整資料計算，不使用降採樣結果。
+METER_CHART_POINTS = 4000
+
+# Y 軸 padding（資料跨距的百分比，再向外對齊整數刻度）。
+# 不用 Excel Auto Scale：跨距低於最大值約 1/6 時 Excel 會把最小值吸附到 0，
+# 使 ~90,000 的累計電量曲線被壓成水平直線。
+METER_PAD_POWER = 0.10                  # kW 軸：跨距 ±10%
+METER_PAD_ENERGY = 0.05                 # kWh 軸：跨距 ±5%
+
+# 數值格式
+METER_NF_DT = "yyyy-mm-dd hh:mm:ss"
+METER_NF_KW = "#,##0.00"
+METER_NF_COUNTER = "#,##0.0"
+
 # Session 狀態值
 SESSION_RECORDING = "recording"
 SESSION_PAUSED = "paused"
@@ -128,6 +170,7 @@ END_REASON = {
     "fault_stop": "故障停止",             # 背景偵測 PCS 故障
     "direction_switch": "方向切換",        # 充↔放切換：先結束舊 Session
     "pcs_stop": "PCS停止",
+    "battery_off": "電池下電",            # 背景偵測電池已下電（原落到 pcs_stop，語意不精確）
     "alarm_stop": "告警中止",
     "timeout": "執行超時",
     "communication_error": "通訊異常",
@@ -161,7 +204,182 @@ ALARM_LEVEL_UI = {"serious": "嚴重", "medium": "一般", "slight": "輕微"}
 # 觸發嚴重條件時是否讓「獨立監測模式」自動結束（True：偵測到即結束並標記對應 end_reason）。
 # 注意：這只影響「報告是否停止記錄」，**永遠不會**送出任何控制命令。
 AUTO_END_ON_CRITICAL = True
-# 連續判定為 idle / PCS 停止的取樣次數 → 視為充放電結束（pcs_stop / completed）
+
+# ======================================================================
+# 自動結束（should_auto_end）—— 唯一停止決策點所使用的門檻與白名單
+# ----------------------------------------------------------------------
+# ⚠️ should_auto_end() 是全專案唯一的自動停止判定入口。
+#    Menu / Dashboard / 背景取樣器都不得自行判斷是否結束報告。
+# ======================================================================
+# 排程結束後是否自動收尾（背景取樣器依 should_auto_end() 的判定 finalize）。
+# **True = 正式產品預設**：智慧排程自動建立報告，並於排程結束自動 finalize、產出 Summary/Excel。
+# False 僅供 Phase 3 開發／實機驗證／問題除錯時暫時關閉 —— 此時仍會照常判定並顯示
+# STOP_PENDING 與 idle 倒數，只是不收尾，需人工以 Menu 19 結束。
+AUTO_STOP_ENABLED = True
+
+# ----------------------------------------------------------------------
+# 去抖動（Debounce）與冷卻門檻 —— **全部集中於此，其他模組一律以 CFG. 引用**
+#
+# ⚠️ 不得在 device_control_menu.py 或任何地方另行宣告同名常數。
+#    （曾發生 menu 自行宣告 AUTO_HOLD_STOP_SEC = 30、與此處生效值 60 矛盾的情況）
+#
+# ⚠️ 三者一律以 time.monotonic() 計算「實際經過時間」，**不是**取樣/刷新次數：
+#      - Debounce 的門檻與累積值完全與 UI 解耦
+#      - Dashboard / （未來）Auto Monitor Service 只決定「多久呼叫一次
+#        auto_schedule_check()」，不影響 Debounce 的計算方式
+#      - 未來改由 Service 以更短週期呼叫時，Debounce 邏輯一行都不需要改，
+#        只是「判斷發生的時機」變密集、延遲變短
+#
+# 狀態流程（Phase 3.4 起固定）：
+#   IDLE → START_HOLD → START_PENDING → RUNNING → STOP_PENDING → AUTO_STOP
+#        → COOLDOWN → IDLE
+# ----------------------------------------------------------------------
+# charge/discharge 需**持續**多少秒才建立 Session（Start Debounce）。
+# 目的：濾掉設備旗標的瞬時抖動，避免誤建報告。
+# 取 15 秒的理由：足以擋掉單次誤判，且相較 30 秒可少漏約 15 秒的排程開頭資料。
+AUTO_HOLD_START_SEC = 15
+
+# idle 需**持續**多少秒才視為「已離開充放電」→ 以 auto_stop 結束（Stop Debounce）。
+# 只負責去抖動（濾掉旗標瞬時跳動與充↔放切換之間的短暫 idle），
+# **不負責**判斷排程是否真的結束（那是 Phase 3.5 的排程時段感知）。
+# 60 秒經 2026-08-06 實機驗證恰當：充電中兩次短暫 idle（27s / 16s）被吸收，
+# 真正結束時 idle 持續 61 秒觸發收尾。
+AUTO_HOLD_STOP_SEC = 60
+
+# ----------------------------------------------------------------------
+# 排程感知（Schedule Context）—— Phase 3.5
+#
+# schedule_ctx 由監看層計算後傳入 should_auto_end()，內容：
+#   {"in_window": bool, "current_plan": str|None,
+#    "next_plan_in_sec": float|None, "source": "ok"|"unknown"}
+# 決策仍 100% 留在 should_auto_end()；監看層只負責把 ctx 算出來。
+# schedule_ctx=None 或 source="unknown" → **完全退回 Phase 3.4 行為**。
+# ----------------------------------------------------------------------
+# 「下一段啟用排程即將開始」的門檻秒數：idle 已達門檻、但下段排程在此秒數內就要開始時，
+# 不收尾 —— 避免相鄰排程（如 Charge 17:00~17:50、Discharge 17:55~18:10）
+# 被拆成兩份報告而失去往返效率（RTE 只能在同一 Session 內計算）。
+#
+# **0 = 停用（Phase 3.5 初始值）**：schedule_ctx 仍完整計算與顯示，
+#   但 should_auto_end() 的判斷與 Phase 3.4 完全一致（idle ≥ AUTO_HOLD_STOP_SEC → auto_stop）。
+#   待 Context 經實機驗證正確後，改為 300 即可啟用，不需要修改任何程式流程。
+AUTO_NEXT_PLAN_GAP_SEC = 0
+
+# 排程窗口比對的寬限秒數（前後各放寬）。
+# 排程在**設備端**執行，但比對用的是 PC 時間；2026-08-07 實測設備 dataCollectTime
+# 較 PC 慢約 72 秒，故在窗口邊界前後各留 120 秒緩衝，避免邊界瞬間判斷相反。
+# 刻意不直接依賴 dataCollectTime（該值本身是「上次採集時間」，另有落後與失敗風險）。
+AUTO_WINDOW_GRACE_SEC = 120
+
+# 排程清單的快取秒數。背景取樣器每 5 秒一輪，若每輪都查會造成不必要的 API 負擔；
+# 且僅在 idle 開始累積（idle_held_seconds() > 0）時才查，idle=0 時完全不呼叫 API。
+AUTO_WINDOW_CACHE_SEC = 60
+
+# ----------------------------------------------------------------------
+# 孤兒 Session 防護（Phase 3.6）
+#
+# 孤兒＝session_state.json 停在 recording，但已無任何行程在取樣。
+# 實測兩次孤兒（2026-08-04）成因相同：行程**正常結束**但未走 main() 的 finally
+# （驗證腳本、任何 import device_control_menu 的工具都會如此），
+# 背景 daemon thread 被直接終止 → 狀態永遠停在 recording。
+#
+# 對策分兩層：
+#   ① atexit 保底：行程正常結束時把 Session 標記為 paused（只寫 JSON，不重產報表、
+#      不做網路 I/O）→ 最差情況從「recording 孤兒」變成「paused 可續接」。
+#   ② 啟動時分類：以 last_sample_time 與現在的間隔判斷是否為孤兒，**只記錄不改變流程**。
+#
+# ⚠️ Phase 3.6 刻意**不**加入「孤兒 + idle → 自動 finalize」與「Exit 時 finalize」。
+#    先把孤兒來源堵住（atexit），觀察是否仍有實際案例，再決定是否需要更積極的回收。
+# ----------------------------------------------------------------------
+# 判定「孤兒」的斷線間隔門檻（秒）：last_sample_time 距現在超過此值即記 orphan_detected。
+# **僅供分類與記錄，不改變 Resume 流程**（超過門檻仍照常續接）。
+# 300 秒 = 背景取樣間隔(5s) 的 60 倍，足以排除短暫卡頓造成的誤判。
+ORPHAN_GAP_SEC = 300
+
+# atexit 保底等待背景取樣執行緒結束的最長秒數。
+# 必須夠短 —— atexit 期間不可讓行程退出被長時間阻塞（背景執行緒為 daemon，
+# 逾時未結束也會隨行程一起被回收，狀態已先寫入故不影響資料）。
+ATEXIT_JOIN_TIMEOUT_SEC = 2
+
+# ----------------------------------------------------------------------
+# Finalize 輸出重試（Phase 3.7）
+# ----------------------------------------------------------------------
+# Excel / Chart / Meter 產出失敗最常見的原因是「檔案正被 Excel 開啟而鎖定」，
+# 這是暫時性的 —— 給有限次重試即可，不需要人工重跑整份報告。
+#
+# ⚠️ 只重試「檔案占用」類失敗（OSError / PermissionError，或既有函式以 False 表示的存檔失敗）。
+#    程式邏輯錯誤（TypeError / KeyError / AttributeError…）第一次就放棄：重試不會成功，
+#    只會拖慢收尾（自動收尾發生在背景執行緒，不應無謂延長）。
+FINALIZE_RETRY_MAX = 3           # 總嘗試次數（含第一次）；1 = 不重試
+FINALIZE_RETRY_WAIT_SEC = 2.0    # 每次重試前等待秒數（最壞情況 = (MAX-1) × 此值 × 輸出項數）
+
+# output_status 的值（寫入 session_state.json；**不寫入 summary.json**，避免變更 Summary schema）
+OUTPUT_OK = "ok"                      # 產生成功
+OUTPUT_SKIPPED = "skipped"            # 非錯誤而略過（無 openpyxl / 無電表 Log / 無模板）
+OUTPUT_FAILED_LOCKED = "failed_locked"  # 檔案占用，重試耗盡仍失敗
+OUTPUT_FAILED = "failed"              # 其他錯誤（未重試）
+
+# ----------------------------------------------------------------------
+# 排程項目方向 enum（**全專案唯一定義**）
+# device_control_menu.py 與 phase2_real_trigger_validation.py 一律引用此處，
+# 不得各自維護副本（Phase 3.6 / D-1 整併）。
+# 對照 HMI 前端：1=充電 / 2=放電 / 3=不充不放。
+# 註：menu 另有中文版 _SCHED_CD（僅供 TUI 顯示），與此表為同一組 enum 的兩種呈現。
+# ----------------------------------------------------------------------
+SCHED_CD_CODE = {1: "charge", 2: "discharge", 3: "none"}
+
+
+def as_int(v):
+    """
+    enum 值正規化為 int（**全專案唯一定義**）：`"2"` → `2`；bool/None/非數值 → `None`。
+
+    為何需要：後端若把 chargeOrDischarge 等 enum 回成字串，直接查 int-key 對照表會漏判
+    （安全閘會把「放電」誤判成 unknown 而放行）。一律先轉型再查表。
+    bool 明確排除 —— Python 中 bool 是 int 子型別，True 會被 int() 轉成 1（＝充電）。
+
+    註：本檔為純設定，此處僅有一個無外部相依的純函式，不含任何 API 呼叫。
+    """
+    if isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# 自動收尾（auto_stop）後的冷卻秒數；期間**一律不得建立新 Session**。
+# 設 60 秒（與 Stop Debounce 對稱）的理由：
+#   1. 避免設備停止後旗標短暫抖動，造成剛收尾又立刻建立第二份 Session
+#   2. 避免充↔放切換瞬間（charge→discharge / discharge→charge）被誤判為新的一輪
+#   3. 避免 Dashboard 與未來的 Auto Monitor Service 同時偵測時發生重複建立
+# 流程：Stop → idle 60s → Finalize → Cooldown 60s → 才允許再次建立
+AUTO_COOLDOWN_SEC = 60
+
+# should_auto_end() 的 session 時間上限（秒）；**0 = 不限**。
+# 設 0 的理由：排程可能長達數小時（實測有 11:40~18:00＝6.3 小時的充電排程），
+# 若沿用 SESSION_TIMEOUT_SEC(3600) 會把長排程的報告砍成一小時。
+# 客戶若需要上限（2/4/8 小時等），直接改此值即可，timeout 機制完整保留。
+AUTO_END_TIMEOUT_SEC = 0
+
+# **白名單**：只有這些 stop_reason 會觸發自動結束。
+# 其餘 critical 條件（alarm_stop / soc_over_max / soc_under_min …）一律
+# 「只記錄事件與 Summary 標示，不結束 Session」：
+#   - alarm_stop     ：設備既有告警在 resume 時會被一次性記為新增，不應中斷記錄
+#   - soc_over_max   ：充電排程充飽（SOC 達上限）是**正常完成**，應走 idle → auto_stop
+#   - soc_under_min  ：放電排程放到下限同理
+# 採白名單而非黑名單：日後新增 critical 條件不會意外造成 Session 被提前 finalize。
+AUTO_END_STOP_REASONS = ("communication_error", "pcs_fault", "battery_off")
+
+# stop_reason → end_reason 對照（統一命名，避免同一種狀況出現兩種結束原因）。
+# 例：pcs_fault 原本會落到 pcs_stop，與 Menu 的 fault_stop 不一致 → 統一為 fault_stop。
+AUTO_END_REASON_MAP = {
+    "communication_error": "communication_error",
+    "pcs_fault": "fault_stop",
+    "battery_off": "battery_off",
+}
+
+# 連續判定為 idle / PCS 停止的取樣「次數」。
+# ⚠️ 已**不再**作為自動結束的觸發依據（改由 AUTO_HOLD_STOP_SEC 時間制判定）；
+#    保留供 Debug / 統計 / 驗證使用，請勿再拿它做停止判斷。
 IDLE_END_SAMPLES = 3
 
 # ---- 啟動門檻（Arming）：未真正進入充/放電前「不建立 Session/資料夾」----

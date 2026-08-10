@@ -125,3 +125,39 @@ python test_pcs_modes.py             # 離線單元測試
 ```
 
 登入密碼放於 `login123.env`（`HMI_PASSWORD=...`），**已 gitignore，切勿提交**。
+
+# 自動排程報告（Auto Schedule Report）
+## Phase 1：Report Framework（報告框架）
+- 建立 ReportSession
+- 建立 Report 架構
+- CSV / Excel 輸出
+- Summary 統計
+
+Phase 2：Auto Start（自動建立報告）
+- 排程自動建立 Session
+- Scheduler 整合
+- Dashboard 監看
+- Resume 機制
+
+Phase 3：Auto Lifecycle（自動生命週期）
+- 3.1 Device State（設備狀態判定）
+- 3.2 Auto Stop Engine（自動停止引擎）
+- 3.3 Auto Finalize（自動完成報告）
+- 3.4 Start Debounce（啟動防抖）
+- 3.5 Schedule Robustness（排程穩定性）
+- 3.6 Resume & Recovery（恢復機制）
+- 3.7 Reliability（可靠性強化）
+- 3.8 Validation（完整驗證）
+
+Phase 4：Auto Monitor Service（背景監控服務）
+- Service 常駐監控
+- Dashboard 解耦
+- Session Ownership
+- Windows Service
+
+Phase 5：Production Ready（正式版本）
+- 長時間穩定測試
+- 壓力測試
+- 實機驗證
+- 文件整理
+- Release
