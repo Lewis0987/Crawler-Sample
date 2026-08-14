@@ -606,6 +606,7 @@ def _samples_count(folder, CFG):
 # ======================================================================
 def run_live(wait_min, log):
     import device_control_menu as M
+    import report_monitor as RM    # noqa: E402  Phase 4.2：Monitor Core 已抽離
     import charge_discharge_report_config as CFG
 
     started_at = datetime.now()
@@ -617,37 +618,37 @@ def run_live(wait_min, log):
     folders_before = _list_session_folders(root)
 
     def note_state():
-        st = M._auto["state"]
+        st = RM._auto["state"]
         if not obs["state_transitions"] or obs["state_transitions"][-1] != st:
             obs["state_transitions"].append(st)
 
     def cycle(phase, client, source):
         """一輪監看：完全走正式路徑（read_all → auto_schedule_check）。"""
         monitor_cycles["n"] += 1
-        r = M._read_device_state(client)
+        r = RM._read_device_state(client)
         note_state()
-        action, reason = M.auto_schedule_check(r, client=client, source=source)
+        action, reason = RM.auto_schedule_check(r, client=client, source=source)
         note_state()
-        sess = M._report["session"]
+        sess = RM._report["session"]
         sid = sess.session_id if sess is not None else None
         if sid:
             obs["session_ids"].add(sid)
-        if M._report["client"] is not None:
-            obs["client_ids"].add(id(M._report["client"]))
+        if RM._report["client"] is not None:
+            obs["client_ids"].add(id(RM._report["client"]))
         # 觸發輪單獨標為 "trigger"：第 1 項只檢查真正的 idle 輪，第 2 項只檢查觸發輪
         phase = "trigger" if action == "started" else phase
         rec = {"phase": phase, "t": datetime.now().strftime("%H:%M:%S"),
                "src": source, "action": action, "reason": reason,
-               "session_id": sid, "state": M._auto["state"],
+               "session_id": sid, "state": RM._auto["state"],
                "mode": (r or {}).get("pcs_control_mode_code"),
                "sched": (r or {}).get("pcs_schedule_enabled"),
                "chg": (r or {}).get("pcs_charging_flag"),
                "dis": (r or {}).get("pcs_discharging_flag"),
                "fault": (r or {}).get("pcs_fault_flag"),
-               "dir": M._actual_direction(r)[0] if r else None,
+               "dir": RM._actual_direction(r)[0] if r else None,
                "soc": (r or {}).get("soc_percent"),
                "power": (r or {}).get("actual_active_power_kw"),
-               "held": round(M._auto["held_sec"], 1)}
+               "held": round(RM._auto["held_sec"], 1)}
         obs["cycles"].append(rec)
         log(f"  [{rec['t']}] {phase:<12} src={source:<6} mode={rec['mode']} "
             f"sched={rec['sched']} chg={rec['chg']} dis={rec['dis']} "
@@ -662,7 +663,7 @@ def run_live(wait_min, log):
     log(f"開始時間：{started_at:%Y-%m-%d %H:%M:%S}")
     log(f"AUTO_SCHEDULE_REPORT_ENABLED = {CFG.AUTO_SCHEDULE_REPORT_ENABLED}")
     log(f"AUTO_MONITOR_DEBUG           = {CFG.AUTO_MONITOR_DEBUG}")
-    log(f"AUTO_REFRESH_SEC             = {M.AUTO_REFRESH_SEC}s"
+    log(f"AUTO_REFRESH_SEC             = {RM.AUTO_REFRESH_SEC}s"
         f"（本腳本沿用正式節奏，不另訂）")
     log(f"最長等待充電開始             = {wait_min} 分鐘")
     log(f"報告輸出根目錄               = {root}")
@@ -676,20 +677,20 @@ def run_live(wait_min, log):
         log("           再由使用者手動改為 True 後重新執行。")
         return False, obs, None
 
-    client, _p = M._monitor_client(force=True)
+    client, _p = RM._monitor_client(force=True)
     if client is None:
         log(f"\n[安全退出] {BLOCK_REASONS['login_failed']}")
         return False, obs, None
     obs["client_ids"].add(id(client))
     log(f"共用 client id                = {id(client)}（整個測試只登入一次）")
 
-    r0 = M._read_device_state(client)
+    r0 = RM._read_device_state(client)
     batt = "未知"
     if r0 is not None:
         batt = r0.get("battery_power_status", "未知")
-    active = M._report["session"]
+    active = RM._report["session"]
     plan_dir, plan_detail = schedule_plan_direction(
-        client, M._SCHED_TPL_LIST, M._SCHED_ITEM_LIST)     # 唯讀 GET，不修改任何排程
+        client, RM._SCHED_TPL_LIST, RM._SCHED_ITEM_LIST)     # 唯讀 GET，不修改任何排程
 
     verdict, reason = preflight(
         r0, auto_enabled=CFG.AUTO_SCHEDULE_REPORT_ENABLED, active_session=active,
@@ -703,7 +704,7 @@ def run_live(wait_min, log):
                  ("pcs_charging_flag", (r0 or {}).get("pcs_charging_flag")),
                  ("pcs_discharging_flag", (r0 or {}).get("pcs_discharging_flag")),
                  ("pcs_fault_flag", (r0 or {}).get("pcs_fault_flag")),
-                 ("actual_direction", M._actual_direction(r0)[0] if r0 else None),
+                 ("actual_direction", RM._actual_direction(r0)[0] if r0 else None),
                  ("rackSoc (%)", (r0 or {}).get("soc_percent")),
                  ("電池上下電狀態", batt),
                  ("active Session", active.session_id if active is not None else "None"),
@@ -741,11 +742,11 @@ def run_live(wait_min, log):
     # ---- YES 之後的快速唯讀複查（不再要求 YES）----
     log("")
     log("[複查] 人工確認期間狀態是否改變（唯讀）…")
-    r1 = M._read_device_state(client)
+    r1 = RM._read_device_state(client)
     batt1 = r1.get("battery_power_status", "未知") if isinstance(r1, dict) else "未知"
     ok2, reason2, changes = recheck_after_confirm(
         r0, r1, auto_enabled=CFG.AUTO_SCHEDULE_REPORT_ENABLED,
-        active_session=M._report["session"], battery_power_status=batt1)
+        active_session=RM._report["session"], battery_power_status=batt1)
     log(f"  期間變化：{changes if changes else '無'}")
     if not ok2:
         log("")
@@ -766,9 +767,9 @@ def run_live(wait_min, log):
         if rec["dis"] is True:
             log("")
             log(f"[停止驗證] {BLOCK_REASONS['discharge_only']}")
-            if M._report["session"] is not None:
+            if RM._report["session"] is not None:
                 log(f"           ⚠️ 正式程式已建立 Session："
-                    f"{M._report['session'].session_id}")
+                    f"{RM._report['session'].session_id}")
                 log("           腳本不會刪除任何資料，請由現場人員以 Menu 19 處理。")
             return False, obs, None
         if rec["fault"] is True:
@@ -782,13 +783,13 @@ def run_live(wait_min, log):
             log(f"[逾時結束] 等待 {wait_min} 分鐘仍未偵測到實際充電 → 未建立任何報告。")
             log("           請確認現場排程是否已啟動，再重新執行。")
             return False, obs, None
-        time.sleep(M.AUTO_REFRESH_SEC)
+        time.sleep(RM.AUTO_REFRESH_SEC)
 
     # ---------------- 階段 2：建立確認 ----------------
     obs["start_cycle"] = start_rec
     folders_after = _list_session_folders(root)
     obs["new_folders"] = sorted(folders_after - folders_before)
-    sess = M._report["session"]
+    sess = RM._report["session"]
     folder = sess.folder if sess is not None else None
     log.section("階段 2：已偵測到實際充電並建立 Session")
     log(f"  Session ID      ：{sess.session_id if sess else None}")
@@ -803,7 +804,7 @@ def run_live(wait_min, log):
     # ---------------- 階段 3：唯一性（自動 + 手動刷新）----------------
     log.section("階段 3：連續刷新（驗證不建立第二份）")
     for _i in range(AUTO_CYCLES_AFTER_START):
-        time.sleep(M.AUTO_REFRESH_SEC)
+        time.sleep(RM.AUTO_REFRESH_SEC)
         cycle("after_auto", client, "auto")
     for _i in range(MANUAL_CYCLES_AFTER_START):
         cycle("after_manual", client, "manual")       # 等同使用者按 r
@@ -817,7 +818,7 @@ def run_live(wait_min, log):
     time.sleep(LEAVE_LOOP_QUIET_SEC)
     alive = [t.name for t in threading.enumerate() if t.name not in expected]
     # 報告背景取樣執行緒屬報告模組（應持續運作）；監看層不得有任何執行緒
-    bg = M._report["thread"]
+    bg = RM._report["thread"]
     unexpected = [n for n in alive if bg is None or n != bg.name]
     s_after = _samples_count(folder, CFG) if folder else 0
     obs["quiet"] = {"seconds": LEAVE_LOOP_QUIET_SEC,
@@ -836,7 +837,7 @@ def run_live(wait_min, log):
     log.section("階段 5：再次進入監看（既有 Session 只接續、不建立第二份）")
     for _i in range(REENTER_CYCLES):
         cycle("reenter", client, "manual")
-        time.sleep(M.AUTO_REFRESH_SEC)
+        time.sleep(RM.AUTO_REFRESH_SEC)
 
     # ---------------- 事實蒐集 ----------------
     folders_final = _list_session_folders(root)
@@ -846,7 +847,7 @@ def run_live(wait_min, log):
     facts["events_at_start"] = events_at_start
 
     log.section("報告狀態（本腳本不送任何停止命令）")
-    cur = M._report["session"]
+    cur = RM._report["session"]
     last = obs["cycles"][-1]
     if cur is not None and last["chg"] is not True:
         log("  充電已停止，但 ReportSession 仍存在，等待 Phase 3 Stop Debounce")
@@ -1189,6 +1190,7 @@ def selftest():
 
     print("\n[關卡] 等待期間不得呼叫 API、不得修改正式狀態或 config")
     import device_control_menu as M_
+    import report_monitor as RM    # noqa: E402  Phase 4.2：Monitor Core 已抽離
 
     class _CountingClient:
         def __init__(self):
@@ -1199,8 +1201,8 @@ def selftest():
             return []
 
     spy = _CountingClient()
-    rep_before = dict(M_._report)
-    auto_before = dict(M_._auto)
+    rep_before = dict(RM._report)
+    auto_before = dict(RM._auto)
     cfg_before = (CFG.AUTO_SCHEDULE_REPORT_ENABLED, CFG.AUTO_MONITOR_DEBUG)
     calls_during = {"n": None}
 
@@ -1212,11 +1214,11 @@ def selftest():
     check("取消（輸入 yes）", res_cancel[0] is False)
     check(f"等待期間 API 呼叫次數 = 0（實際 {calls_during['n']}）",
           calls_during["n"] == 0 and spy.n == 0)
-    check("取消時未修改 _report", dict(M_._report) == rep_before)
-    check("取消時未修改 _auto", dict(M_._auto) == auto_before)
+    check("取消時未修改 _report", dict(RM._report) == rep_before)
+    check("取消時未修改 _auto", dict(RM._auto) == auto_before)
     check("取消時未修改 config 開關",
           (CFG.AUTO_SCHEDULE_REPORT_ENABLED, CFG.AUTO_MONITOR_DEBUG) == cfg_before)
-    check("取消時未建立 Session", M_._report["session"] is None)
+    check("取消時未建立 Session", RM._report["session"] is None)
     # 判定「是否持鎖」只看實際取得鎖的語法（with <lock>: / .acquire()），docstring 提及不算
     _gsrc = _src_of(confirm_gate) + _src_of(read_line_with_deadline)
     check("confirm_gate / read_line_with_deadline 未取得任何鎖（無 with LOCK / .acquire()）",
@@ -1260,14 +1262,14 @@ def selftest():
 
         def get(self, path, **_k):
             self.paths.append(path)
-            if path == M_._SCHED_TPL_LIST:
+            if path == RM._SCHED_TPL_LIST:
                 return self.tpls
             for tid, v in self.items.items():
-                if path == M_._SCHED_ITEM_LIST.format(tid=tid):
+                if path == RM._SCHED_ITEM_LIST.format(tid=tid):
                     return v
             return []
 
-    T, I = M_._SCHED_TPL_LIST, M_._SCHED_ITEM_LIST
+    T, I = RM._SCHED_TPL_LIST, RM._SCHED_ITEM_LIST
     en = [{"tempId": "1", "tempName": "t1", "enableFlag": 1}]
     check("啟用模板含充電項目 → charge",
           schedule_plan_direction(_SchedClient(en, {"1": [{"chargeOrDischarge": 1}]}), T, I)[0]

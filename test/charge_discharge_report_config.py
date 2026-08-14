@@ -259,10 +259,29 @@ AUTO_HOLD_STOP_SEC = 60
 # 不收尾 —— 避免相鄰排程（如 Charge 17:00~17:50、Discharge 17:55~18:10）
 # 被拆成兩份報告而失去往返效率（RTE 只能在同一 Session 內計算）。
 #
-# **0 = 停用（Phase 3.5 初始值）**：schedule_ctx 仍完整計算與顯示，
-#   但 should_auto_end() 的判斷與 Phase 3.4 完全一致（idle ≥ AUTO_HOLD_STOP_SEC → auto_stop）。
-#   待 Context 經實機驗證正確後，改為 300 即可啟用，不需要修改任何程式流程。
-AUTO_NEXT_PLAN_GAP_SEC = 0
+# 語意（Case A：下一排程**尚未**開始）：
+#   前一排程結束 → 下一排程 nominal start 之間，允許的最大「排程間隔」。
+#   對應 ctx 的 next_plan_in_sec（未來式倒數）。
+#
+# 0 = 停用 → should_auto_end() 的 Case A 完全跳過（退回 Phase 3.4 行為）。
+# 180：涵蓋 2026-08-10 實機觀察的相鄰排程間隔（16:00~16:10 discharge → 16:11~16:21 charge，
+#      間隔 60s）。刻意不放大 AUTO_HOLD_STOP_SEC —— 那會讓**每一份**報告都延後收尾。
+AUTO_NEXT_PLAN_GAP_SEC = 180
+
+# 「新排程 nominal start 已到、但 PCS/API 狀態尚未追上」的最大等待秒數。
+#
+# 語意（Case B：下一排程**已經**開始，但設備還沒動）：
+#   與 AUTO_NEXT_PLAN_GAP_SEC 是**兩個不同的概念，不可混用**——
+#     AUTO_NEXT_PLAN_GAP_SEC        ：排程與排程之間的「時刻表間隔」（未來式）
+#     AUTO_SCHEDULE_CONTINUITY_GRACE_SEC：排程已開始後，等待設備狀態反映的「執行延遲」（過去式）
+#
+# 為何需要：排程在**設備端**執行，nominal start 到實際出現 charge/discharge 旗標之間，
+#   要經過 排程觸發 → API → PCS 命令 → PCS 狀態改變 → 資料刷新 → 監看偵測 的完整鏈路。
+#   2026-08-10 實機：charge 排程 16:11 開始，Session 至 16:13:37 才偵測到 charge（延遲 157s）。
+#
+# 這同時也是 continuity 的**逾時上限**：超過此秒數仍未出現充/放電 → 正常 finalize，
+#   Session 不會因為「等下一段排程」而無限期卡住。
+AUTO_SCHEDULE_CONTINUITY_GRACE_SEC = 180
 
 # 排程窗口比對的寬限秒數（前後各放寬）。
 # 排程在**設備端**執行，但比對用的是 PC 時間；2026-08-07 實測設備 dataCollectTime
@@ -299,6 +318,27 @@ ORPHAN_GAP_SEC = 300
 # 必須夠短 —— atexit 期間不可讓行程退出被長時間阻塞（背景執行緒為 daemon，
 # 逾時未結束也會隨行程一起被回收，狀態已先寫入故不影響資料）。
 ATEXIT_JOIN_TIMEOUT_SEC = 2
+
+# ----------------------------------------------------------------------
+# Monitor Ownership（Phase 4.4）
+# ----------------------------------------------------------------------
+# 跨行程互斥：同一時間只有一個行程可以驅動自動報告生命週期並寫入 Session。
+#
+# ⚠️ 互斥的**唯一依據**是 Windows 命名 Mutex。
+#    MONITOR_OWNER_FILE 只是診斷資訊（誰持有、何時取得），
+#    **絕不可**用它的 pid 或存在與否來判斷所有權 —— PID 會被回收、檔案會殘留。
+#
+# 命名空間用 Global\：Phase 4.6 的 Windows Service 跑在 session 0，
+# Dashboard 跑在使用者 session，Local\ 無法跨 session 互斥。
+# 名稱附加 output_root 的雜湊，讓同機的不同部署不互相搶鎖。
+MONITOR_MUTEX_PREFIX = "Global\\ESS_AutoMonitor_Owner_v1_"
+MONITOR_OWNER_FILE = "monitor_owner.json"
+
+# Service 取不到所有權時的 exit code（供 Phase 4.6 的服務管理員判讀）
+#   3 = 預期的競爭結果，**不是程式故障**，不應觸發自動重啟
+#   4 = ownership API / 系統異常（fail closed），需人工介入
+EXIT_OWNER_HELD_BY_OTHER = 3
+EXIT_OWNER_API_ERROR = 4
 
 # ----------------------------------------------------------------------
 # Finalize 輸出重試（Phase 3.7）

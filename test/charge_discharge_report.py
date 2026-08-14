@@ -434,6 +434,33 @@ def read_all(client):
     r = {"raw_source_time": "", "communication_ok": True, "_fail": []}
 
     def _get(path, **kw):
+        """
+        單支 GET，失敗一律記入 r["_fail"]（不丟例外）。_fail 元素格式：
+            "<path>"                  取回 None
+            "<path>:<ExceptionType>"  丟出例外
+            "<path>:_error<code>"     HTTP 通了，但 application 層判定失敗
+
+        ⚠️ 第三種是 Phase 4.6-B 補上的。原本 _fail **只認 None**，於是
+           「HTTP 200 + application code ∉ (0,200)」這種失敗完全記不到 ——
+           unwrap() 會把它變成 {"_error": code, "msg":…, "_raw":…}，非 None。
+
+           實機後果（2026-08-13）：Service 於 11:03:15 登入，11:33:15 起
+           getRunMode / getScheduleSwitch 開始回這種 error dict，約 1060 個
+           監看 tick、3 小時以上未恢復（mode=unknown、sched=None），而整份
+           Service log 的「[警告] GET」為 **0 行** —— ApiClient.get() 每一條
+           回 None 的路徑都會先印警告，零警告即證明它回的不是 None。
+           因為沒進 _fail，report_monitor 的登入態失效偵測完全看不到這兩支
+           端點已經失敗，於是永遠不會重新登入。
+
+        ⚠️ 刻意**不**把 _error 轉成 None 回傳 —— 那會改變所有既有 read_all
+           消費者看到的資料型態，blast radius 沒有必要。此處**只補失敗資訊**，
+           回傳值與原本完全相同。
+        ⚠️ 刻意**不**比對特定 code（401/403/500…）：設備實際的 business code
+           尚未取得，而 "_error" key 本身就是 unwrap() 判定 application 失敗的
+           結論，無需猜測數值。
+        ⚠️ 只記端點與 code，**不**把 msg / _raw / body 寫進 _fail
+           （避免把回應內容擴散到診斷欄位與 log）。
+        """
         try:
             v = client.get(path, **kw)
         except Exception as e:
@@ -441,6 +468,8 @@ def read_all(client):
             r["_fail"].append(f"{path}:{type(e).__name__}")
         if v is None:
             r["_fail"].append(path)
+        elif isinstance(v, dict) and "_error" in v:
+            r["_fail"].append(f"{path}:_error{v.get('_error')}")
         return v
 
     # 1) 電池 SOC/電壓/電流（guest）
@@ -2379,25 +2408,40 @@ class ReportSession:
         **全專案唯一的自動停止判定入口**（Menu / Dashboard / 背景取樣器一律呼叫本函式，
         不得自行判斷）。回傳 (end?, reason)；只做判斷，**不送任何控制命令、不寫任何檔案**。
 
-        schedule_ctx（Phase 3.5，選填）：由監看層計算的排程感知資訊
+        schedule_ctx（Phase 3.5 / 3.8，選填）：由監看層計算的排程感知資訊
             {"in_window": bool, "current_plan": str|None,
-             "next_plan_in_sec": float|None, "source": "ok"|"unknown"}
+             "current_plan_started_sec": float|None, "current_plan_cd": str|None,
+             "next_plan_in_sec": float|None, "next_plan_cd": str|None,
+             "source": "ok"|"unknown"}
           - None 或 source != "ok" → **完全退回 Phase 3.4 行為**（僅看 idle 門檻）
-          - 僅在 CFG.AUTO_NEXT_PLAN_GAP_SEC > 0 時才會影響判定；
-            該值預設 0（停用）→ ctx 只被計算與顯示，不改變任何結果。
           - 本函式**不自行讀取排程 API**：排程讀取屬監看層職責，決策留在這裡。
+          - 只讀結構化欄位，**不得** parse current_plan 顯示字串。
 
-        判定優先序：
+        判定優先序（continuity 一律排在最後，不得降低任何既有優先序）：
           ① 白名單 critical（CFG.AUTO_END_STOP_REASONS）
                communication_error → communication_error
                pcs_fault           → fault_stop      （與 Menu 命名統一）
                battery_off         → battery_off
              ⚠️ 其餘 critical 條件一律**不結束**，只保留於 stop_reasons / events / Summary：
                 alarm_stop（設備既有告警在 resume 時會被記為新增，不應中斷記錄）
-                soc_over_max（充電充飽＝排程正常完成 → 應走 ② 以 auto_stop 收尾）
+                soc_over_max（充電充飽＝排程正常完成 → 應走 ③ 以 auto_stop 收尾）
                 soc_under_min（放電放到下限，同理）
-          ② idle 持續 ≥ CFG.AUTO_HOLD_STOP_SEC（monotonic 時間制）→ auto_stop
-          ③ CFG.AUTO_END_TIMEOUT_SEC > 0 且經過時間超過 → timeout（0＝不限）
+          ② CFG.AUTO_END_TIMEOUT_SEC > 0 且經過時間超過 → timeout（0＝不限）
+             ⚠️ **硬性上限必須排在 continuity 之前**：continuity 不得讓 Session 上限失效。
+          ③ idle 持續 ≥ CFG.AUTO_HOLD_STOP_SEC（monotonic 時間制）
+               → 先判 continuity（下方兩種 Case），不成立才 auto_stop
+
+        排程銜接保護（Phase 3.8）—— 相鄰排程不應因 PCS 切換延遲被拆成兩份報告：
+          Case A：下一排程**尚未**開始（未來式，看 next_plan_in_sec）
+                  0 <= next_plan_in_sec <= CFG.AUTO_NEXT_PLAN_GAP_SEC
+          Case B：下一排程 nominal start **已到**、但 PCS/API 尚未反映（過去式）
+                  in_window 且 0 <= current_plan_started_sec
+                                 <= CFG.AUTO_SCHEDULE_CONTINUITY_GRACE_SEC
+                  ⚠️ 只靠 in_window 不行 —— 單筆排程正常結束後，**上一筆的尾端 grace**
+                     仍會讓 in_window=True。必須加上 current_plan_started_sec 上限，
+                     且 ctx 已保證命中多筆時取 nominal start 最新者（＝剛開始的那一筆）。
+                  這個上限同時就是 continuity 的**逾時**：超過即正常收尾，不會無限期等待。
+          兩個 Case 都要求該排程方向為 charge/discharge —— "none"（不充不放）不算連續。
 
         註：_idle_streak（次數）僅供 Debug / 統計，**不參與**本判定。
         """
@@ -2405,19 +2449,41 @@ class ReportSession:
             for cond in CFG.AUTO_END_STOP_REASONS:          # 依 config 順序＝優先序
                 if cond in self.stop_reasons:
                     return True, CFG.AUTO_END_REASON_MAP.get(cond, cond)
-        if self.idle_held_seconds() >= CFG.AUTO_HOLD_STOP_SEC:
-            # 排程感知（Phase 3.5）：下一段啟用排程即將開始 → 暫不收尾，維持同一份 Session。
-            # AUTO_NEXT_PLAN_GAP_SEC = 0（預設）時整段跳過 → 與 Phase 3.4 行為完全相同。
-            _gap = getattr(CFG, "AUTO_NEXT_PLAN_GAP_SEC", 0) or 0
-            if (_gap > 0 and isinstance(schedule_ctx, dict)
-                    and schedule_ctx.get("source") == "ok"):
-                _nxt = schedule_ctx.get("next_plan_in_sec")
-                if _nxt is not None and _nxt <= _gap:
-                    return False, None          # 下段排程將至 → 不切成兩份報告
-            return True, "auto_stop"
+        # 硬性 Session 上限：排在 continuity 之前，確保等待下一段排程不會讓上限失效
         if CFG.AUTO_END_TIMEOUT_SEC and self._elapsed() >= CFG.AUTO_END_TIMEOUT_SEC:
             return True, "timeout"
+        if self.idle_held_seconds() >= CFG.AUTO_HOLD_STOP_SEC:
+            if self._schedule_continuity_wait(schedule_ctx):
+                return False, "schedule_continuity_wait"
+            return True, "auto_stop"
         return False, None
+
+    @staticmethod
+    def _schedule_continuity_wait(schedule_ctx):
+        """
+        排程銜接保護（Phase 3.8）：idle 已達門檻時，是否應**暫緩**收尾以維持同一份 Session。
+        純判斷、無副作用；ctx 不可用（None / source != "ok"）一律回 False → 退回 Phase 3.4。
+        判定細節與兩種 Case 見 should_auto_end() 的 docstring。
+        """
+        if not isinstance(schedule_ctx, dict) or schedule_ctx.get("source") != "ok":
+            return False
+        _ACTIVE = ("charge", "discharge")               # "none"（不充不放）不算連續排程
+
+        # Case A：下一排程尚未開始，且銜接間隔在允許範圍內
+        gap = getattr(CFG, "AUTO_NEXT_PLAN_GAP_SEC", 0) or 0
+        nxt = schedule_ctx.get("next_plan_in_sec")
+        if (gap > 0 and nxt is not None and 0 <= nxt <= gap
+                and schedule_ctx.get("next_plan_cd") in _ACTIVE):
+            return True
+
+        # Case B：下一排程 nominal start 已到，等待 PCS/API 狀態追上
+        grace = getattr(CFG, "AUTO_SCHEDULE_CONTINUITY_GRACE_SEC", 0) or 0
+        started = schedule_ctx.get("current_plan_started_sec")
+        if (grace > 0 and schedule_ctx.get("in_window")
+                and schedule_ctx.get("current_plan_cd") in _ACTIVE
+                and started is not None and 0 <= started <= grace):
+            return True
+        return False
 
     def finalize(self, end_reason, client_lock=None):
         """

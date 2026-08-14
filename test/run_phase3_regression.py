@@ -49,11 +49,23 @@ COMPILE_TARGETS = [
     "charge_discharge_report.py",
     "charge_discharge_report_config.py",
     "device_control_menu.py",
+    "report_monitor.py",          # Phase 4.2：Auto Monitor Core（含排程 context / continuity）
+    "auto_monitor_service.py",    # Phase 4.3：可獨立執行的背景監看服務
+    "test_phase4_service.py",
+    "test_phase4_ownership.py",
+    "test_phase4_observer.py",
+    "test_phase4_service_env.py",
+    "test_phase4_writer_gate.py",
+    "test_phase4_mutex_dacl.py",
+    "test_phase4_auth_recovery.py",
+    "test_phase4_mutex_canon.py",
+    "_p44_owner_child.py",
     "phase2_real_trigger_validation.py",
     "test_auto_schedule.py",
     "test_phase3_file_lock.py",
     "test_dashboard_loop.py",
     "probe_schedule_context.py",
+    "test_schedule_switch.py",
 ]
 
 # (顯示名稱, 指令 argv)；皆為離線項目
@@ -63,6 +75,15 @@ OFFLINE_SUITES = [
     ("3-B selftest", ["phase2_real_trigger_validation.py", "--selftest"]),
     ("Dashboard harness", ["test_dashboard_loop.py"]),
     ("Windows file lock", ["test_phase3_file_lock.py"]),
+    ("PCS schedule switch", ["test_schedule_switch.py"]),
+    ("Phase 4.3 service", ["test_phase4_service.py"]),
+    ("Phase 4.4 ownership", ["test_phase4_ownership.py"]),
+    ("Phase 4.5 observer", ["test_phase4_observer.py"]),
+    ("Phase 4.6-A service env", ["test_phase4_service_env.py"]),
+    ("Phase 4.6-B writer gate", ["test_phase4_writer_gate.py"]),
+    ("Phase 4.6-B mutex DACL", ["test_phase4_mutex_dacl.py"]),
+    ("Phase 4.6-B auth recovery", ["test_phase4_auth_recovery.py"]),
+    ("Phase 4.6-C mutex canon", ["test_phase4_mutex_canon.py"]),
 ]
 
 _COUNT_RE = re.compile(r"[（(](\d+)\s*/\s*(\d+)\s*檢查通過[）)]")
@@ -85,8 +106,11 @@ def _judge(rc, out):
     以 return code + 實際檢查數 + [FAIL] 行數共同判定。
     回傳 (status, passed, total, note)；passed/total 為 None 表示該項不輸出檢查數。
     """
-    m = _COUNT_RE.search(out)
-    passed, total = (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    # 取**最後**一個匹配：套件的總結行一律印在最後。
+    # 若取第一個，任何在檢查標籤中提及「（N/M 檢查通過）」的輸出都會被誤抓成套件總數
+    # （Phase 4.4 曾因此讓 runner 少報 6 項而未被判為 FAIL —— 靜默的錯誤回報）。
+    _ms = _COUNT_RE.findall(out)
+    passed, total = (int(_ms[-1][0]), int(_ms[-1][1])) if _ms else (None, None)
     fail_lines = out.count("[FAIL]")
     if rc != 0:
         return FAIL, passed, total, f"return code {rc}"

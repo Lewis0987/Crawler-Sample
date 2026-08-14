@@ -43,7 +43,8 @@ RESULT_PATH = os.path.join(_OUTPUT_DIR, "device_control_action_result.json")
 
 # ---- 控制端點 ----
 _AC_EP = "/client/dynamic/airConditioningControl"
-_MANUAL_EP = "/schedule/config/editManualSwitch"
+_MANUAL_EP = "/schedule/config/editManualSwitch"      # 手動模式開關
+_SCHEDULE_EP = "/schedule/config/editScheduleSwitch"  # 排程主開關（2026-08-11 DevTools 實抓確認）
 _VENT_EP = "/client/dynamic/dataOrControl/switchingQuantityControl"
 _COOL_ON_EP = "/client/dynamic/dataOrControl/waterPumpControl/1"
 _COOL_OFF_EP = "/client/dynamic/dataOrControl/waterPumpControl/0"
@@ -52,7 +53,8 @@ _PCS_POWER_EP = "/client/dynamic/sinexcel/dataOrControl/manualControl"
 
 # ---- 允許的控制端點（唯一 exact-match 白名單）----
 _ALLOWED_CONTROL_PATHS = {
-    _AC_EP, _MANUAL_EP, _VENT_EP, _COOL_ON_EP, _COOL_OFF_EP, _BATT_EP, _PCS_POWER_EP,
+    _AC_EP, _MANUAL_EP, _SCHEDULE_EP, _VENT_EP, _COOL_ON_EP, _COOL_OFF_EP, _BATT_EP,
+    _PCS_POWER_EP,
 }
 # ---- 絕不允許（雙保險）----
 _FORBIDDEN_EXACT = {
@@ -93,6 +95,25 @@ ACTIONS = {
     "pcs_manual_off": {"method": "PUT", "endpoint": _MANUAL_EP,
                        "payload": {"schedulePlanSwitchId": 1, "schedulePlanSwitch": 1, "manualModeSwitch": 0},
                        "kind": "pcs_manual", "expect": {"manualModeSwitch": 0}},
+
+    # 排程主開關（schedulePlanSwitch）—— 端點由 DevTools 實抓確認（2026-08-11）
+    #
+    # 關鍵：手動模式與排程主開關是**兩支不同端點，但 payload 完全相同**：
+    #     手動模式    → PUT /schedule/config/editManualSwitch
+    #     排程主開關  → PUT /schedule/config/editScheduleSwitch
+    #   ON  = {schedulePlanSwitchId:1, schedulePlanSwitch:1, manualModeSwitch:0}
+    #   OFF = {schedulePlanSwitchId:1, schedulePlanSwitch:0, manualModeSwitch:1}
+    #   因此**不能以 payload 判斷該送哪一支** —— 端點本身才是語意所在。
+    #
+    # 這解釋了 2026-08-10 的實機現象：當時兩個方向都誤送 editManualSwitch，
+    #   關閉（→回手動模式）生效，開啟（→進智慧模式）則回 200 但 schedulePlanSwitch 不變。
+    #   設備顯然只讓 editManualSwitch 負責手動模式；要動排程主開關必須走 editScheduleSwitch。
+    "pcs_schedule_on":  {"method": "PUT", "endpoint": _SCHEDULE_EP,
+                         "payload": {"schedulePlanSwitchId": 1, "schedulePlanSwitch": 1, "manualModeSwitch": 0},
+                         "kind": "pcs_manual", "expect": {"schedulePlanSwitch": 1}},
+    "pcs_schedule_off": {"method": "PUT", "endpoint": _SCHEDULE_EP,
+                         "payload": {"schedulePlanSwitchId": 1, "schedulePlanSwitch": 0, "manualModeSwitch": 1},
+                         "kind": "pcs_manual", "expect": {"schedulePlanSwitch": 0}},
 
     "vent_on":  {"method": "POST", "endpoint": _VENT_EP,
                  "payload": {"outputIndex": 5, "status": 1}, "kind": "vent"},
@@ -625,10 +646,14 @@ def run(action, execute, power=None, assume_yes=False, no_verify=False):
     # 未確認 payload 的 PCS 模式（直流恆流/恆功率）：一律只允許 dry-run，禁止實送。
     mode_key = spec.get("pcs_mode")
     mode_unconfirmed = bool(mode_key and not PCS_CONTROL_MODES[mode_key]["confirmed"])
+    # 個別 action 層級的未確認旗標（spec["confirmed"] is False）：
+    #   用於「payload 已知但實機證實無效」的 action（如 pcs_schedule_on）。
+    #   未標示 confirmed 的 action 一律視為已確認（既有 action 行為完全不變）。
+    action_unconfirmed = spec.get("confirmed") is False
 
-    # 判斷順序（安全優先）：登入 → dry-run → 未確認模式 [HOLD] → 前置檢查 → 送出。
-    #   未確認 PCS 模式（DC）在 --execute 時「一律」先被 [HOLD] 阻擋（不論電池前置檢查結果），
-    #   確保「未取得 DevTools payload 前絕不送 DC 控制」。
+    # 判斷順序（安全優先）：登入 → dry-run → 未確認模式/action [HOLD] → 前置檢查 → 送出。
+    #   未確認 PCS 模式（DC）與未確認 action 在 --execute 時「一律」先被 [HOLD] 阻擋
+    #   （不論電池前置檢查結果），確保「未取得 DevTools 證據前絕不送出該控制」。
     if not logged_in:
         print("登入失敗，略過控制與驗證。")
     elif not execute:
@@ -638,6 +663,11 @@ def run(action, execute, power=None, assume_yes=False, no_verify=False):
         reason = m.get("hold_reason", "payload/enum/充放電方向尚未由 DevTools 確認")
         warnings.append(f"{m['label']}：{reason}；僅允許 dry-run，未送出控制 API。")
         print(f"[HOLD] {m['label']}：{reason}。僅 dry-run，未送出控制 API。")
+    elif action_unconfirmed:
+        reason = spec.get("hold_reason", "payload 尚未由 DevTools 確認")
+        warnings.append(f"{action}：{reason}；僅允許 dry-run，未送出控制 API。")
+        print(f"[HOLD] {action} 尚未確認\n原因：{reason}")
+        print("僅 dry-run，未送出控制 API（不進行 read-back 等待）。")
     elif blocked:
         print("前置檢查未通過，已取消 PCS 控制（未送出任何控制 API）。")
     else:

@@ -154,6 +154,19 @@ Phase 4：Auto Monitor Service（背景監控服務）
 - Dashboard 解耦
 - Session Ownership
 - Windows Service
+- 4.1 | 架構盤點
+- 4.2 | 抽離 report_monitor.py，device_control_menu.py 改為 import | **Phase 3 Regression 734/734 必須維持 PASS，功能零改變** |
+- 4.3 | auto_monitor_service.py 可獨立執行 | 不開 Dashboard，排程仍可自動建立/停止/完成報告 |
+- 4.4 | Ownership（Monitor Owner / Session Owner） | Dashboard 與 Service 不會重複建立 Session |
+- 4.5 | Dashboard Observer 模式 | Dashboard 開關完全不影響 Auto Report |
+- 4.6 | Windows Service 包裝 | Windows 開機即可常駐 |
+- 4.7 | Service Restart / Recovery | Service 重啟後可 Resume，不重複建立 Session |
+- 4.8 | Phase 4 Validation | Regression + Service + 實機驗證全部 PASS |
+
+Windows Service 使用 NSSM 作為宿主程式（SCM 啟動 `tools\nssm.exe`，
+再由它啟動並監督 `test\auto_monitor_service.py`）。
+`tools\nssm.exe` 是 **runtime dependency**，安裝後不可刪除、改名或搬移。
+詳細版本、授權、SHA-256 與部署／更新說明見：[../tools/README.md](../tools/README.md)
 
 Phase 5：Production Ready（正式版本）
 - 長時間穩定測試

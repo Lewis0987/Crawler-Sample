@@ -52,6 +52,12 @@ except Exception as _e:            # 匯入失敗不影響既有控制選單
     _REPORT_AVAILABLE = False
     _REPORT_IMPORT_ERR = str(_e)
 
+# Auto Monitor Core（Phase 4.2 抽離）：監看決策 / Session 生命週期 / 裝置讀取 / 排程 / 恢復。
+# 一律以 RM.<name> 存取，不要 from report_monitor import <name> ——
+# from-import 會在本模組綁定獨立參考，測試對 RM.<name> 的注入將不會生效。
+# 依賴為單向：本檔 -> report_monitor；report_monitor 不得 import 本檔。
+import report_monitor as RM
+
 # 查詢目前設備狀態
 QUERY_CHOICE = "1"
 # 一般控制（直接 --execute）
@@ -94,6 +100,7 @@ VERIFY_TIMEOUT = {
     "water": 60,     # 冷卻循環
     "ac_on": 180,    # 空調開（風機翻轉可能 >60s）
     "ac_off": 180,   # 空調關
+    # 排程主開關不另設 timeout —— 見 _verify_timeout()，一律沿用 AUTO_POLL_TIMEOUT_SEC。
 }
 VERIFY_TIMEOUT_DEFAULT = 60
 VERIFY_INTERVAL = 2      # 每幾秒 verify 一次
@@ -107,6 +114,14 @@ def _verify_timeout(action):
     """依 action 取對應設備的 verify timeout（秒）。"""
     if action in ("ac_on", "ac_off"):
         return VERIFY_TIMEOUT.get(action, VERIFY_TIMEOUT_DEFAULT)
+    # 排程主開關：沿用既有控制標準 AUTO_POLL_TIMEOUT_SEC（90s），不另立門檻。
+    # 需排在 startswith("pcs") 之前 —— 否則會落到通用的 pcs=60s。
+    # ⚠️ 2026-08-10 實機：editManualSwitch 回 http=200 / code=200 / operation successful、
+    #    control_success=True，但 getScheduleSwitch 的回讀超過 15s 才反映 → 曾誤判 FAIL。
+    #    設定旗標寫入**不代表**狀態立即可讀，故與其他控制採同一套 90s 上限。
+    #    在函式內取值（非模組載入時），確保與下方 AUTO_POLL_TIMEOUT_SEC 定義永遠同步。
+    if action in ("pcs_schedule_on", "pcs_schedule_off"):
+        return AUTO_POLL_TIMEOUT_SEC
     key = ("battery" if action.startswith("battery")
            else "pcs" if action.startswith("pcs")
            else "fan" if action.startswith("vent")
@@ -117,6 +132,11 @@ def _verify_timeout(action):
 VERIFY_EXPECT = {
     "pcs_manual_on":  ("PCS", "PCS手動模式開關", "已啟用"),
     "pcs_manual_off": ("PCS", "PCS手動模式開關", "已停用"),
+    # 排程主開關回讀＝既有唯讀欄位 PCS排程開關狀態（_SCHEDULE_DISPLAY：開/關/暫無資料）
+    # ← device_control_scraper 的 schedulePlanSwitch，與狀態頁同一來源，不另建第二套。
+    # 「開」/「關」互不為子字串，substring 比對不會誤判；「暫無資料」兩者皆不符 → 逾時。
+    "pcs_schedule_on":  ("PCS", "PCS排程開關狀態", "開"),
+    "pcs_schedule_off": ("PCS", "PCS排程開關狀態", "關"),
     "battery_power_on":  ("電池", "電池上下電狀態", "已上電"),
     "battery_power_off": ("電池", "電池上下電狀態", "已下電"),
     "ac_on":  ("空調", "空調開關", "開"),
@@ -252,14 +272,6 @@ _BLOCK_SEP = "─" * 24
 _FEEDBACK_LABELS = {"主正反饋", "主正", "主負反饋", "主負", "環流"}
 
 
-def _load_json(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (ValueError, OSError):
-        return None
 
 
 def _run_script(args, title):
@@ -386,7 +398,7 @@ def _pcs_mode_submenu(cfg):
 
 
 def show_action_result():
-    data = _load_json(ACTION_RESULT)
+    data = RM._load_json(ACTION_RESULT)
     if data is None:
         print("尚未產生結果檔（device_control_action_result.json 不存在或無法讀取）")
         return
@@ -438,7 +450,7 @@ def refresh_status_silent():
         return {}                       # 逾時：subprocess.run 已終止子程序，直接放棄
     except Exception:
         return {}
-    return (_load_json(READONLY_RESULT) or {}).get("status_summary") or {}
+    return (RM._load_json(READONLY_RESULT) or {}).get("status_summary") or {}
 
 
 # ---- 動態進度行（同一行覆寫，不逐行新增）----
@@ -480,7 +492,7 @@ def wait_and_verify(action, start=None):
     to = _verify_timeout(action)      # 每種設備獨立 timeout
     live = start is not None
     if not live:
-        data = _load_json(ACTION_RESULT) or {}
+        data = RM._load_json(ACTION_RESULT) or {}
         if not data.get("control_success"):
             print("（控制未成功送出，略過等待驗證）", flush=True)
             return None
@@ -571,7 +583,7 @@ def _execute_live(operator_args, action, label):
         time.sleep(1)
     rc = proc.returncode
 
-    data = _load_json(ACTION_RESULT) or {}
+    data = RM._load_json(ACTION_RESULT) or {}
     sent = max(1, int(time.monotonic() - start))
     if data.get("blocked"):
         finish_progress_line(f"[{sent:02d}/{to}] 前置檢查未通過，未送出控制")
@@ -639,76 +651,19 @@ def _print_control_detail(data, verify_result):
     print(f"結果已寫入：{ACTION_RESULT}", flush=True)
 
 
-# ======================================================================
-# 充放電報告控制器（Menu 16/17/18）
-# 以獨立模組 charge_discharge_report 的 ReportSession 在背景執行緒取樣；
-# 本檔僅 orchestration：不修改報告模組、不送任何控制 API、全程唯讀 GET。
-# ======================================================================
-_report = {"session": None, "thread": None, "stop": None,
-           "lock": threading.Lock(), "finalized": False,
-           "pending_end_reason": None, "client": None,
-           "stopping": False}      # 停止流程進行中（防重複 Stop；期間一律不得 Start）
 
-# ---- Process-level 鎖（Phase 2）----
-# _SESSION_LOCK：保護「Session 的建立與停止」。手動控制（Menu 4/5/6/7）與智慧排程監看層
-#   共用同一份 _report 狀態，兩邊都必須經此鎖，確保同一時間只會有一份 Report Session。
-#   為 RLock：建立流程內部可能再次進入需要同鎖的函式（如 _report_start_session → 記錄事件）。
-# _CLIENT_LOCK：保護共用 ApiClient 的使用（requests.Session 非執行緒安全）。
-#   背景取樣執行緒與前景監看/輪詢都會用同一個 client，所有 GET 一律包在此鎖內。
-#   ⚠️ 控制命令（operator）是**獨立子程序、自己登入**，不共用本 client；且自動刷新僅在
-#      Dashboard 前景迴圈執行（無背景 thread），進入控制選單期間不會刷新 → 控制與刷新不會並行。
-_SESSION_LOCK = threading.RLock()
-_CLIENT_LOCK = threading.RLock()
 
 # 自動跟隨控制流程的輪詢設定（純 GET 唯讀）
 AUTO_POLL_TIMEOUT_SEC = 90      # 送控制後最長等待實際狀態改變（畫面訊息一律動態引用此值）
 AUTO_POLL_INTERVAL_SEC = 3
 
 
-def _report_output_root():
-    return os.path.join(OUTPUT_DIR, CDR_CFG.OUTPUT_SUBDIR)
 
 
-def _report_client(quiet=False):
-    """
-    共用已登入的 ApiClient（**整個程式生命週期只登入一次**；輪詢、報告 Session、監看層共用）。
-    登入成功後快取於 _report["client"]，之後每次呼叫直接回傳快取，不會重新登入。
-    quiet=True：登入失敗時不印訊息（供監看層的靜默重試使用，避免每次重試都洗畫面）。
-    失敗回 None。
-    """
-    if _report["client"] is None:
-        c = CDR.ApiClient()
-        tok = c.login_hmi(CDR.USERNAME)
-        if not tok:
-            if not quiet:
-                print("[REPORT] 登入失敗，無法進行報告相關作業")
-            return None
-        _report["client"] = c
-    return _report["client"]
 
 
-def _read_device_state(client):
-    """一次唯讀取樣（供輪詢方向/狀態）。錯誤印出、不靜默；回傳 reading dict 或 None。
-    ⚠️ read_all 只做資料讀取；**不得**在此加入任何建立/停止報告的副作用（見 auto_schedule_check）。"""
-    try:
-        with _CLIENT_LOCK:                       # 共用 client：與背景取樣互斥
-            return CDR.read_all(client)
-    except Exception as e:
-        print(f"[REPORT] 讀取設備狀態失敗：{e}")
-        return None
 
 
-def _actual_direction(r):
-    """回傳 (direction, fault)：direction ∈ charge/discharge/idle/unknown；fault=PCS 是否故障。"""
-    if not isinstance(r, dict):
-        return "unknown", False
-    d, _src = CDR.resolve_direction(r.get("pcs_charging_flag"),
-                                    r.get("pcs_discharging_flag"),
-                                    r.get("actual_active_power_kw"))
-    # 故障判斷統一委派 CDR.pcs_is_fault()：優先讀 pcs_fault_flag（systemFaultStatus.oldValue，
-    # 語言無關）；旗標缺失才退回中文 badge 比對。不在此檔另做字串判斷，避免兩份邏輯不一致。
-    fault = CDR.pcs_is_fault(r)
-    return d, fault
 
 
 def _poll_state(client, want):
@@ -716,377 +671,36 @@ def _poll_state(client, want):
     start = time.monotonic()
     last = None
     while time.monotonic() - start < AUTO_POLL_TIMEOUT_SEC:
-        last = _read_device_state(client)
-        d, f = _actual_direction(last)
+        last = RM._read_device_state(client)
+        d, f = RM._actual_direction(last)
         if want(d, f):
             return True, last
         time.sleep(AUTO_POLL_INTERVAL_SEC)
     return False, last
 
 
-def _report_finalize(end_reason):
-    """
-    idempotent finalize：整個 session 只會產生一次報告（避免背景自動結束與手動 17 併發重複產檔）。
-    回傳 (sess, stats)；若已結束/無 session → (None, None)。finalize 僅讀取狀態與寫本地檔，不送任何控制。
-    """
-    with _report["lock"]:
-        sess = _report["session"]
-        if sess is None or _report["finalized"]:
-            return None, None
-        _report["finalized"] = True
-    try:
-        # Phase 3.7：_CLIENT_LOCK 改為**注入**給 finalize()，由它只套用在網路階段
-        # （_prepare_finalize：read_all + session_end Cell 快照，<1s）。
-        # Excel / CSV / Chart / Meter 產出（數秒）不再持鎖 → 不會卡住前景 Dashboard 讀取。
-        # 安全前提（已實查）：兩條 finalize 路徑都已先停止背景取樣 ——
-        #   _stop_and_finalize() 先 set stop event 並 join thread 才呼叫本函式；
-        #   _auto_finalize_from_loop() 本身就跑在背景取樣迴圈內。
-        # 故輸出期間不會有人改動 sess.samples。
-        return sess, sess.finalize(end_reason, client_lock=_CLIENT_LOCK)
-    except Exception as e:
-        # 例外安全：finalized 旗標在嘗試前就已設 True，若不還原，之後用 Menu 19 重試會被
-        # idempotent 檢查擋掉 → 整份 Session 永遠無法補產報告（例如 Excel 被開啟鎖住時）。
-        # 自動收尾是無人值守的，這種情況更需要能重試，故失敗時還原旗標。
-        with _report["lock"]:
-            _report["finalized"] = False
-        print(f"[錯誤] 產生報告失敗：{e}")
-        print("       Session 仍為 recording、資料完整保留，可用 Menu 19 重試產生報告。")
-        return sess, None
 
 
-def report_start():
-    """Menu 18：開始/續接充放電報告（背景記錄；方向由 PCS 旗標自動判定）。
-    若磁碟上有未完成 Session（recording/paused）→ 續接同一資料夾累積；否則建立新 Session。"""
-    if not _REPORT_AVAILABLE:
-        print(f"[錯誤] 無法載入報告模組：{_REPORT_IMPORT_ERR}")
-        return
-    # 與智慧排程監看層共用同一把 _SESSION_LOCK 與同一份 _report 狀態 → Session 全程唯一
-    with _SESSION_LOCK:
-        _report_start_locked()
 
 
-def _report_start_locked():
-    """report_start() 的實際內容（呼叫端必須已持有 _SESSION_LOCK）。"""
-    if _report["session"] is not None:
-        print("已有進行中的充放電報告，請先選 17 停止並產生報告。")
-        return
-
-    active = CDR.find_active_session(_report_output_root())
-    client = _report_client()
-    if client is None:
-        return
-
-    if active:
-        # 續接既有未完成 Session（不建新資料夾、從既有累積值續加）
-        try:
-            with _CLIENT_LOCK:                       # start() 會做唯讀 GET
-                sess = CDR.ReportSession.resume(active, client)
-                sess.start()
-        except Exception as e:
-            print(f"[REPORT] 續接既有 Session 失敗：{e}")
-            return
-        print("\n【充放電報告】續接既有 Session（recording_resume）")
-    else:
-        # 建立新 Session（僅新建時詢問控制方式/設定值）
-        try:
-            mode = input("控制方式（交流有功/直流恆流/直流恆功率，Enter=交流有功）：").strip() or "交流有功"
-        except (EOFError, KeyboardInterrupt):
-            mode = "交流有功"
-        try:
-            sp_raw = input("設定值（選填，Enter 略過）：").strip()
-        except (EOFError, KeyboardInterrupt):
-            sp_raw = ""
-        setpoint = None
-        if sp_raw:
-            try:
-                setpoint = float(sp_raw)
-            except ValueError:
-                print("設定值格式錯誤，改為不記錄設定值。")
-        try:
-            with _CLIENT_LOCK:                       # start() 會做唯讀 GET
-                sess = CDR.ReportSession("auto", setpoint, mode, client, _report_output_root())
-                sess.start()
-        except Exception as e:
-            print(f"[REPORT] 開始報告失敗：{e}")
-            return
-        print("\n【充放電報告】開始記錄（新 Session）")
-
-    _report_bg_start(sess)
-    print(f"  Session ID：{sess.session_id}")
-    print(f"  資料夾：{sess.folder}")
-    print(f"  取樣間隔：{CDR_CFG.SAMPLE_INTERVAL_SEC}s（背景記錄中）")
 
 
-def _last_active_direction(sess):
-    """由 samples 反向找出最後一次非 idle 的方向（供 auto_charge_stop / auto_discharge_stop 命名）。"""
-    for row in reversed(getattr(sess, "samples", None) or []):
-        d = row.get("charge_discharge_direction")
-        if d in ("charge", "discharge"):
-            return d
-    return None
 
 
-def _sync_stop_pending(sess):
-    """
-    把 idle 累積狀態反映到 _auto（供 Dashboard 顯示）。
-    **只反映狀態、不做任何停止判定**（判定一律在 should_auto_end()）。
-    """
-    held = sess.idle_held_seconds()
-    with _SESSION_LOCK:                              # 瞬時：只寫一個 key
-        if _report["stopping"]:
-            return
-        if held > 0 and _auto["state"] == AUTO_RUNNING:
-            _auto["state"] = AUTO_STOP_PENDING       # idle 累積中 → 等待收尾
-        elif held <= 0 and _auto["state"] == AUTO_STOP_PENDING:
-            _auto["state"] = AUTO_RUNNING            # 方向回充/放 → 取消
 
 
-def _auto_finalize_from_loop(sess, reason):
-    """
-    背景取樣執行緒內的自動收尾。回傳 True=可結束迴圈；False=收尾失敗（Session 保留供重試）。
-    ⚠️ 這裡**不可**呼叫 _stop_and_finalize()：那會 join 自己所在的執行緒 → 死鎖。
-       一律走既有唯一入口 _report_finalize(reason)，不新增第二套 finalize 邏輯。
-    """
-    with _SESSION_LOCK:
-        _report["stopping"] = True                   # 收尾期間擋掉任何新 Session（條件 F）
-        _auto["state"] = AUTO_STOP_PENDING
-    ok = False
-    try:
-        # 正常結束（auto_stop）額外記錄 auto_charge_stop / auto_discharge_stop；
-        # 故障/通訊異常沿用既有 session_end + stop_reasons，不另外加事件。
-        if reason == "auto_stop":
-            d = _last_active_direction(sess)
-            ev = {"charge": "auto_charge_stop",
-                  "discharge": "auto_discharge_stop"}.get(d, "auto_stop")
-            try:
-                sess.log_event(ev, "info",
-                               f"origin=scheduler｜排程結束自動收尾｜"
-                               f"idle 持續 {sess.idle_held_seconds():.0f}s｜"
-                               f"最後方向 {d or 'unknown'}")
-            except Exception as e:
-                print(f"[REPORT] 記錄自動停止事件失敗：{e}")
-        s, stats = _report_finalize(reason)
-        if s is None:                                # 已由其他路徑收尾（idempotent）
-            ok = True
-        elif stats is None:
-            print(f"[REPORT] 自動收尾失敗（{reason}）→ Session 仍為 recording，"
-                  f"資料完整保留，可用 Menu 19 重試產生報告")
-        else:
-            print(f"\n[REPORT] 已自動結束並產生報告"
-                  f"（{reason} / {CDR_CFG.END_REASON.get(reason, reason)}）")
-            _print_report_result(s, stats)
-            ok = True
-    except Exception as e:
-        print(f"[REPORT] 自動收尾例外（{reason}）：{e}；Session 保留，可用 Menu 19 重試")
-    finally:
-        with _SESSION_LOCK:
-            if ok:                                   # 成功才清空；失敗保留供 Menu 19 重試
-                _report.update(session=None, thread=None, stop=None,
-                               pending_end_reason=None)
-                _auto_clear_notes()              # 回到 IDLE → 統一清除所有去重狀態
-                _auto_reset_tracking()
-                # 啟動冷卻：期間一律不得建立新 Session（見 CFG.AUTO_COOLDOWN_SEC 說明）
-                _cd_sec = _auto_start_cooldown()
-                _auto["state"] = AUTO_COOLDOWN if _cd_sec > 0 else AUTO_IDLE
-                if _cd_sec > 0:
-                    print(f"[AUTO] 進入收尾後冷卻 {_cd_sec}s"
-                          f"（期間不建立新報告，避免旗標抖動造成重複建立）")
-            _report["stopping"] = False
-    return True if ok else False
 
 
-def _report_bg_start(sess):
-    """
-    啟動背景取樣執行緒：持續取樣（合併 Session）並負責 Session 的**生命週期結束**。
-      - charge/idle/discharge 皆為同一 Session 內的有效狀態；充↔放切換之間的短暫 idle
-        由 should_auto_end() 的 idle debounce（AUTO_HOLD_STOP_SEC）吸收，不會被切成兩份。
-      - **停止判定一律委派 sess.should_auto_end()**（全專案唯一決策點）；本檔不得再自行
-        判斷 fault / communication_error / battery_off / idle / timeout。
-      - 停止交給背景取樣器（而非 Dashboard 監看層）的理由：週期較短（5s），且使用者進入
-        控制選單期間仍持續運作 —— 否則排程結束時若正在控制選單就永遠不會收尾。
-      - 方向於相鄰取樣間改變時，由 ReportSession.sample_once 記錄 charge/idle/discharge_start 事件。
-    """
-    stop = threading.Event()
-    _report.update(session=sess, thread=None, stop=stop, finalized=False)
-    # 新 Session 起始（手動 / 排程 / resume 都會經過這裡）→ 清除上一份 Session 遺留的
-    # 去重狀態，確保各類提示（含停止提示）在新 Session 會重新各印一次。
-    _auto_clear_notes()
-
-    def _loop():
-        try:
-            while not stop.is_set():
-                try:
-                    with _CLIENT_LOCK:           # 共用 client：與前景監看/輪詢互斥
-                        sess.sample_once()
-                except Exception as e:
-                    print(f"[REPORT] 背景取樣例外：{e}")
-
-                # ---- 排程感知（Phase 3.5）：只在 idle 開始累積時才查，並快取 60s ----
-                #      本層只把 ctx 算出來，判定仍在 should_auto_end()。
-                #      取得失敗 → ctx=None/source=unknown → 退回 Phase 3.4 行為。
-                sched_ctx = None
-                try:
-                    if sess.idle_held_seconds() > 0:
-                        sched_ctx = _schedule_window_ctx(_report["client"])
-                except Exception as e:
-                    print(f"[REPORT] 排程窗口查詢例外（退回純 idle 門檻）：{e}")
-
-                # ---- 停止判定：唯一決策點；不依賴本輪取樣結果（讀累積狀態）----
-                end, reason = False, None
-                try:
-                    end, reason = sess.should_auto_end(schedule_ctx=sched_ctx)
-                except Exception as e:
-                    print(f"[REPORT] 停止判定例外（本輪略過，繼續記錄）：{e}")
-                try:
-                    _sync_stop_pending(sess)     # 只反映 STOP_PENDING，不參與判定
-                except Exception as e:
-                    print(f"[REPORT] 狀態同步例外：{e}")
-
-                if end:
-                    # 使用者已按 Menu 7 → 尊重其結束原因，不被 auto_stop 蓋掉
-                    if _report["pending_end_reason"]:
-                        reason = _report["pending_end_reason"]
-                    if not getattr(CDR_CFG, "AUTO_STOP_ENABLED", True):
-                        # 用**獨立** key：背景取樣器(5s) 與 Dashboard(15s) 是兩個節奏，
-                        # 共用 last_note 會互相覆寫而讓去重失效 → 同一條件反覆洗版。
-                        _auto_note(f"[REPORT] 自動停止條件成立（{reason}）但 "
-                                   f"AUTO_STOP_ENABLED=False → 僅記錄，不收尾"
-                                   f"（請以 Menu 19 人工結束）",
-                                   key="last_stop_note")
-                        stop.wait(CDR_CFG.SAMPLE_INTERVAL_SEC)
-                        continue
-                    _auto_finalize_from_loop(sess, reason)
-                    break                        # 成功或失敗都結束迴圈（失敗時 Session 保留）
-                stop.wait(CDR_CFG.SAMPLE_INTERVAL_SEC)
-        except Exception as e:                   # 最外層防護：背景執行緒不得靜默死亡
-            print(f"[REPORT] 背景執行緒異常結束：{e}")
-
-    th = threading.Thread(target=_loop, daemon=True)
-    _report["thread"] = th
-    th.start()
 
 
-def _stop_and_finalize(reason, write_final=True):
-    """
-    停止背景執行緒 →（選擇性）寫最後一筆即時資料 → finalize（idempotent）。回傳 (sess, stats)。
-    **鎖範圍最小化**（見檔頭鎖說明）：
-      - _SESSION_LOCK 只包「檢查 Session／設 stopping 旗標／取出並清除參考」等瞬時狀態切換。
-      - thread.join（最長 SAMPLE_INTERVAL+10 秒的等待）與 finalize（含 Excel 產出）
-        **一律不持有 _SESSION_LOCK**，避免長時間鎖住 Dashboard。
-      - stopping 旗標＋_report["session"] 仍非 None → 期間任何 Start 都會被擋掉（雙重保護）。
-    """
-    with _SESSION_LOCK:                          # ① 瞬時：檢查 + 旗標 + 取參考
-        if _report["session"] is None or _report["stopping"]:
-            return None, None
-        _report["stopping"] = True
-        sess = _report["session"]
-        stop_ev, th = _report["stop"], _report["thread"]
-        _auto["state"] = AUTO_STOP_PENDING
-    try:                                         # ② 長時間：等待與產出，**不持鎖**
-        if stop_ev is not None:
-            stop_ev.set()
-        if th is not None:
-            th.join(timeout=CDR_CFG.SAMPLE_INTERVAL_SEC + 10)
-        if write_final and sess is not None and not _report["finalized"]:
-            try:
-                with _CLIENT_LOCK:               # 只包一次取樣
-                    sess.sample_once()           # 寫入最後一筆即時資料
-            except Exception as e:
-                print(f"[REPORT] 最後取樣失敗：{e}")
-        res = _report_finalize(reason)
-    finally:                                     # ③ 瞬時：清除參考與狀態
-        with _SESSION_LOCK:
-            _report.update(session=None, thread=None, stop=None,
-                           pending_end_reason=None, stopping=False)
-            _auto["state"] = AUTO_IDLE
-            _auto_clear_notes()                  # 回到 IDLE → 統一清除所有去重狀態
-            _auto_reset_tracking()
-    return res
 
 
-def report_pause():
-    """
-    離開程式時：停止背景取樣但保留 Session 為 paused（下次可續接），不標記 completed。
-    鎖範圍同 _stop_and_finalize：_SESSION_LOCK 只包狀態切換，**join 等待不持鎖**。
-    """
-    with _SESSION_LOCK:                          # ① 瞬時
-        sess = _report["session"]
-        if sess is None or _report["stopping"]:
-            return
-        _report["stopping"] = True
-        stop_ev, th = _report["stop"], _report["thread"]
-        _auto["state"] = AUTO_STOP_PENDING
-    try:                                         # ② 等待與寫檔，不持鎖
-        if stop_ev is not None:
-            stop_ev.set()
-        if th is not None:
-            th.join(timeout=CDR_CFG.SAMPLE_INTERVAL_SEC + 10)
-        if not _report["finalized"]:             # 背景已 finalize（completed）→ 不覆蓋
-            try:
-                sess.pause()
-                print(f"充放電報告已暫停（下次可續接）：{sess.session_id}")
-            except Exception as e:
-                print(f"[REPORT] 暫停報告失敗：{e}")
-    finally:                                     # ③ 瞬時
-        with _SESSION_LOCK:
-            _report.update(session=None, thread=None, stop=None,
-                           pending_end_reason=None, stopping=False)
-            _auto["state"] = AUTO_IDLE
-            _auto_clear_notes()                  # 回到 IDLE → 統一清除所有去重狀態
-            _auto_reset_tracking()
 
 
-def _atexit_guard():
-    """
-    行程結束時的**保底**：仍有進行中的 Session → 標記為 paused（可續接）。
-
-    為什麼需要：`report_pause()` 只在 main() 的 finally 被呼叫。任何「import 了本模組、
-    建立了 Session、但沒走 main()」的行程（驗證腳本、工具、未來的 Auto Monitor Service）
-    正常退出時，背景 daemon thread 會被直接終止，session_state.json 永遠停在 recording
-    → 產生孤兒。2026-08-04 兩次孤兒皆為此成因（都是**正常**退出，非當機）。
-
-    ⚠️ 本函式的鐵則（atexit 期間不可拖慢或阻斷行程退出）：
-        - **不做任何網路 I/O**（不取樣、不讀 Cell/告警、不呼叫 finalize）
-        - **不重產報表** —— 故用 mark_paused() 而非 pause()：
-          pause() 會 _regenerate_outputs()，重寫 summary/statistics/alarms 與整份 Excel，需數秒
-        - join 背景執行緒有硬上限（CFG.ATEXIT_JOIN_TIMEOUT_SEC）
-        - 全程 try/except，**任何情況都不得拋出例外**
-        - idempotent：main() 的 finally 已收尾時 _report["session"] 為 None → 直接返回
-    """
-    try:
-        sess = _report.get("session")
-        if sess is None or _report.get("finalized"):
-            return
-        ev = _report.get("stop")
-        if ev is not None:
-            ev.set()                                     # 讓背景取樣停止
-        th = _report.get("thread")
-        if th is not None and th.is_alive():
-            th.join(timeout=getattr(CDR_CFG, "ATEXIT_JOIN_TIMEOUT_SEC", 2))
-        mark = getattr(sess, "mark_paused", None)        # 測試替身可能沒有此方法
-        if callable(mark):
-            mark()
-            print(f"[REPORT] 行程結束保底：Session 已標記為 paused（下次啟動可續接）："
-                  f"{getattr(sess, 'session_id', '?')}")
-    except Exception:
-        pass                                             # atexit 絕不拋例外
 
 
-atexit.register(_atexit_guard)
 
 
-def report_stop(end_reason="user_stop"):
-    """Menu 17（備用）：手動停止並 finalize（status=completed；end_reason 預設 user_stop）。"""
-    if _report["session"] is None:
-        print("目前沒有進行中的充放電報告（請先選 16 開始，或由控制流程自動建立）。")
-        return
-    print("正在停止並產生報告…")
-    sess, stats = _stop_and_finalize(end_reason)
-    if sess is None:
-        print("報告已結束（可能已自動結束）。")
-    elif stats is not None:
-        print("[REPORT] 已手動結束並產生報告")
-        _print_report_result(sess, stats)
 
 
 # ======================================================================
@@ -1094,53 +708,10 @@ def report_stop(end_reason="user_stop"):
 # ======================================================================
 def _control_succeeded():
     """讀 device_control_action_result.json 判斷最近一次控制是否成功。"""
-    data = _load_json(ACTION_RESULT) or {}
+    data = RM._load_json(ACTION_RESULT) or {}
     return bool(data.get("control_success"))
 
 
-def _report_start_session(direction, mode_label, setpoint=None, origin="manual", extra_events=()):
-    """
-    **建立/沿用 Report Session 的唯一入口**（手動控制與智慧排程監看層共用，不存在第二套報告邏輯）。
-    全程持有 _SESSION_LOCK，保證同一時間只會有一份 Session：
-      - 已有 active Session → **不建新資料夾**，僅記錄 direction_change 事件後回傳該 Session。
-      - 無 Session → 建立單一合併 Session（action='auto' → 資料夾 {timestamp}_auto）並啟動背景取樣。
-    origin：manual（Menu 4/5/6）/ scheduler（智慧排程自動）—— 僅寫入事件，不影響流程。
-    extra_events：[(event_type, severity, detail), ...] 建立成功後補記的事件（如 auto_charge_start）。
-    回傳 (sess, created)：created=True 表示本次新建；False=沿用既有。失敗回 (None, False)。
-    """
-    zh = {"charge": "充電", "discharge": "放電"}.get(direction, direction)
-    with _SESSION_LOCK:
-        cur = _report["session"]
-        if cur is not None:
-            # 沿用現有合併 Session，僅記錄方向切換（不結束、不建新資料夾）
-            try:
-                cur.log_event("direction_change", "info",
-                              f"方向切換為 {direction}（{zh}）｜來源 {origin}")
-            except Exception as e:
-                print(f"[REPORT] 記錄方向切換失敗：{e}")
-            print(f"[REPORT] 沿用現有 Session，方向切換為 {direction}")
-            return cur, False
-
-        client = _report_client()
-        if client is None:
-            return None, False
-        try:
-            with _CLIENT_LOCK:                   # start() 會做唯讀 GET（起始狀態/Cell 快照）
-                sess = CDR.ReportSession("auto", setpoint, mode_label, client,
-                                         _report_output_root())
-                sess.start()
-        except Exception as e:
-            print(f"[REPORT] 建立 Session 失敗（{origin}）：{e}")
-            return None, False
-        _report_bg_start(sess)                   # 設定 _report["session"] 並啟動背景取樣
-        for ev in extra_events:
-            try:
-                sess.log_event(*ev)
-            except Exception as e:
-                print(f"[REPORT] 記錄事件失敗（{ev[0] if ev else '?'}）：{e}")
-        print(f"[REPORT] 已建立充放電 Session（來源 {origin}）")
-        print(f"  Session ID：{sess.session_id}｜初始方向：{direction}｜控制方式：{mode_label}")
-        return sess, True
 
 
 def report_on_charge_discharge_control(direction, mode_label, setpoint=None):
@@ -1156,7 +727,13 @@ def report_on_charge_discharge_control(direction, mode_label, setpoint=None):
     if not _REPORT_AVAILABLE:
         print(f"[REPORT] 報告模組未載入：{_REPORT_IMPORT_ERR}")
         return
-    client = _report_client()
+    # Phase 4.5：Observer 不得建立報告。設備控制本身已在呼叫端完成且不受限制 ——
+    # Ownership 只限制 Report Writer，不擴大成設備控制權限。
+    if not RM.is_owner():
+        print("[REPORT] 設備控制已送出；目前本視窗為 Observer，"
+              "報告由 Monitor Owner 負責。")
+        return
+    client = RM._report_client()
     if client is None:
         return
     zh = "充電" if direction == "charge" else "放電"
@@ -1165,7 +742,7 @@ def report_on_charge_discharge_control(direction, mode_label, setpoint=None):
     if not ok:
         print("[REPORT] 尚未偵測到實際充/放電狀態")
         return
-    _report_start_session(direction, mode_label, setpoint, origin="manual")
+    RM._report_start_session(direction, mode_label, setpoint, origin="manual")
 
 
 def report_on_stop_control():
@@ -1173,653 +750,107 @@ def report_on_stop_control():
     if not _REPORT_AVAILABLE:
         print(f"[REPORT] 報告模組未載入：{_REPORT_IMPORT_ERR}")
         return
-    if _report["session"] is None:
+    # Phase 4.5：設備已停止（呼叫端完成），但 Observer 不得執行報告收尾。
+    if not RM.is_owner():
+        print("[REPORT] 設備已停止；目前本視窗為 Observer，"
+              "報告收尾由 Monitor Owner 負責。")
+        return
+    if RM._report["session"] is None:
         print("[REPORT] 無進行中的報告 Session（略過自動結束）")
         return
-    _report["pending_end_reason"] = "control_stop"
+    RM._report["pending_end_reason"] = "control_stop"
     reason = "control_stop"
-    client = _report_client()
+    client = RM._report_client()
     if client is not None:
         print(f"[REPORT] 確認 PCS 回到停止/待機中…（最長 {AUTO_POLL_TIMEOUT_SEC}s）")
         ok, r = _poll_state(client, lambda d, f: d == "idle" or f)
-        if r is not None and _actual_direction(r)[1]:
+        if r is not None and RM._actual_direction(r)[1]:
             reason = "fault_stop"
     try:
-        sess, stats = _stop_and_finalize(reason)
+        sess, stats = RM._stop_and_finalize(reason)
         if sess is not None and stats is not None:
             print("[REPORT] 已結束合併充放電報告")
-            _print_report_result(sess, stats)
+            RM._print_report_result(sess, stats)
         elif sess is None:
             print("[REPORT] 報告已結束（可能已自動結束）")
     except Exception as e:
         print(f"[REPORT] 自動結束失敗：{e}")
 
 
-def _orphan_gap_seconds(folder):
-    """
-    由 session_state.json 的 last_sample_time 算出「斷線間隔」秒數。
-    ⚠️ 用**系統時間**（非 monotonic）—— 這是跨行程的比較，monotonic 值跨行程無意義。
-    無法判定（欄位缺失／格式非預期）回 None。
-    """
-    st = _load_json(os.path.join(folder, CDR_CFG.FILE_SESSION_STATE)) or {}
-    last = st.get("last_sample_time")
-    if not last:
-        return None
-    try:
-        return (datetime.now()
-                - datetime.strptime(str(last), "%Y-%m-%d %H:%M:%S")).total_seconds()
-    except (ValueError, TypeError):
-        return None
 
 
-def report_resume_on_launch():
-    """
-    程式啟動時：若磁碟有未完成 Session（recording/paused）→ 恢復並繼續背景取樣（不重複建立）。
-
-    Phase 3.6 新增「孤兒分類」：以斷線間隔判斷是否為行程異常中斷所遺留，
-    **只記錄事件與提示，不改變 Resume 流程**（超過門檻仍照常續接）。
-    是否要對孤兒做更積極的處置（如直接 finalize），待累積更多實機案例後再決定。
-    """
-    if not _REPORT_AVAILABLE:
-        return
-    active = CDR.find_active_session(_report_output_root())
-    if not active:
-        return
-    gap = _orphan_gap_seconds(active)            # 需在 resume 覆寫 state 前先讀
-    client = _report_client()
-    if client is None:
-        return
-    try:
-        sess = CDR.ReportSession.resume(active, client)
-        sess.start()
-    except Exception as e:
-        print(f"[REPORT] 恢復未完成 Session 失敗：{e}")
-        return
-    _report_bg_start(sess)
-    print(f"[REPORT] 已恢復未完成 Session：{sess.session_id}（方向 {sess.action}，背景繼續記錄）")
-    # 孤兒分類：僅記錄，不改變流程
-    _gap_limit = getattr(CDR_CFG, "ORPHAN_GAP_SEC", 0) or 0
-    if gap is not None and _gap_limit > 0 and gap > _gap_limit:
-        detail = (f"斷線間隔 {gap:.0f}s（門檻 {_gap_limit}s）｜"
-                  f"上次取樣後行程未正常收尾即中斷｜本次照常續接，未改變流程")
-        try:
-            sess.log_event("orphan_detected", "warning", detail)
-        except Exception as e:
-            print(f"[REPORT] 記錄 orphan_detected 失敗：{e}")
-        print(f"[REPORT] ⚠ 偵測到孤兒 Session：{detail}")
 
 
-# ======================================================================
-# 智慧排程自動建立報告 —— 監看決策層（Phase 2：基本自動建立）
-# ----------------------------------------------------------------------
-# 三層嚴格分離，不得混用：
-#   ① 資料讀取層  CDR.read_all(client)         只取狀態，**零副作用**
-#   ② 監看決策層  auto_schedule_check(reading) 只判斷要不要開始/停止（本節）
-#   ③ 報告執行層  _report_start_session(...)   沿用既有 ReportSession，不存在第二套邏輯
-#
-# ⚠️ 絕對不可把本節任何函式塞進 read_all()：selftest、_arm_for_charge_discharge()、
-#    單純狀態查詢等都會呼叫 read_all()，一旦有副作用就會誤觸發自動報告。
-#    呼叫端必須自己明確呼叫：reading = CDR.read_all(c) → auto_schedule_check(reading)
-# ⚠️ 本節不建立任何背景 thread：偵測完全跑在 Dashboard 前景迴圈（離開迴圈即停止 GET）。
-# ======================================================================
-# ⚠️ Auto Start 目前依賴本刷新間隔：排程開始後最久要等這麼久才會建立 Session。
-#    設太大會漏掉排程開頭的資料（曾誤設 60s）。維持 15s。
-AUTO_REFRESH_SEC = 15            # Dashboard 前景自動刷新間隔（秒）
-AUTO_LOGIN_RETRY_SEC = 60        # 登入失敗後的靜默重試間隔（秒）；按 r 可立即重試
 # ⚠️ Debounce / Cooldown 的門檻常數**一律定義於 charge_discharge_report_config.py**，
 #    本檔不得自行宣告（曾發生 menu 宣告 AUTO_HOLD_STOP_SEC=30、與 config 生效值 60 矛盾）。
 #    使用時一律 CFG.AUTO_HOLD_START_SEC / CFG.AUTO_HOLD_STOP_SEC / CFG.AUTO_COOLDOWN_SEC。
 
-# ======================================================================
-# 監看狀態機（Phase 3.4 起固定）
-# ----------------------------------------------------------------------
-#   IDLE
-#     ↓  條件 A~F 全部成立，且方向為 charge/discharge
-#   START_HOLD        ← Start Debounce 累積中（held < CFG.AUTO_HOLD_START_SEC）
-#     ↓  held ≥ CFG.AUTO_HOLD_START_SEC
-#   START_PENDING     ← 鎖內瞬時佔位，外部觀察不到
-#     ↓  _report_start_session() 成功
-#   RUNNING           ← Session recording，背景取樣器每 5s 取樣
-#     ↓  偵測到 idle（背景取樣器 _sync_stop_pending）
-#   STOP_PENDING      ← Stop Debounce 累積中（idle < CFG.AUTO_HOLD_STOP_SEC）
-#     ↓  should_auto_end() → (True, "auto_stop")
-#   AUTO_STOP         ← _report_finalize() 產出 Summary / Excel
-#     ↓
-#   COOLDOWN          ← 冷卻中，**一律不得建立任何 Session**
-#     ↓  冷卻期滿（CFG.AUTO_COOLDOWN_SEC）
-#   IDLE
-#
-# ⚠️ START_HOLD 不是「進去就等」的狀態：每一輪 auto_schedule_check() 都會**重新
-#    完整驗證所有守門條件**（F/D/E/A/B/C），任一失效即回 IDLE 並重新累積。
-# ⚠️ 所有 debounce/cooldown 計時一律 time.monotonic()，與呼叫頻率無關。
-# ======================================================================
-(AUTO_IDLE, AUTO_START_HOLD, AUTO_START_PENDING, AUTO_RUNNING,
- AUTO_STOP_PENDING, AUTO_COOLDOWN) = (
-    "IDLE", "START_HOLD", "START_PENDING", "RUNNING", "STOP_PENDING", "COOLDOWN")
-
-_auto = {
-    "state": AUTO_IDLE,
-    "direction": None,          # 目前觀測到的方向（charge/discharge/idle/unknown）
-    "since": None,              # **monotonic 秒**：該方向首次被觀測的時間點
-    "held_sec": 0.0,            # 該方向已持續秒數（monotonic 實際時間，Start Debounce 依據）
-    "streak": 0,                # 連續同方向次數（僅輔助資訊，不作觸發依據）
-    # 冷卻截止時間（**monotonic 秒**；None = 無冷卻）。auto_stop 收尾成功後設定。
-    # 冷卻期間一律不得建立 Session —— 不論方向如何變化、模式或排程是否重開。
-    "cooldown_until": None,
-    # 排程感知（Phase 3.5）：最近一次算出的 schedule_ctx 與其 monotonic 時間戳（供快取與顯示）
-    "sched_ctx": None,
-    "sched_ctx_at": None,
-    "template_status": "unknown",   # enabled / none / unknown（僅資訊，**不阻擋**建立）
-    # ---- 訊息去重用的「上次已印內容」；三者**必須各自獨立**，不可共用一個 key ----
-    # 背景取樣器（5s）與 Dashboard 監看層（15s）是兩個不同節奏的輸出來源，
-    # 若共用同一個 key，兩邊會交替覆寫而讓彼此的去重失效 → 同一條件反覆洗版。
-    "last_note": None,          # 監看層的判斷訊息（auto_schedule_check）
-    "last_start_note": None,    # Start Debounce 累積中的提示（START_HOLD）
-    "last_cooldown_note": None,  # 冷卻中的提示（COOLDOWN）
-    "last_status": None,        # 監看層的狀態摘要（_monitor_status_line）
-    "last_stop_note": None,     # 背景取樣器的停止提示（AUTO_STOP_ENABLED=False 時）
-    "disabled": False,          # 監看暫停（登入失敗）；**可恢復**，非永久停用
-    "login_failed_at": None,    # monotonic：上次登入失敗時間（用於 60s 靜默重試節流）
-    # ↓ 畫面輸出用的暫存旗標（非監看狀態；集中宣告於此，避免散落成動態新增的 key）
-    "_pending_nl": False,       # 游標仍停在提示行末端 → 下一行輸出前需補一次換行
-    "_no_tty_warned": False,    # 非互動 stdin 的提示只顯示一次
-}
-# 系統時間（datetime.now）可能被使用者/NTP 調整 → 一律用 time.monotonic 計算持續時間。
-_MODE_LABEL_TO_CODE = {"智慧模式": "smart", "手動模式": "manual", "未開啟模式": "none"}
 
 
-def _auto_reset_tracking():
-    """清空方向追蹤（建立/停止 Session 後重新起算持續時間）。"""
-    _auto.update(direction=None, since=None, held_sec=0.0, streak=0)
 
 
-def _auto_pending_newline(on=True):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _ownership_line():
     """
-    標記「游標目前停在提示行末端」。自動刷新逾時時不主動換行（否則每 15s 都會多一行空白），
-    改由真正要輸出的第一行自己補換行 → 沒有輸出就完全不留痕跡。
-    """
-    _auto["_pending_nl"] = bool(on)
+    Dashboard 的 Monitor Ownership 狀態行（Phase 4.5）。三態明確區分：
 
+      Owner       本視窗負責 Auto Report
+      Observer    其他行程持有 → 本視窗不寫報告
+      unavailable 取不到（fail closed）→ 自動報告停用
 
-def _auto_print(text):
-    """輸出一行；若游標仍停在提示行末端，先補一次換行（只補一次）。"""
-    if _auto.get("_pending_nl"):
-        print()
-        _auto["_pending_nl"] = False
-    print(text)
-
-
-def _auto_clear_notes():
-    """清除所有訊息去重狀態（Session 起訖、監看恢復時呼叫），確保新一輪會重新提示一次。"""
-    _auto.update(last_note=None, last_status=None, last_stop_note=None,
-                 last_start_note=None, last_cooldown_note=None)
-
-
-def _auto_cooldown_remaining():
-    """
-    冷卻剩餘秒數（monotonic）；0.0 = 無冷卻或已期滿。
-    與呼叫頻率無關 —— 呼叫得再密集也不會讓冷卻提早結束。
-    """
-    until = _auto.get("cooldown_until")
-    if until is None:
-        return 0.0
-    return max(0.0, until - time.monotonic())
-
-
-def _auto_start_cooldown():
-    """auto_stop 收尾成功後啟動冷卻（見 CFG.AUTO_COOLDOWN_SEC 的三項理由）。"""
-    sec = getattr(CDR_CFG, "AUTO_COOLDOWN_SEC", 0) or 0
-    _auto["cooldown_until"] = (time.monotonic() + sec) if sec > 0 else None
-    return sec
-
-
-def _auto_note(text, key="last_note", with_time=False):
-    """
-    僅在訊息與上次不同時列印（避免每 15s 重複洗畫面）。回傳是否真的印出。
-    with_time=True 時列印會加上 HH:MM:SS 前綴；比較仍以「不含時間」的內容為準，
-    否則每輪時間都不同會導致每次都印。
-    """
-    if text == _auto[key]:
-        return False
-    _auto[key] = text
-    _auto_print(f"[{time.strftime('%H:%M:%S')}] {text}" if with_time else text)
-    return True
-
-
-def _auto_track_direction(direction, now=None):
-    """
-    以 monotonic 時間累計「同一方向持續多久」。回傳 (held_sec, changed)。
-    方向改變 → 重新起算（held=0）；相同 → held = now - since。
-    不使用系統日期時間，避免電腦時間被調整後判斷錯誤。
-    """
-    now = time.monotonic() if now is None else now
-    if direction != _auto["direction"]:
-        _auto.update(direction=direction, since=now, held_sec=0.0, streak=1)
-        return 0.0, True
-    _auto["streak"] += 1
-    held = max(0.0, now - _auto["since"]) if _auto["since"] is not None else 0.0
-    _auto["held_sec"] = held
-    return held, False
-
-
-def _monitor_client(force=False):
-    """
-    取得監看用的共用 client，並處理「登入失敗 → 可恢復」：
-      - 正常：直接回傳已快取的共用 client（**不會重新登入**）。
-      - 首次失敗：印一次提示，暫停監看（disabled=True）並記錄失敗時間。
-      - 暫停期間：每 AUTO_LOGIN_RETRY_SEC（60s）**靜默**重試一次（不洗畫面）；
-                  force=True（使用者按 r）則立即重試，不受節流限制。
-      - 恢復成功：印一次「自動監看已恢復」，回到正常 15 秒監看。
-    回傳 (client 或 None, printed)。
-    """
-    if not _auto["disabled"]:
-        client = _report_client()
-        if client is not None:
-            return client, False
-        _auto.update(disabled=True, login_failed_at=time.monotonic())
-        _auto_print(f"[AUTO] 登入失敗 → 暫停智慧排程自動偵測"
-                    f"（每 {AUTO_LOGIN_RETRY_SEC}s 自動重試，或按 r 立即重試；"
-                    f"設備控制選單不受影響）")
-        return None, True
-
-    # ---- 暫停中：節流重試（靜默；api_client 的登入訊息一併抑制，避免每 60s 洗畫面）----
-    last = _auto["login_failed_at"]
-    if not force and last is not None and (time.monotonic() - last) < AUTO_LOGIN_RETRY_SEC:
-        return None, False
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            client = _report_client(quiet=True)
-    except Exception:
-        client = None
-    if client is None:
-        _auto["login_failed_at"] = time.monotonic()
-        return None, False                       # 重試失敗 → 完全不輸出
-    _auto.update(disabled=False, login_failed_at=None)
-    _auto_clear_notes()                          # 監看恢復 → 讓各類提示重新各印一次
-    _auto_print("[AUTO] 登入成功 → 自動監看已恢復"
-                f"（每 {AUTO_REFRESH_SEC}s 更新 PCS／排程／充放電狀態）")
-    return client, True
-
-
-def _auto_control_mode_code(r):
-    """PCS 控制模式機器語意：優先讀 pcs_control_mode_code；舊 reading 才退回中文標籤對照。"""
-    code = r.get("pcs_control_mode_code")
-    if code:
-        return str(code)
-    return _MODE_LABEL_TO_CODE.get(str(r.get("pcs_control_mode", "")), "unknown")
-
-
-def _auto_enabled_plan_state(client):
-    """
-    排程配置清單狀態（**僅供資訊，永不阻擋報告建立**）：
-      enabled = 至少一筆 enableFlag==1 / none = 取得成功但無啟用 / unknown = API 取得失敗或格式非預期。
-    """
-    if client is None:
-        return "unknown"
-    try:
-        with _CLIENT_LOCK:
-            tpls = client.get(_SCHED_TPL_LIST)
-    except Exception as e:
-        _auto_print(f"[AUTO] 排程配置清單讀取失敗（不影響報告建立）：{e}")
-        return "unknown"
-    if not isinstance(tpls, list):
-        return "unknown"
-    return ("enabled" if any(_sched_template_enabled(t) for t in tpls if isinstance(t, dict))
-            else "none")
-
-
-# ======================================================================
-# 排程感知（Schedule Context）—— Phase 3.5
-# ----------------------------------------------------------------------
-# 職責分工：本層只負責「把排程窗口狀態算出來」，**不做任何停止判定**；
-#           決策一律留在 ReportSession.should_auto_end(schedule_ctx=...)。
-# 時間來源：PC 時間 + CFG.AUTO_WINDOW_GRACE_SEC 寬限（不依賴設備 dataCollectTime）。
-# 呼叫時機：僅在 idle 開始累積時查詢，並快取 CFG.AUTO_WINDOW_CACHE_SEC 秒。
-# ======================================================================
-def _hhmm_to_min(s):
-    """'17:00' → 1020（當日分鐘數）；格式非預期回 None。"""
-    try:
-        h, m = str(s).strip().split(":")[:2]
-        h, m = int(h), int(m)
-    except (ValueError, AttributeError, IndexError):
-        return None
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        return None
-    return h * 60 + m
-
-
-def _plan_applies_on(plan, day):
-    """該排程模板是否適用於指定日期（datetime.date）。"""
-    if plan["plan_type"] == 1:                       # 每週：executeTime 為 isoweekday 逗號字串
-        return str(day.isoweekday()) in plan["days"]
-    if plan["plan_type"] == 2:                       # 按日期：executeTime 為 'MM-DD'
-        return plan["date"] == day.strftime("%m-%d")
-    return False
-
-
-def fetch_enabled_plans(client, tpl_path, item_path_fmt):
-    """
-    唯讀取得**已啟用**（enableFlag==1）排程模板底下的所有項目。
-    回傳 (plans, ok)：plans 為 list[dict]；ok=False 表示 API 失敗或格式非預期。
-    """
-    try:
-        with _CLIENT_LOCK:
-            tpls = client.get(tpl_path)
-    except Exception as e:
-        print(f"[AUTO] 排程清單讀取失敗（窗口判定退回純 idle 門檻）：{e}")
-        return [], False
-    if not isinstance(tpls, list):
-        return [], False
-    plans = []
-    for t in tpls:
-        if not isinstance(t, dict) or t.get("enableFlag") not in (1, "1"):
-            continue
-        try:
-            with _CLIENT_LOCK:
-                items = client.get(item_path_fmt.format(tid=t.get("tempId")))
-        except Exception as e:
-            print(f"[AUTO] 排程項目讀取失敗（tempId={t.get('tempId')}）：{e}")
-            return [], False
-        if not isinstance(items, list):
-            return [], False
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            s, e = _hhmm_to_min(it.get("startTime")), _hhmm_to_min(it.get("endTime"))
-            if s is None or e is None:
-                continue
-            plans.append({
-                "name": t.get("tempName"),
-                "plan_type": t.get("plan_type", t.get("planType")),
-                "days": [x for x in str(t.get("executeTime") or "").split(",") if x],
-                "date": str(t.get("executeTime") or ""),
-                "start_min": s, "end_min": e,
-                "start_txt": str(it.get("startTime")), "end_txt": str(it.get("endTime")),
-                # enum 對照與型別正規化一律用 config 的唯一定義（Phase 3.6 / D-1）
-                "cd": CDR_CFG.SCHED_CD_CODE.get(
-                    CDR_CFG.as_int(it.get("chargeOrDischarge")), "unknown"),
-            })
-    return plans, True
-
-
-def compute_schedule_ctx(plans, now, grace_sec=None, lookahead_days=8):
-    """
-    **純函式**：由排程清單與現在時間算出 schedule_ctx（無 I/O，供離線測試直接驗證）。
-
-    回傳 {"in_window", "current_plan", "next_plan_in_sec", "source"}。
-      in_window        ：現在是否落在任一啟用排程項目的時段內（含前後 grace 寬限）
-      current_plan     ：命中的項目描述（如 "Charge 17:00~17:50 charge"），無則 None
-      next_plan_in_sec ：距下一段排程開始的秒數；未來 lookahead_days 內查無則 None
-      source           ："ok"
-
-    跨午夜（end <= start，如 22:00~02:00）處理：
-      該時段橫跨兩天 —— 22:00~24:00 屬「當天」、00:00~02:00 屬「前一天」的排程，
-      因此判斷 00:00~02:00 時要看**前一天**是否符合執行日。
-    """
-    grace = (getattr(CDR_CFG, "AUTO_WINDOW_GRACE_SEC", 0) or 0) if grace_sec is None else grace_sec
-    gmin = grace / 60.0
-    today = now.date()
-    yesterday = today - timedelta(days=1)
-    now_min = now.hour * 60 + now.minute + now.second / 60.0
-
-    in_window, current = False, None
-    for p in plans:
-        s, e = p["start_min"], p["end_min"]
-        hit = False
-        if e > s:                                     # 一般時段
-            hit = _plan_applies_on(p, today) and (s - gmin) <= now_min < (e + gmin)
-        elif e < s:                                   # 跨午夜
-            hit = ((_plan_applies_on(p, today) and now_min >= (s - gmin))
-                   or (_plan_applies_on(p, yesterday) and now_min < (e + gmin)))
-        # e == s → 零長度時段，視為不成立
-        if hit:
-            in_window = True
-            current = f"{p['name']} {p['start_txt']}~{p['end_txt']} {p['cd']}"
-            break
-
-    # 下一段排程開始時間：往後掃 lookahead_days 天，取最近且尚未開始者
-    next_sec = None
-    for d in range(lookahead_days):
-        day = today + timedelta(days=d)
-        for p in plans:
-            if not _plan_applies_on(p, day):
-                continue
-            start_dt = (datetime.combine(day, dtime())
-                        + timedelta(minutes=p["start_min"]))
-            delta = (start_dt - now).total_seconds()
-            if delta > 0 and (next_sec is None or delta < next_sec):
-                next_sec = delta
-        if next_sec is not None and d >= 1:
-            break                                     # 已找到且掃過隔天 → 不需再往後
-    return {"in_window": in_window, "current_plan": current,
-            "next_plan_in_sec": next_sec, "source": "ok"}
-
-
-def _schedule_window_ctx(client, now=None):
-    """
-    取得 schedule_ctx（含快取）。失敗回 source="unknown" → should_auto_end 會退回 3.4 行為。
-    快取於 _auto["sched_ctx"]，有效期 CFG.AUTO_WINDOW_CACHE_SEC 秒。
-    """
-    ttl = getattr(CDR_CFG, "AUTO_WINDOW_CACHE_SEC", 0) or 0
-    cached_at = _auto.get("sched_ctx_at")
-    if (cached_at is not None and _auto.get("sched_ctx") is not None
-            and (time.monotonic() - cached_at) < ttl):
-        return _auto["sched_ctx"]
-    if client is None:
-        ctx = {"in_window": False, "current_plan": None,
-               "next_plan_in_sec": None, "source": "unknown"}
-    else:
-        plans, ok = fetch_enabled_plans(client, _SCHED_TPL_LIST, _SCHED_ITEM_LIST)
-        if not ok:
-            ctx = {"in_window": False, "current_plan": None,
-                   "next_plan_in_sec": None, "source": "unknown"}
-        else:
-            ctx = compute_schedule_ctx(plans, now or datetime.now())
-    _auto.update(sched_ctx=ctx, sched_ctx_at=time.monotonic())
-    return ctx
-
-
-def _schedule_ctx_text(ctx):
-    """schedule_ctx → Debug 顯示字串。"""
-    if not isinstance(ctx, dict):
-        return ""
-    if ctx.get("source") != "ok":
-        return " window=unknown"
-    if ctx.get("in_window"):
-        return f" window=in({ctx.get('current_plan')})"
-    nxt = ctx.get("next_plan_in_sec")
-    return f" window=out next={'none' if nxt is None else f'{nxt:.0f}s'}"
-
-
-def auto_schedule_check(r, client=None, source="auto"):
-    """
-    智慧排程自動建立報告（Phase 2 基本版）。由 Dashboard 刷新流程取得 reading 後**明確呼叫**。
-    只做判斷與委派：不自行取樣、不自行登入、不複製報告邏輯。
-
-    建立條件（須全部成立）：
-      A. pcs_control_mode_code == "smart"      智慧模式（語言無關）
-      B. pcs_schedule_enabled is True          排程主開關開
-      C. 實際方向為 charge / discharge         ← systemCharging/DischargingStatus.oldValue
-      D. _report["session"] is None            目前沒有任何 Report Session（手動建立的也算）
-      E. PCS 非故障                            ← CDR.pcs_is_fault（pcs_fault_flag）
-      F. 狀態機不在 START_PENDING / STOP_PENDING
-
-    排程配置清單（template list）僅記錄 enabled/none/unknown，**取得失敗也照建報告**。
-    Phase 2 不做 debounce（持續時間只記錄不判斷），也不自動停止報告（沿用既有 control_stop /
-    fault_stop / communication_error），停止 debounce 留待 Phase 3。
-
-    回傳 (action, reason)：action ∈ started / skipped / noop。
+    ⚠️ 三態一律由 RM.is_owner() 與 acquire 的 reason 判定（Windows Mutex）。
+       owner_info() 讀來的 json **只用於補充「誰持有」的描述文字**，
+       不參與判定 —— json 缺失或損壞只會讓描述降級為「詳細資訊不可用」。
     """
     if not _REPORT_AVAILABLE:
-        return "noop", "report_module_unavailable"
-    if _auto["disabled"]:
-        return "noop", "monitor_disabled"
-    if not isinstance(r, dict):
-        _auto_note("[AUTO] 本輪取樣失敗 → 略過自動判斷（不建立、不停止）")
-        return "noop", "no_reading"
-
-    direction, fault = _actual_direction(r)
-    held, _changed = _auto_track_direction(direction)
-    mode_code = _auto_control_mode_code(r)
-    sched_on = r.get("pcs_schedule_enabled") is True
-
-    with _SESSION_LOCK:
-        # ---- 狀態機 ↔ 實際 Session 同步（手動 Menu 建立/停止的 Session 也要反映進來）----
-        # START_HOLD 是**每輪重新推導**的顯示狀態，先歸零再依本輪條件重新決定，
-        # 確保任一守門條件失效時會確實回到 IDLE（不會卡在 START_HOLD）。
-        if _report["session"] is None:
-            if _auto["state"] in (AUTO_RUNNING, AUTO_START_HOLD):
-                _auto["state"] = AUTO_IDLE          # 報告已結束／重新推導 START_HOLD
-        elif _auto["state"] in (AUTO_IDLE, AUTO_START_HOLD, AUTO_START_PENDING):
-            _auto["state"] = AUTO_RUNNING           # 手動流程建立的 Session：共用同一狀態
-
-        st = _auto["state"]
-        # F：Start/Stop 進行中 → 本輪不處理（防止同一輪、或手動＋自動雙來源重複觸發）
-        if _report["stopping"]:
-            return "skipped", "state=STOP_PENDING"
-        if st in (AUTO_START_PENDING, AUTO_STOP_PENDING):
-            return "skipped", f"state={st}"
-        # D：已有 Session → 絕不建立第二份（方向切換由控制流程沿用同一 Session）
-        if _report["session"] is not None:
-            _auto_note(f"[AUTO] 已有進行中的報告 Session（{_report['session'].session_id}）"
-                       f"→ 不建立新報告")
-            return "skipped", "session_exists"
-        # COOLDOWN：auto_stop 收尾後的冷卻期，**一律不得建立任何 Session**。
-        # 刻意置於 E/A/B/C/G 之前 → 期間即使方向改變（charge↔discharge）、
-        # 智慧模式重開、排程重開，也全部等冷卻結束才重新開始判斷。
-        _cd = _auto_cooldown_remaining()
-        if _cd > 0:
-            _auto["state"] = AUTO_COOLDOWN
-            _auto_note(f"[AUTO] 自動收尾後冷卻中（剩餘 {_cd:.0f}s / "
-                       f"{CDR_CFG.AUTO_COOLDOWN_SEC}s）→ 期間一律不建立新報告",
-                       key="last_cooldown_note")
-            return "skipped", f"cooldown={_cd:.0f}s"
-        if _auto["state"] == AUTO_COOLDOWN:         # 冷卻剛期滿 → 回到正常判斷
-            _auto.update(state=AUTO_IDLE, cooldown_until=None, last_cooldown_note=None)
-        # E：PCS 故障 → 不建立（故障停止沿用既有 SafetyMonitor / fault_stop）
-        if fault:
-            _auto_note("[AUTO] PCS 故障中（pcs_fault_flag）→ 不建立新報告")
-            return "skipped", "pcs_fault"
-        # A / B：非智慧模式或排程主開關未開 → 不自動建立
-        if mode_code != "smart":
-            _auto_note(f"[AUTO] 控制模式非智慧模式（{mode_code}）→ 不自動建立報告")
-            return "skipped", f"control_mode={mode_code}"
-        if not sched_on:
-            _auto_note("[AUTO] 排程主開關未開啟 → 不自動建立報告")
-            return "skipped", "schedule_off"
-        # C：尚未實際充/放電（含 idle / unknown）→ 只等待，不建立
-        if direction not in ("charge", "discharge"):
-            _auto_note(f"[AUTO] 智慧模式＋排程已開，但設備方向為 {direction}"
-                       f"（持續 {held:.0f}s）→ 等待實際充/放電")
-            return "skipped", f"direction={direction}"
-
-        # ---- A~F 全部成立 ----
-        zh = "充電" if direction == "charge" else "放電"
-        # G：Start Debounce —— 同方向需**持續**達門檻才建立，濾掉設備旗標瞬時抖動。
-        #    held 為 monotonic 實際經過秒數（非取樣次數）→ 與呼叫頻率完全解耦；
-        #    未來由 Auto Monitor Service 以更短週期呼叫時，此邏輯一行都不需要改。
-        _hold_start = getattr(CDR_CFG, "AUTO_HOLD_START_SEC", 0) or 0
-        if held < _hold_start:
-            _auto["state"] = AUTO_START_HOLD
-            _auto_note(f"[AUTO] 偵測到實際{zh}，去抖動中"
-                       f"（持續 {held:.0f}s / {_hold_start}s）→ 尚未建立報告",
-                       key="last_start_note")
-            return "skipped", f"start_hold={held:.0f}s/{_hold_start}s"
-        # 安全開關（config.AUTO_SCHEDULE_REPORT_ENABLED）：關閉時只判斷與記錄，不建立 Session。
-        # **只擋自動建立**：手動報告（Menu 18/19）與手動控制後的自動跟隨完全不受影響。
-        if not getattr(CDR_CFG, "AUTO_SCHEDULE_REPORT_ENABLED", False):
-            _auto_note(f"[AUTO] 條件全部成立（實際{zh}，持續 {held:.0f}s）"
-                       f"但自動報告開關為關閉（AUTO_SCHEDULE_REPORT_ENABLED=False）"
-                       f"→ 僅記錄，不建立報告")
-            return "skipped", "auto_report_disabled"
-
-        # 佔位（claim）：在鎖內把狀態切成 START_PENDING，之後任何呼叫都會在上面的 F 被擋掉。
-        # 這一步就是唯一性的保證 → 因此接下來的網路等待可以安全地在鎖外執行。
-        _auto["state"] = AUTO_START_PENDING
-
-    # ---- 建立報告（**已離開 _SESSION_LOCK**：template GET 與 sess.start() 的網路等待不鎖住 Dashboard）
-    sess = None
-    try:
-        _auto_print(f"[AUTO] 條件成立：智慧模式＋排程開啟＋實際{zh}"
-                    f"（持續 {held:.0f}s／連續 {_auto['streak']} 次；來源 {source}）"
-                    f"→ 建立充放電報告")
-        _auto["template_status"] = _auto_enabled_plan_state(client or _report["client"])
-        print(f"[AUTO] 排程配置清單：{_auto['template_status']}（僅供資訊，不影響報告建立）")
-        ev_type = "auto_charge_start" if direction == "charge" else "auto_discharge_start"
-        sess, _created = _report_start_session(      # 內部自行取得 _SESSION_LOCK（RLock）
-            direction,
-            r.get("pcs_power_control_mode") or "交流有功",
-            None,
-            origin="scheduler",
-            # detail 開頭寫入 origin=scheduler：讓 events.csv 本身能自證「誰建立了這份報告」，
-            # 不必回頭看當時的 console 輸出（origin 與 source 語意不同：
-            #   origin=scheduler/manual → 誰建立；source=auto/manual → 哪種刷新觸發）。
-            # 僅增加 detail 文字，不改 CSV schema、不增欄位。
-            extra_events=[(ev_type, "info",
-                           f"origin=scheduler｜智慧排程自動開始{zh}｜方向持續 {held:.0f}s｜"
-                           f"排程配置 {_auto['template_status']}｜刷新來源 {source}")],
-        )
-    finally:
-        with _SESSION_LOCK:                          # 瞬時：離開 pending（成功或失敗都要）
-            _auto["state"] = AUTO_RUNNING if _report["session"] is not None else AUTO_IDLE
-    if sess is None:
-        _auto_note("[AUTO] 建立報告失敗（詳見上方訊息）→ 下一輪重試")
-        return "skipped", "start_failed"
-    _auto_reset_tracking()
-    _auto_clear_notes()                              # 已建立 → 解除訊息抑制（含停止提示）
-    return "started", direction
-
-
-def _monitor_status_line(r, source="auto"):
-    """
-    監看 Debug 一行（實機唯讀觀察階段用）。**不含時間戳**，才能做「僅在改變時列印」的比較。
-    欄位固定：control_mode_code / schedule_enabled / charging_flag / discharging_flag /
-              fault_flag / direction / auto_state / session / source / held_sec
-    """
-    if not isinstance(r, dict):
-        return "[AUTO] 取樣失敗（本輪略過）"
-    d, fault = _actual_direction(r)
-    sess = _report["session"]
-    # 三個倒數擇一顯示，讓現場一眼看出目前卡在哪個階段（皆為顯示，不參與判定）：
-    #   有 Session   → idle=XXs/60s      （Stop Debounce，距離自動收尾）
-    #   冷卻中       → cooldown=XXs/60s  （收尾後冷卻，期間不建立新報告）
-    #   其餘         → hold=XXs/15s      （Start Debounce，距離建立報告）
-    idle_txt = ""
-    try:
-        if sess is not None:
-            _h = getattr(CDR_CFG, "AUTO_HOLD_STOP_SEC", 0)
-            idle_txt = f" idle={sess.idle_held_seconds():.0f}s/{_h}s"
-            # 排程窗口（Phase 3.5）：僅在 idle 累積期間才會有 ctx，其餘時候不顯示
-            if sess.idle_held_seconds() > 0:
-                idle_txt += _schedule_ctx_text(_auto.get("sched_ctx"))
-        else:
-            _cd = _auto_cooldown_remaining()
-            if _cd > 0:
-                _c = getattr(CDR_CFG, "AUTO_COOLDOWN_SEC", 0)
-                idle_txt = f" cooldown={_cd:.0f}s/{_c}s"
-            else:
-                _s = getattr(CDR_CFG, "AUTO_HOLD_START_SEC", 0)
-                idle_txt = f" hold={_auto['held_sec']:.0f}s/{_s}s"
-    except Exception:
-        idle_txt = ""
-    return ("[AUTO] "
-            f"mode={_auto_control_mode_code(r)}"
-            f" sched={r.get('pcs_schedule_enabled')}"
-            f" chg={r.get('pcs_charging_flag')}"
-            f" dis={r.get('pcs_discharging_flag')}"
-            # run / stby 為**顯示強化**：讓現場直接看見排程結束時的旗標轉換
-            # （systemOnOrOffStatus / systemStandbyStatus 的 oldValue）。
-            # 判斷仍一律由 pcs_is_idle_state() 與 should_auto_end() 負責，此處不參與決策。
-            f" run={r.get('pcs_running_flag')}"
-            f" stby={r.get('pcs_standby_flag')}"
-            f" fault={r.get('pcs_fault_flag')}({'是' if fault else '否'})"
-            f" dir={d}"
-            f" state={_auto['state']}"
-            f" session={sess.session_id if sess is not None else 'None'}"
-            f" src={source}"
-            f"{idle_txt}"
-            f"｜SOC {r.get('soc_percent')}% P {r.get('actual_active_power_kw')}kW")
+        return "Monitor Owner：報告模組未載入 → 自動報告停用"
+    if RM.is_owner():
+        st = RM.ownership_state()
+        extra = "（接管自異常結束的前一個 Owner）" if st.get("abandoned") else ""
+        return (f"Monitor Owner：本視窗（{st.get('role') or '?'}，pid {os.getpid()}）"
+                f"{extra} → 本視窗負責 Auto Report")
+    _why = (RM.ownership_state() or {}).get("reason")
+    if _why == "held_by_other":
+        return (f"Monitor Owner：{_owner_who_text(RM.owner_info() or {})}"
+                f" → 本視窗為 Observer，不建立/續接/收尾任何報告")
+    return (f"Monitor Owner：無法取得（{_why or '未嘗試'}）"
+            f" → 自動報告已停用（fail closed）；人工控制仍正常")
 
 
 def _monitor_footer():
@@ -1828,11 +859,12 @@ def _monitor_footer():
     避免誤以為所有欄位都在自動更新。同時顯示自動報告安全開關的實際狀態。
     """
     armed = getattr(CDR_CFG, "AUTO_SCHEDULE_REPORT_ENABLED", False) if CDR_CFG else False
-    if _auto["disabled"]:
-        state = f"暫停（登入失敗，每 {AUTO_LOGIN_RETRY_SEC}s 重試，或按 r 立即重試）"
+    if RM._auto["disabled"]:
+        state = f"暫停（登入失敗，每 {RM.AUTO_LOGIN_RETRY_SEC}s 重試，或按 r 立即重試）"
     else:
-        state = f"每 {AUTO_REFRESH_SEC} 秒更新"
+        state = f"每 {RM.AUTO_REFRESH_SEC} 秒更新"
     print(f"\n{_BLOCK_SEP}")
+    print(_ownership_line())
     print(f"自動監看：PCS／排程／充放電狀態 —— {state}")
     print(f"　　　　　自動建立報告：{'開啟' if armed else '關閉'}"
           f"（AUTO_SCHEDULE_REPORT_ENABLED={armed}）")
@@ -1862,24 +894,24 @@ def dashboard_refresh(auto=False):
         return None, printed
 
     # 共用 client（整個程式只登入一次）；登入失敗可恢復：按 r 立即重試、自動每 60s 靜默重試
-    client, login_printed = _monitor_client(force=not auto)
+    client, login_printed = RM._monitor_client(force=not auto)
     printed = printed or login_printed
     if client is None:
         if not auto:
             _monitor_footer()
         return None, printed
 
-    reading = _read_device_state(client)             # ← 純資料讀取（_CLIENT_LOCK 只包這一次取樣）
+    reading = RM._read_device_state(client)             # ← 純資料讀取（_CLIENT_LOCK 只包這一次取樣）
     debug_always = getattr(CDR_CFG, "AUTO_MONITOR_DEBUG", False)
-    line = _monitor_status_line(reading, source)
+    line = RM._monitor_status_line(reading, source)
     if debug_always:
-        _auto_print(f"[{time.strftime('%H:%M:%S')}] {line}")     # 每輪都印（唯讀觀察階段）
-        _auto["last_status"] = line
+        RM._auto_print(f"[{time.strftime('%H:%M:%S')}] {line}")     # 每輪都印（唯讀觀察階段）
+        RM._auto["last_status"] = line
         printed = True
-    elif _auto_note(line, key="last_status", with_time=True):
+    elif RM._auto_note(line, key="last_status", with_time=True):
         printed = True                               # 僅在監看狀態改變時印
 
-    act, _reason = auto_schedule_check(reading, client=client, source=source)
+    act, _reason = RM.auto_schedule_check(reading, client=client, source=source)
     if act == "started":
         printed = True
     if not auto:
@@ -1887,11 +919,113 @@ def dashboard_refresh(auto=False):
     return reading, printed
 
 
+def _observer_status_line():
+    """
+    Observer 模式下，由**磁碟唯讀**呈現 Owner 正在記錄的 Session（Phase 4.5）。
+
+    沒有這一行，Observer 會完全看不到「別的行程正在錄製」，容易誤以為系統沒在工作。
+
+    ⚠️ 嚴格唯讀：只解析 session_state.json —— 不建立 ReportSession 物件、不 resume、
+       不啟動取樣執行緒、不寫入任何檔案。
+    ⚠️ 本行純顯示，與 Ownership 判定無關（判定一律 RM.is_owner()）。
+    """
+    try:
+        folder = CDR.find_active_session(RM._report_output_root())
+        if not folder:
+            return None
+        st = RM._load_json(os.path.join(folder, CDR_CFG.FILE_SESSION_STATE))
+        if not isinstance(st, dict):
+            return None
+        return ("【充放電報告｜由 Monitor Owner 記錄中】"
+                f"{st.get('session_id', os.path.basename(folder))}｜"
+                f"status={st.get('status', '?')}｜"
+                f"方向 {st.get('action', '-')}｜"
+                f"取樣 {st.get('sample_count', '-')} 筆｜"
+                f"最後取樣 {st.get('last_sample_time', '-')}"
+                "（唯讀顯示；本視窗為 Observer）")
+    except Exception:                                    # noqa: BLE001
+        return None
+
+def _require_owner(action):
+    """
+    報告類操作的 UI 守門（Phase 4.5）。回傳 True=可執行。
+
+    ⚠️ 這只是 UX —— 讓使用者立刻知道為什麼沒反應，取代原本的 silent no-op。
+       **真正的防線是 report_monitor 的 Writer Gate（_report_bg_start）**：
+       即使這裡漏判，Core 仍會阻止非 Owner 寫入。兩者不可互相取代。
+    """
+    if RM.is_owner():
+        return True
+    info = RM.owner_info() or {}
+    who = _owner_who_text(info)
+    print(f"\n[OBSERVER] 無法{action}：Auto Monitor 由{who}持有。")
+    print("           本視窗為唯讀觀察模式 —— 報告的建立、續接與收尾一律由該行程負責。")
+    print("           設備狀態顯示與人工控制（Menu 1~17）不受影響。")
+    return False
+
+
+def _owner_who_text(info):
+    """由 owner_info() 的內容組出「誰持有」的描述；資訊不可用時降級顯示。"""
+    if not isinstance(info, dict) or not info:
+        return "其他行程（詳細資訊不可用）"
+    role = {"service": "背景服務", "dashboard": "另一個 Dashboard 視窗"}.get(
+        info.get("role"), info.get("role") or "其他行程")
+    pid = info.get("pid")
+    since = info.get("started_at")
+    txt = role + (f"（pid {pid}" if pid else "（pid ?")
+    txt += f"，自 {since} 起）" if since else "）"
+    if info.get("abandoned_takeover"):
+        txt += "（接管自異常結束的前一個 Owner）"
+    return txt
+
+
+def report_start_interactive():
+    """
+    Menu 18 的**互動**入口（Phase 4.5：input() 一律留在 UI 層）。
+
+    report_monitor 是 Monitor Core，會被 auto_monitor_service 使用，
+    而 Windows Service（Phase 4.6）沒有 console —— Core 內任何 input() 都會讓服務卡死。
+    故此處收集參數後，交給純參數的 RM.report_start(mode_label, setpoint)。
+    續接既有 Session 時不需要參數，因此先判斷再決定是否詢問。
+    """
+    if not _REPORT_AVAILABLE:
+        print(f"[錯誤] 無法載入報告模組：{_REPORT_IMPORT_ERR}")
+        return
+    if not _require_owner("開始報告"):
+        return
+    # 已有未完成 Session → 續接，不詢問參數（沿用磁碟上的既有設定）
+    try:
+        _active = CDR.find_active_session(RM._report_output_root())
+    except Exception:                                    # noqa: BLE001
+        _active = None
+    if _active:
+        RM.report_start()
+        return
+    mode = "交流有功"
+    setpoint = None
+    try:
+        mode = input("控制方式（交流有功/直流恆流/直流恆功率，Enter=交流有功）：").strip() or mode
+    except (EOFError, KeyboardInterrupt):
+        pass
+    try:
+        _raw = input("設定值（選填，Enter 略過）：").strip()
+    except (EOFError, KeyboardInterrupt):
+        _raw = ""
+    if _raw:
+        try:
+            setpoint = float(_raw)
+        except ValueError:
+            print("設定值格式錯誤，改為不記錄設定值。")
+    RM.report_start(mode_label=mode, setpoint=setpoint)
+
+
+
 def report_status_line():
     """主選單顯示用：進行中報告的一行摘要；無則回 None。"""
-    sess = _report["session"]
+    sess = RM._report["session"]
     if sess is None:
-        return None
+        # 非 Owner（Observer）→ 由磁碟唯讀顯示 Owner 的 Session
+        return _observer_status_line() if not RM.is_owner() else None
     last = sess.samples[-1] if sess.samples else {}
     return ("【充放電報告｜記錄中】"
             f"{sess.session_id}｜經過 {sess._elapsed():.0f}s｜"
@@ -1912,7 +1046,7 @@ def report_view_latest():
     if not _REPORT_AVAILABLE:
         print(f"[錯誤] 無法載入報告模組：{_REPORT_IMPORT_ERR}")
         return
-    root = _report_output_root()            # 由程式檔位置建立的絕對路徑，不依賴目前工作目錄
+    root = RM._report_output_root()            # 由程式檔位置建立的絕對路徑，不依賴目前工作目錄
     print(f"[REPORT] 搜尋路徑：{root}")
     try:
         if not os.path.isdir(root):
@@ -1923,7 +1057,7 @@ def report_view_latest():
             folder = os.path.join(root, name)
             if not os.path.isdir(folder):
                 continue
-            state = _load_json(os.path.join(folder, CDR_CFG.FILE_SESSION_STATE)) or {}
+            state = RM._load_json(os.path.join(folder, CDR_CFG.FILE_SESSION_STATE)) or {}
             sessions.append({
                 "folder": folder,
                 "mtime": os.path.getmtime(folder),
@@ -1957,52 +1091,19 @@ def report_view_latest():
 
 
 def _show_report_folder(folder):
-    data = _load_json(os.path.join(folder, CDR_CFG.FILE_SUMMARY))
+    data = RM._load_json(os.path.join(folder, CDR_CFG.FILE_SUMMARY))
     if not data:
         print(f"[錯誤] 無法讀取 summary.json：{folder}")
         return
-    _print_summary_json(data, folder)
+    RM._print_summary_json(data, folder)
 
 
-def _print_report_result(sess, stats):
-    data = _load_json(os.path.join(sess.folder, CDR_CFG.FILE_SUMMARY))
-    if data:
-        _print_summary_json(data, sess.folder)
-    else:
-        print(f"報告已產生於：{sess.folder}（無法讀回 summary.json）")
 
 
-def _print_summary_json(data, path):
-    sess = data.get("session", {}) or {}
-    st = data.get("statistics", {}) or {}
-    val = data.get("validation", {}) or {}
-    # 簡易結果指標（依既有 summary 欄位；正式 PASS/FAIL 自動判定屬 V2，本處不臆造）
-    result = "PASS" if (val.get("data_complete") and not val.get("stop_recommended")) else "REVIEW"
-    print("\n============ 最近充放電報告 ============")
-    print(f"Session ID     : {sess.get('session_id')}")
-    print(f"方向(Direction) : {sess.get('action')}")
-    print(f"控制方式        : {sess.get('control_mode')}")
-    print(f"開始時間       : {sess.get('start_time')}")
-    print(f"結束時間       : {sess.get('end_time')}")
-    print(f"總時長(秒)     : {sess.get('duration_seconds')}")
-    print(f"SOC            : {st.get('start_soc_percent')} → {st.get('end_soc_percent')} "
-          f"（最高 {st.get('max_soc_percent')} / 最低 {st.get('min_soc_percent')}）")
-    print(f"最大充/放電功率 : {st.get('max_charge_power_kw')} / {st.get('max_discharge_power_kw')} kW")
-    print(f"累積充/放電    : {st.get('charged_energy_kwh')} / {st.get('discharged_energy_kwh')} kWh")
-    print(f"Net Energy     : {st.get('net_energy_kwh')} kWh")
-    print(f"往返效率       : {st.get('round_trip_efficiency_percent')}")
-    print(f"告警數(新增)   : {st.get('alarm_count')}（追蹤 {st.get('alarm_total_tracked')}）")
-    print(f"結束原因       : {sess.get('end_reason')}（{sess.get('end_reason_text')}）")
-    print(f"資料完整/建議停止: {val.get('data_complete')} / {val.get('stop_recommended')} "
-          f"{val.get('stop_reasons') or ''}")
-    print(f"結果           : {result}")
-    print(f"資料夾         : {path}")
 
 
 # ---- PCS 排程（唯讀查看 + 主開關控制入口）----
 _SCHED_MAIN = "/schedule/config/getScheduleSwitch"
-_SCHED_TPL_LIST = "/schedule/template/list"
-_SCHED_ITEM_LIST = "/schedule/list/{tid}"
 _SCHED_CD = {1: "充電", 2: "放電", 3: "不充不放"}
 _SCHED_PLAN = {1: "週", 2: "按日期"}
 _SCHED_WEEK = {"1": "一", "2": "二", "3": "三", "4": "四", "5": "五", "6": "六", "7": "日"}
@@ -2041,9 +1142,6 @@ def _menu_input(prompt):
         return "0"
 
 
-def _sched_template_enabled(t):
-    """模板是否啟用（enableFlag==1）。"""
-    return t.get("enableFlag") in (1, "1")
 
 
 def _sched_week_text(execute_time):
@@ -2055,8 +1153,8 @@ def _sched_enabled_item_count(client, tpls):
     """已啟用模板底下的排程項目總數（唯讀；供主開關警示判斷）。"""
     n = 0
     for t in tpls:
-        if _sched_template_enabled(t):
-            items = client.get(_SCHED_ITEM_LIST.format(tid=t.get("tempId")))
+        if RM._sched_template_enabled(t):
+            items = client.get(RM._SCHED_ITEM_LIST.format(tid=t.get("tempId")))
             n += len(items) if isinstance(items, list) else 0
     return n
 
@@ -2072,14 +1170,14 @@ def pcs_schedule_view():
         return
     while True:
         ps, _ms, _raw = _sched_switch_state(c)
-        tpls = c.get(_SCHED_TPL_LIST)
+        tpls = c.get(RM._SCHED_TPL_LIST)
         tpls = tpls if isinstance(tpls, list) else []
         print("\nPCS 排程配置")
         print(f"（排程主開關：{'開' if ps == 1 else ('關' if ps == 0 else '無法確認')}）")
         if not tpls:
             print("  (無排程模板)")
         for i, t in enumerate(tpls, 1):
-            en = _sched_template_enabled(t)
+            en = RM._sched_template_enabled(t)
             print(f"{i}. {t.get('tempName')}   狀態：{'已啟用' if en else '已停用'}")
         print("0. 返回")
         # 主開關已開但無任何啟用項目 → 警示（智慧模式 pre-check 依據）
@@ -2102,9 +1200,9 @@ def _pcs_schedule_template_submenu(client, tpl):
     """
     tid = tpl.get("tempId")
     while True:
-        en = _sched_template_enabled(tpl)
+        en = RM._sched_template_enabled(tpl)
         pt = tpl.get("planType")
-        items = client.get(_SCHED_ITEM_LIST.format(tid=tid))
+        items = client.get(RM._SCHED_ITEM_LIST.format(tid=tid))
         items = items if isinstance(items, list) else []
         print(f"\n排程名稱：{tpl.get('tempName')}")
         print(f"狀態：{'已啟用' if en else '已停用'}")
@@ -2137,32 +1235,78 @@ def _pcs_schedule_template_submenu(client, tpl):
             print("無效選項，請重新輸入。")
 
 
+# 選項 → (action, 控制紀錄用標籤, 選單顯示文字, 期望的 schedulePlanSwitch, 未支援原因)
+# 未支援原因 = None 代表可送出；非 None 則只顯示、不送出任何控制（機制保留供日後使用）。
+#
+# 2026-08-11：DevTools 實抓確認排程主開關另有專屬端點 editScheduleSwitch，
+#   兩個方向改走該端點後解除封鎖（先前 ON 失敗的原因是誤送 editManualSwitch）。
+SCHEDULE_SWITCH_ACTIONS = {
+    "1": ("pcs_schedule_on", "PCS 排程主開關開", "開啟排程主開關", 1, None),
+    "2": ("pcs_schedule_off", "PCS 排程主開關關", "關閉排程主開關", 0, None),
+}
+
+
 def _pcs_schedule_switch_menu():
     """
-    Item 8：PCS 排程主開關（開/關）。控制整個智慧排程（schedulePlanSwitch），與 Item 9 個別模板不同。
-    ⚠️ editScheduleSwitch 之實際 PUT payload 尚未由 DevTools 確認 → 開/關僅顯示、標示「尚未開放」，
-       不猜測、不送任何寫入（唯讀）。待確認 payload 後才實作（寫入後會重新 GET 驗證，失敗不顯示成功）。
+    Item 8：PCS 排程主開關（開/關）。
+
+    寫入端點：PUT /schedule/config/editScheduleSwitch（2026-08-11 DevTools 實抓確認）。
+      ⚠️ 與 Menu 2/3（手動模式）的 editManualSwitch **payload 完全相同、端點不同** ——
+         語意由端點決定，不可依 payload 判斷該送哪一支。
+
+      沿革：2026-08-10 曾誤用 editManualSwitch，結果關閉可用、開啟回 200 但
+      schedulePlanSwitch 不變（已排除 verify timeout 因素）。改用專屬端點後解除封鎖。
+
+    成功判定：API 送出成功 **且** 回讀 PCS排程開關狀態 一致（wait_and_verify）。
+      回讀 timeout 沿用 AUTO_POLL_TIMEOUT_SEC（90s）—— 實機證實設定旗標寫入後
+      狀態回讀可能超過 15s 才反映，過短的門檻會把成功誤判成 FAIL。
     """
     c = _sched_readonly_client()
     if c is None:
         return
     while True:
-        ps, _ms, _raw = _sched_switch_state(c)
-        cur = "開" if ps == 1 else ("關" if ps == 0 else "無法確認")
+        ps, ms, raw = _sched_switch_state(c)
+        if ps is None:
+            cur = "無法確認"
+        else:
+            cur = "開" if ps == 1 else "關"
         print("\nPCS 排程主開關")
-        print(f"目前狀態：{cur}")
-        print("1. 開啟排程主開關　（尚未開放）")
-        print("2. 關閉排程主開關　（尚未開放）")
+        print(f"目前狀態：{cur}"
+              + (f"（手動模式：{'開' if ms == 1 else '關' if ms == 0 else '無法確認'}）"
+                 if ms is not None else ""))
+        if ps is None:
+            # 讀取失敗時仍允許操作（設備可能只是暫時讀不到），但明確標示無法比對
+            print(f"  ⚠ 無法讀取目前狀態{'：' + str(raw.get('_error')) if isinstance(raw, dict) and raw.get('_error') else ''}")
+        for k, (_act, _lbl, text, want, unsup) in SCHEDULE_SWITCH_ACTIONS.items():
+            # 「目前已是此狀態」優先於「待確認」——前者對使用者更直接有用
+            if ps is not None and ps == want:
+                suffix = "　（目前已是此狀態）"
+            else:
+                suffix = "　（待確認控制 API）" if unsup else ""
+            print(f"{k}. {text}{suffix}")
         print("0. 返回")
         ch = _menu_input("請輸入選項：")
         if ch == "0":
             return
-        if ch in ("1", "2"):
-            print("⚠ 目前僅唯讀，排程主開關控制功能尚未開放。")
-            print("  （開/關＝PUT /schedule/config/editScheduleSwitch；payload 尚未由 DevTools 確認，"
-                  "為避免猜測 manualModeSwitch/多送欄位，暫不實作寫入。）")
-        else:
+        if ch not in SCHEDULE_SWITCH_ACTIONS:
             print("無效選項，請重新輸入。")
+            continue
+        action, label, _text, want, unsup = SCHEDULE_SWITCH_ACTIONS[ch]
+        if ps is not None and ps == want:
+            # 已是目標狀態 → 不重複送命令（避免無謂寫入與不必要的模式翻轉）
+            print(f"[略過] 排程主開關已是「{'開' if want == 1 else '關'}」，未送出任何控制。")
+            continue
+        if unsup:
+            # 已知無效 → 一律不送出：送了只會得到「200 但狀態不變」再等滿 90s 逾時。
+            print(f"\n⚠ 此功能尚未開放：{unsup}")
+            print("　 （HMI 網頁的排程主開關仍可正常操作；本選單待取得正確 payload 後再開放。）")
+            continue
+        # payload 仍同時帶 manualModeSwitch（DevTools 實抓即如此），故模式仍會連動 → 明確告知。
+        other = "關閉手動模式" if want == 1 else "開啟手動模式"
+        print(f"\n※ 本操作同時會{other}（payload 依 HMI 實際行為同時帶兩個欄位）。")
+        _execute_live([OPERATOR, "--action", action, "--execute"], action, label)
+
+
 
 
 def handle_choice(choice):
@@ -2173,10 +1317,12 @@ def handle_choice(choice):
 
     # 充放電報告（Menu 18/19/20）：獨立唯讀報告模組，不送任何控制
     if choice == "18":
-        report_start()
+        report_start_interactive()
         return True
     if choice == "19":
-        report_stop()
+        if not _require_owner("結束報告"):
+            return True
+        RM.report_stop()
         return True
     if choice == "20":
         report_view_latest()
@@ -2336,7 +1482,7 @@ def refresh_status():
         return {}
 
     print("✓ 設備狀態取得成功")
-    data = _load_json(READONLY_RESULT) or {}
+    data = RM._load_json(READONLY_RESULT) or {}
     return data.get("status_summary") or {}
 
 
@@ -2397,8 +1543,8 @@ def _prompt_with_timeout(prompt, timeout):
         print(prompt, end="", flush=True)
 
     if not sys.stdin.isatty():                       # 管線/重導向輸入（如自動化測試）→ 不做逾時
-        if not _auto.get("_no_tty_warned"):
-            _auto["_no_tty_warned"] = True
+        if not RM._auto.get("_no_tty_warned"):
+            RM._auto["_no_tty_warned"] = True
             print("\n（stdin 非互動終端 → 停用自動刷新，請手動按 r 重新整理）")
         return input()
 
@@ -2487,7 +1633,15 @@ def _exec_menu():
 def main():
     _enable_ansi()
     print("設備控制總覽（狀態為顯示用，不會自動執行控制）")
-    report_resume_on_launch()      # 啟動時恢復未完成的充放電報告 Session（若有）
+    # Phase 4.4：取得 Monitor Ownership 才有資格續接／建立／收尾報告。
+    # 取不到不退出 —— Dashboard 仍是有用的唯讀觀察與人工控制介面（Observer）。
+    # 非 Owner 時所有 Session 寫入路徑都會被 report_monitor 的 Writer Gate 擋下。
+    _owned, _why = RM.acquire_ownership(role="dashboard")
+    if _owned:
+        RM.report_resume_on_launch()  # 啟動時恢復未完成的充放電報告 Session（若有）
+    else:
+        print(f"[OBSERVER] Auto Monitor 由其他行程持有（{_why}）→ 本視窗為唯讀觀察模式。")
+        print("           設備狀態顯示與人工控制正常；不會續接、建立或收尾任何報告。")
     try:
         while True:
             # 完整重畫（進入迴圈、按 r、或從控制選單返回）；同時做一次監看判斷
@@ -2498,20 +1652,20 @@ def main():
 
             # 等待輸入；逾時 → 自動刷新（前景、不新增 thread、離開迴圈即停止 GET）
             prompt = (f"\n[r] 重新整理　[e] 進入控制執行選單　[0] 離開"
-                      f"（{AUTO_REFRESH_SEC}s 未輸入則自動刷新）：")
+                      f"（{RM.AUTO_REFRESH_SEC}s 未輸入則自動刷新）：")
             choice = None
             show_prompt = True
             try:
                 while choice is None:
                     choice = _prompt_with_timeout(prompt if show_prompt else None,
-                                                  AUTO_REFRESH_SEC)
+                                                  RM.AUTO_REFRESH_SEC)
                     if choice is None:
                         # 自動刷新：不重畫整個 Dashboard，僅在狀態改變/建立報告時輸出。
                         # 游標仍停在提示行末端 → 交由第一行輸出自己補換行（無輸出即無痕跡）。
-                        _auto_pending_newline(True)
+                        RM._auto_pending_newline(True)
                         _r, printed = dashboard_refresh(auto=True)
                         show_prompt = printed        # 有輸出才重印提示行，避免提示行被推走
-                _auto_pending_newline(False)         # 使用者已按 Enter（自帶換行）
+                RM._auto_pending_newline(False)         # 使用者已按 Enter（自帶換行）
                 choice = choice.strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print("\n結束程式。")
@@ -2533,9 +1687,9 @@ def main():
                 print(f"（'{choice}' 非本層選項；請按 e 進入控制執行選單，或直接輸入 18/19/20 操作報告）")
     finally:
         # 離開程式時，若仍有進行中的報告 → 暫停（paused，保留可續接），不強制 completed。
-        if _REPORT_AVAILABLE and _report.get("session") is not None:
+        if _REPORT_AVAILABLE and RM._report.get("session") is not None:
             print("\n偵測到進行中的充放電報告，離開前自動暫停（下次選 16 可續接）…")
-            report_pause()
+            RM.report_pause()
 
 
 if __name__ == "__main__":
