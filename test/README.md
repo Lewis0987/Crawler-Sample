@@ -1,248 +1,190 @@
 # Crawler Sample — HMI / BESS 資料擷取與設備控制工具
 
-儲能櫃（BESS）HMI 的資料擷取（爬蟲）＋設備控制工具集。
-- API Base：`http://192.168.128.110:8080/admin-api`
-- 前端（HMI SPA）：`http://192.168.128.110:8853/`（Vue，Yudao/ruoyi-vue-pro）
-- 輸出目錄：`D:\Crawler Sample\output`
+## 1. 專案簡介
 
----
+儲能櫃（BESS）HMI 的資料擷取（爬蟲）＋設備控制工具集，
+並提供**自動充放電報告**與**背景監控服務（Auto Monitor Service）**。
 
-## 檔案結構
-
-| 檔案 | 角色 |
+| 項目 | 值 |
 |---|---|
-| `api_client.py` | API 薄封裝（session／登入／`Authorization: Bearer`／統一 timeout）。`login123.env` 存真實密碼（已 gitignore）。 |
-| `device_control_scraper.py` | **共用解析核心**。PCS／電池／空調／進排風／冷卻循環等區塊解析；產生 `device_control_readonly.json`。`parse_pcs_current_status()` 於此定義（唯一）。 |
-| `dashboard_scraper.py` | **唯一 Dashboard 抓取程式**。數據概覽（電池／PCS／環控）逐欄對齊 UI；`--once` 單次 / `--loop` 背景循環（`start_dashboard_loop`/`stop_dashboard_loop`，可乾淨停止、單例）；輸出 `dashboard_data.json` / `dashboard_data.csv`。 |
+| API Base | `http://192.168.128.110:8080/admin-api` |
+| 前端 HMI | `http://192.168.128.110:8853/`（Vue，Yudao/ruoyi-vue-pro） |
+| 輸出目錄 | `D:\Crawler Sample\output` |
+
+## 2. 主要功能
+
+- **設備資料擷取** —— 電池／PCS／空調／進排風／冷卻循環等區塊，逐欄對齊 HMI UI。
+- **PCS／排程控制** —— CLI 選單操作，控制指令需二次確認。
+- **自動充放電報告** —— 智慧排程開始充放電時自動建立 Session，結束時自動收尾產表。
+- **Windows Service 背景監控** —— 不開 Dashboard 也能自動建立與收尾報告。
+- **Session Recovery** —— Service 正常停止或異常中斷後，重啟可續接同一份 Session。
+- **Auth Recovery** —— 登入態失效時自動重新登入，不需人工介入。
+- **Ownership / Dashboard Observer** —— 同一時間只有一個寫入者，Dashboard 為唯讀觀察者。
+
+## 3. 主要檔案
+
+| 檔案 | 用途 |
+|---|---|
+| `api_client.py` | API 薄封裝：session、登入、`Authorization: Bearer`、統一 timeout。 |
+| `dashboard_scraper.py` | Dashboard 數據概覽擷取；輸出 `dashboard_data.json` / `.csv`。 |
+| `device_control_scraper.py` | 共用解析核心（PCS／電池／環控）；輸出 `device_control_readonly.json`。 |
 | `device_control_menu.py` | CLI 設備控制選單（查詢＋控制）。 |
-| `device_control_operator.py` | PCS 控制模式 payload 組裝與送出（需 `--execute` + YES）。 |
-| `test_pcs_modes.py` | 離線單元測試（PCS 模式／當前狀態解析）。 |
-| `inspect_dashboard_sources.py` | 唯讀診斷：比對 PCS 匯流排 vs AC380 電量儀。 |
+| `device_control_operator.py` | 控制指令的 payload 組裝與送出（需 `--execute` + YES）。 |
+| `report_monitor.py` | Monitor Core：監看決策、Session 生命週期、Ownership、Auth Recovery。 |
+| `auto_monitor_service.py` | 背景服務入口，由 NSSM 啟動並常駐。 |
+| `charge_discharge_report.py` | `ReportSession` 與報告產出（CSV／Excel／Summary／統計）。 |
+| `run_phase3_regression.py` | 一鍵執行完整 Regression 並輸出總表。 |
 | `run_all.py` | 一鍵執行全部擷取腳本。 |
 
----
-
-## PCS「當前狀態」— 100% 複製前端渲染邏輯
-
-> 需求：`PCS當前狀態` 必須與前端 Dashboard「當前狀態」**完全一致**；Python 不得自行設計組合方式，而是**複製前端 UI 的判斷邏輯**。
-
-### 品牌分歧：本機為 US 變體
-
-`GET /hmiGuest/unauthorizedAccess/envCon/pcs/getBrand` 回傳 `device.brand.shengHong` → `pcsControl.vue` 據此渲染 **`pcsMode_US`**（非 TW 的 `pcsMode`）。兩者「當前狀態」邏輯**不同**：
-- TW `pcsMode`：讀單一 mark `systemStatus` 的 value（本機此 mark 不存在）。
-- **US `pcsMode_US`（本機採用）：由多個細分 mark 依 `oldValue` 組合 badge**。
-
-### 前端渲染程式分析（`pcsMode_US-ad91147b.js`，去混淆後）
-
-```js
-// He：badge 設定（固定順序）
-He = [
-  {data:"systemOnOrOffStatus",     alwaysDisplay:true },
-  {data:"systemFaultStatus",       alwaysDisplay:false},
-  {data:"systemGridTiedStatus",    alwaysDisplay:false},
-  {data:"systemOffGridStatus",     alwaysDisplay:false},
-  {data:"systemChargingStatus",    alwaysDisplay:false},
-  {data:"systemDischargingStatus", alwaysDisplay:false},
-];
-// 資料來源：Re() = permission 匯出 o = 函式 g = GET /hmiGuest/unauthorizedAccess/envCon/pcs
-const a = await Re();                       // 請求帶 Accept-Language: zh-TW → value 為中文
-a[0].metricsDataVoList.forEach(l =>
-  n.value[l.mark] = { name, value, oldValue, unit });
-// render「當前狀態」：
-Object.keys(n.value).length > 0
-  ? He.map(l =>
-      ((n.value[l.data]?.oldValue==="1" && n.value[l.data]?.value) || l.alwaysDisplay)
-        ? <Tag>{ n.value[l.data]?.value }</Tag> : nothing)
-  : " - ";
-```
-
-**結論：US 前端「當前狀態」= 依 `He` 固定順序，`systemOnOrOffStatus` 永遠顯示、其餘 5 個 `oldValue==="1"` 才顯示，badge 文字用該 mark 的中文 `value`，以「 / 」串接。**
-
-### 對照表
-
-| 項目 | 內容 |
-|---|---|
-| **1. 前端使用的原始 mark** | `systemOnOrOffStatus`、`systemFaultStatus`、`systemGridTiedStatus`、`systemOffGridStatus`、`systemChargingStatus`、`systemDischargingStatus`（**不讀 `systemStatus`**） |
-| **2. mark → 中文標籤** | 用各 mark 的 `value`（API 帶 `Accept-Language: zh-TW` 回中文，如 `停止`/`執行`/`故障`/`併網`/`離網`/`充電`/`放電`） |
-| **3. 顯示條件** | `systemOnOrOffStatus`：永遠顯示；其餘 5 個：`oldValue==="1"` 且 `value` 非空才顯示；不補「正常/未知」 |
-| **4. 顯示順序** | 固定為 `He` 順序（onOff → fault → gridTied → offGrid → charging → discharging），不改順序、不固定段數 |
-| **5. Python 與前端是否一致** | **是，100% 一致**（同端點、同 `Accept-Language: zh-TW`、同 `He` 順序與條件） |
-
-### Python 實作（`device_control_scraper.py`，唯一定義）
-
-```python
-_PCS_STATUS_CONFIG = [
-    ("systemOnOrOffStatus", True),      # 執行
-    ("systemFaultStatus", False),       # 正常
-    ("systemGridTiedStatus", False),    # 併網
-    ("systemOffGridStatus", False),     # 離網
-    ("systemChargingStatus", False),    # 充電  
-    ("systemDischargingStatus", False), # 放電
-]
-
-def parse_pcs_current_status(metrics):
-    marks = {i.get("mark"): i for i in (metrics or []) if isinstance(i, dict) and i.get("mark")}
-    statuses = []
-    for mark, always_display in _PCS_STATUS_CONFIG:
-        item = marks.get(mark)
-        if not item:
-            continue
-        value = str(item.get("value") or "").strip()
-        old_value = str(item.get("oldValue") or "").strip()
-        if not value:
-            continue
-        if always_display or old_value == "1":
-            statuses.append(value)
-    return " / ".join(statuses)
-```
-
-資料來源（唯一共用）：`get_pcs_current_status(client)` → `fetch_pcs_status_data()`（帶 `Accept-Language: zh-TW`）→ `parse_pcs_current_status()`。
-共用此**同一函式與同一來源**（無重複邏輯）：
-- `device_control_scraper.parse_pcs()`（`pcs_status_data` 為 zh-TW 抓取）→ 寫入 `device_control_readonly.json`
-- `device_control_menu.py` → 顯示 `device_control_readonly.json`
-
-> 註：`dashboard_scraper.py` 的「數據概覽」PCS 區塊改用自身 `summarize_pcs()`（啟停狀態取 value、併網/離網與充放電取 oldValue），與上述「PCS當前狀態 badge」為不同用途、不共用。
-
-> 注意：mode 類解析（`PCS工作模式`/`PCS功率控制模式`/`PCS控制模式`）仍讀 **enum**（不帶語言標頭）的那份資料，故 zh-TW 僅用於當前狀態 badge，不影響 mode 解析。
-
-### 目前實測（本機當下）
-
-`systemOnOrOffStatus.value=停止`（永遠顯示）、`systemGridTiedStatus.oldValue="1" value=併網`，其餘 5 個 `oldValue="0"` → 隱藏。
-四支輸出與 JSON 皆為：**`PCS當前狀態：停止 / 併網`**（與 HMI Dashboard 一致，不再出現 `-`）。
-若之後充電/放電/故障等 `oldValue` 變 `1`，會自動依 `He` 順序加入對應 badge（例 `執行 / 併網 / 充電`）。
-
----
-
-## 執行方式
+## 4. 執行方式
 
 ```bash
 python device_control_scraper.py     # 產生 device_control_readonly.json + 主控台摘要
-python dashboard_scraper.py --once   # Dashboard 抓一次（數據概覽）→ dashboard_data.json / .csv
-python dashboard_scraper.py --loop   # Dashboard 背景循環（每 INTERVAL_SECONDS 一次，Ctrl+C 停止）
+python dashboard_scraper.py --once   # Dashboard 抓一次 → dashboard_data.json / .csv
+python dashboard_scraper.py --loop   # Dashboard 背景循環（Ctrl+C 停止）
 python device_control_menu.py        # CLI 設備控制選單
-python run_all.py                    # 一鍵執行全部
-python test_pcs_modes.py             # 離線單元測試
+python run_all.py                    # 一鍵執行全部擷取
+python run_phase3_regression.py      # 完整 Regression
 ```
 
-登入密碼放於 `login123.env`（`HMI_PASSWORD=...`），**已 gitignore，切勿提交**。
+### 登入設定
 
-# 自動排程報告（Auto Schedule Report）
-## Phase 1：Report Framework（報告框架）
-- 建立 ReportSession
-- 建立 Report 架構
-- CSV / Excel 輸出
-- Summary 統計
+登入資訊放在 `test/` 目錄下的 `*.env` 檔案（例如 `login.env`）。
+可依 `.env.example` 建立本機 env 檔。
 
-Phase 2：Auto Start（自動建立報告）
-- 排程自動建立 Session
-- Scheduler 整合
-- Dashboard 監看
-- Resume 機制
+**`.env` 檔案已由 Git 排除，請勿提交。**
 
-Phase 3：Auto Lifecycle（自動生命週期）
-- 3.1 Device State（設備狀態判定）
-- 3.2 Auto Stop Engine（自動停止引擎）
-- 3.3 Auto Finalize（自動完成報告）
-- 3.4 Start Debounce（啟動防抖）
-- 3.5 Schedule Robustness（排程穩定性）
-- 3.6 Resume & Recovery（恢復機制）
-- 3.7 Reliability（可靠性強化）
-- 3.8 Validation（完整驗證）
+## 5. PCS 當前狀態
 
-Phase 4：Auto Monitor Service（背景監控服務）
-- Service 常駐監控
-- Dashboard 解耦
-- Session Ownership
-- Windows Service
-- 4.1 | 架構盤點 |（COMPLETE）
-- 4.2 | 抽離 report_monitor.py，device_control_menu.py 改為 import | **Phase 3 Regression 734/734 必須維持 PASS，功能零改變** |（COMPLETE）
-- 4.3 | auto_monitor_service.py 可獨立執行 | 不開 Dashboard，排程仍可自動建立/停止/完成報告 |（COMPLETE）
-- 4.4 | Ownership（Monitor Owner / Session Owner） | Dashboard 與 Service 不會重複建立 Session |（COMPLETE）
-- 4.5 | Dashboard Observer 模式 | Dashboard 開關完全不影響 Auto Report |（COMPLETE）
-- 4.6 | Windows Service 包裝 | Windows 開機即可常駐 |（COMPLETE，見 docs/Phase4.6_Closure_Report.md）
-- 4.7 | Service Restart / Recovery | Service 重啟後可 Resume，不重複建立 Session |（COMPLETE）
-- 4.8 | Phase 4 Validation | Regression + Service + 實機驗證全部 PASS |（COMPLETE）
+PCS 當前狀態依 HMI 實際顯示邏輯解析。
 
-**Phase 4 = COMPLETE**（2026-08-17）
-Full Regression 1529/1529 PASS、FAIL 0、SKIP 0、Environment residue PASS。
-完整驗證矩陣、兩個關鍵實機發現、Recovery 兩條路徑與已知限制見：
-[../docs/Phase4_Closure_Report.md](../docs/Phase4_Closure_Report.md)
-
-Windows Service 使用 NSSM 作為宿主程式（SCM 啟動 `tools\nssm.exe`，
-再由它啟動並監督 `test\auto_monitor_service.py`）。
-`tools\nssm.exe` 是 **runtime dependency**，安裝後不可刪除、改名或搬移。
-詳細版本、授權、SHA-256 與部署／更新說明見：[../tools/README.md](../tools/README.md)
-
-### Session Recovery：兩條路徑
-
-Service 中斷後續接同一份 Session 有兩條路徑，**已分別實機驗證**：
-
-**Graceful Recovery — Phase 4.6（J/K）**
+- 使用 US 版本 `pcsMode_US` 規則
+- 顯示順序：啟停 → 故障 → 併網 → 離網 → 充電 → 放電
+- 啟停狀態固定顯示，其餘狀態於 `oldValue=1` 時顯示
+- 共用解析位於 `device_control_scraper.py`
+- 顯示結果需與 HMI Dashboard 一致
 
 ```
-recording
-→ install_service_nssm.ps1 -Action stop（NSSM 送 Ctrl+C）
-→ report_pause() → status = paused（不 finalize）
-→ 取樣執行緒結束、canonical Mutex 正常 release
-→ -Action start
-→ recording_resume → 同一 session_id / folder / start_time
-→ sample_index 續接，不建立第二份 Session
+PCS當前狀態：執行 / 併網 / 充電
 ```
 
-實機：`20260814_112748_auto`，`#84`（paused）→ `#85` 續接 → 1..96 連續。
-Mutex 釋放後他人取得原因為 `acquired` 而非 `abandoned_taken`，
-證明是正常釋放、未被強制終止。
+自動監看層的旗標判斷一律讀 `oldValue`（語言無關），不比對翻譯後的中文字串。
 
-**Crash Recovery — Phase 4.7**
+## 6. 自動充放電報告
 
 ```
-recording
-→ taskkill /F worker PID（非優雅中斷；atexit 不執行）
-→ Session 保持 status = recording（**不會**變成 paused / completed）
-→ 無 recording_pause / session_end / finalize_ok
-→ NSSM AppExit Default=Exit → Service 轉 Stopped（不自動重啟）
-→ -Action start
-→ 取得 canonical Mutex（reason = acquired）
-→ recording_resume → 同一 session_id / folder / start_time
-→ #244 → #245 續接，不建立第二份 Session
+排程開始 → 建立 Session → 持續取樣 → 自動停止 → 產生報告
 ```
 
-實機：`20260814_163756_auto`，crash 後最後 `#244 @ 17:01:08`，
-Service 於 `17:37:32` 啟動並 `recording_resume`，
-`#245 @ 17:37:33` 續接，最終 1..293 連續、crash 前 244 筆逐筆未被覆寫。
+輸出位置：`output\charge_discharge_reports\<session_id>\`
 
-離線 regression：`test_phase4_recovery.py`（73 項，涵蓋 A~H 與 DoD 18 項）。
+| 檔案 | 內容 |
+|---|---|
+| `samples.csv` | 逐筆取樣資料 |
+| `events.csv` | Session 事件（開始／方向切換／暫停／續接／結束） |
+| `summary.json` | 報告摘要 |
+| `statistics.json` | 統計數據 |
+| `report.xlsx` | Excel 報告（含圖表） |
 
-**三項需要留意的契約**
+另有 `alarms.csv`、`cell_snapshots.json`、`session_state.json`。
 
-1. **`abandoned_taken` 不是 production crash 的必要條件。**
-   worker 是 canonical Mutex 的唯一 handle 持有者，被強殺後 OS 關閉其 handle、
-   kernel object 隨即消滅，下一個行程建立的是全新物件 → `acquired`、
-   `abandoned_takeover = False`。這是**正確的 production behavior**。
-   `WAIT_ABANDONED` 需要另有行程持有 handle 使 object 存活才會出現，
-   該路徑以離線 regression 驗證（`test_phase4_recovery.py` 契約 B）。
+## 7. Auto Monitor Service
 
-2. **`orphan_detected` 只記錄，不改變流程。**
-   `last_sample_time` 距今超過 `ORPHAN_GAP_SEC`（300s）即記一筆事件並提示，
-   **仍照常續接**。實機曾記錄斷線間隔 2185s，未影響 resume。
+```
+Windows SCM → NSSM → auto_monitor_service.py → report_monitor.py → Session / Report
+```
 
-3. **`monitor_owner.json` 在 crash 後會保留舊 worker PID。**
-   強制終止不執行 `_delete_owner_file()`，屬預期現象。
-   Ownership 判定一律以 Windows Mutex 為準，不看此檔。
+- Service 可在 **Dashboard 未開啟時獨立監控**。
+- Service 為 **Monitor Owner**；Dashboard 為 **Observer**（唯讀，不寫報告）。
+- `tools\nssm.exe` 是 **runtime dependency**，安裝後不可刪除、改名或搬移。
 
-**本次驗證後另發生的外部事件（非 Crash Recovery 缺陷）**
+以**系統管理員** PowerShell 操作：
 
-Recovery 正常運作約 8 分鐘、新增 49 筆樣本後，於 17:43 起發生
-**整體設備通訊中斷**（authed 與 guest 端點全部 `連線逾時`）。
-產品正確地未誤觸發 Auth Recovery（該機制要求 authed 失敗但 guest 正常），
-而是走 `communication_error` 安全收尾：
-`session_end(reason=communication_error)` → `finalize_ok`，
-輸出檔完整、`output_status` 無 failed。
-此事件另行登記為設備／網路層問題，不列為 Crash Recovery 缺陷。
+```powershell
+.\tools\install_service_nssm.ps1 -Action install
+.\tools\install_service_nssm.ps1 -Action start
+.\tools\install_service_nssm.ps1 -Action status
+.\tools\install_service_nssm.ps1 -Action stop
+.\tools\install_service_nssm.ps1 -Action remove
+```
 
-Phase 5：Production Ready（正式版本）
-- 長時間穩定測試
-- 壓力測試
-- 實機驗證
-- 文件整理
-- Release
+Service log：`output\logs\auto_monitor_service.log`
+
+> NSSM 版本、授權、SHA-256 與詳細部署／更新說明見
+> [`../tools/README.md`](../tools/README.md)。
+
+## 8. Recovery
+
+**Graceful Recovery**（正常停止）
+
+```
+recording → Service stop → paused → Service start → resume
+```
+
+**Crash Recovery**（異常中斷）
+
+```
+recording → worker 中斷 → Service start → resume
+```
+
+兩者的共同結果：
+
+- 同一 `session_id`
+- 同一 folder
+- 舊 samples 完整保留
+- `sample_index` 繼續遞增
+- **不建立第二份 Session**
+
+> 兩條路徑的實機驗證證據與底層機制見
+> [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md)。
+
+## 9. Regression
+
+目前正式 baseline：
+
+```
+Automated checks : 1529 / 1529 PASS
+FAIL             : 0
+SKIP             : 0
+Environment      : PASS
+```
+
+執行：`python run_phase3_regression.py`
+
+## 10. 開發階段
+
+| Phase | 內容 | 狀態 |
+|---|---|---|
+| Phase 1 | Report Framework | COMPLETE |
+| Phase 2 | Auto Start | COMPLETE |
+| Phase 3 | Auto Lifecycle | COMPLETE |
+| Phase 4 | Auto Monitor Service | COMPLETE |
+| Phase 5 | Production Ready | IN PROGRESS |
+
+**Phase 5 進度**
+
+| | 項目 | 狀態 |
+|---|---|---|
+| 5.1 | Production Validation Plan | COMPLETE |
+| 5.2 | Long-running Stability / Soak Test | — |
+| 5.3 | Stress / Boundary Test | — |
+| 5.4 | Production Documentation / Deployment | — |
+| 5.5 | Release Validation | — |
+
+## 11. 文件
+
+| 文件 | 內容 |
+|---|---|
+| [`../docs/Phase3_Closure_Report.md`](../docs/Phase3_Closure_Report.md) | Phase 3 自動生命週期收尾報告 |
+| [`../docs/Phase4.6_Closure_Report.md`](../docs/Phase4.6_Closure_Report.md) | Windows Service 包裝與 NSSM 驗證 |
+| [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md) | Phase 4 整體收尾：架構、Ownership、Recovery、已知限制 |
+| [`../docs/Phase5_Validation_Plan.md`](../docs/Phase5_Validation_Plan.md) | Phase 5 驗證計畫與驗收基準 |
+| [`../tools/README.md`](../tools/README.md) | NSSM 版本、授權、SHA-256 與部署 |
+
+## 12. 注意事項
+
+- **`.env` 檔案不可 commit**（已由 `.gitignore` 排除）。
+- **`tools/nssm.exe` 為 runtime dependency**，不可刪除、改名或搬移。
+- Service 運行時 **Dashboard 為 Observer**，不會寫入報告。
+- **不要同時啟動第二個 Monitor writer** —— Ownership 會擋下，但應避免。
+- 詳細測試結果、實機證據與歷史紀錄請查看 `docs/`。
