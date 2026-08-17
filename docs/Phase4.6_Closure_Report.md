@@ -375,3 +375,16 @@ Phase 4 核心目標失效的缺陷：
 - `monitor_owner.json` 的生命週期（多 Owner 情境下互相覆寫／刪除）在本次僅登記為
   診斷副作用，未擴大修改；Ownership 判定一律以 Windows Mutex 為準
 - Phase 4.7（Service Restart / Recovery）尚未開始
+
+---
+
+## 後續狀態（本報告完成之後）
+
+> 以下為 Phase 4.6 收尾之後的進展，僅補記後續狀態；
+> 上文所有內容維持 Phase 4.6 當時的實測事實，未做改寫。
+
+- **Phase 4.7 Crash Recovery 已於後續完成**（2026-08-14 實機驗證，
+  `#244 → recording_resume → #245 → #293`，產品碼零修改）。
+- **Phase 4.8 Phase 4 Validation 已完成**，Phase 4 正式 COMPLETE
+  （Full Regression 1529/1529、FAIL 0、SKIP 0）。
+- 完整內容詳見 [Phase4_Closure_Report.md](Phase4_Closure_Report.md)。

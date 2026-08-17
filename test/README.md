@@ -154,19 +154,91 @@ Phase 4：Auto Monitor Service（背景監控服務）
 - Dashboard 解耦
 - Session Ownership
 - Windows Service
-- 4.1 | 架構盤點
-- 4.2 | 抽離 report_monitor.py，device_control_menu.py 改為 import | **Phase 3 Regression 734/734 必須維持 PASS，功能零改變** |
-- 4.3 | auto_monitor_service.py 可獨立執行 | 不開 Dashboard，排程仍可自動建立/停止/完成報告 |
-- 4.4 | Ownership（Monitor Owner / Session Owner） | Dashboard 與 Service 不會重複建立 Session |
-- 4.5 | Dashboard Observer 模式 | Dashboard 開關完全不影響 Auto Report |
-- 4.6 | Windows Service 包裝 | Windows 開機即可常駐 |
-- 4.7 | Service Restart / Recovery | Service 重啟後可 Resume，不重複建立 Session |
-- 4.8 | Phase 4 Validation | Regression + Service + 實機驗證全部 PASS |
+- 4.1 | 架構盤點 |（COMPLETE）
+- 4.2 | 抽離 report_monitor.py，device_control_menu.py 改為 import | **Phase 3 Regression 734/734 必須維持 PASS，功能零改變** |（COMPLETE）
+- 4.3 | auto_monitor_service.py 可獨立執行 | 不開 Dashboard，排程仍可自動建立/停止/完成報告 |（COMPLETE）
+- 4.4 | Ownership（Monitor Owner / Session Owner） | Dashboard 與 Service 不會重複建立 Session |（COMPLETE）
+- 4.5 | Dashboard Observer 模式 | Dashboard 開關完全不影響 Auto Report |（COMPLETE）
+- 4.6 | Windows Service 包裝 | Windows 開機即可常駐 |（COMPLETE，見 docs/Phase4.6_Closure_Report.md）
+- 4.7 | Service Restart / Recovery | Service 重啟後可 Resume，不重複建立 Session |（COMPLETE）
+- 4.8 | Phase 4 Validation | Regression + Service + 實機驗證全部 PASS |（COMPLETE）
+
+**Phase 4 = COMPLETE**（2026-08-17）
+Full Regression 1529/1529 PASS、FAIL 0、SKIP 0、Environment residue PASS。
+完整驗證矩陣、兩個關鍵實機發現、Recovery 兩條路徑與已知限制見：
+[../docs/Phase4_Closure_Report.md](../docs/Phase4_Closure_Report.md)
 
 Windows Service 使用 NSSM 作為宿主程式（SCM 啟動 `tools\nssm.exe`，
 再由它啟動並監督 `test\auto_monitor_service.py`）。
 `tools\nssm.exe` 是 **runtime dependency**，安裝後不可刪除、改名或搬移。
 詳細版本、授權、SHA-256 與部署／更新說明見：[../tools/README.md](../tools/README.md)
+
+### Session Recovery：兩條路徑
+
+Service 中斷後續接同一份 Session 有兩條路徑，**已分別實機驗證**：
+
+**Graceful Recovery — Phase 4.6（J/K）**
+
+```
+recording
+→ install_service_nssm.ps1 -Action stop（NSSM 送 Ctrl+C）
+→ report_pause() → status = paused（不 finalize）
+→ 取樣執行緒結束、canonical Mutex 正常 release
+→ -Action start
+→ recording_resume → 同一 session_id / folder / start_time
+→ sample_index 續接，不建立第二份 Session
+```
+
+實機：`20260814_112748_auto`，`#84`（paused）→ `#85` 續接 → 1..96 連續。
+Mutex 釋放後他人取得原因為 `acquired` 而非 `abandoned_taken`，
+證明是正常釋放、未被強制終止。
+
+**Crash Recovery — Phase 4.7**
+
+```
+recording
+→ taskkill /F worker PID（非優雅中斷；atexit 不執行）
+→ Session 保持 status = recording（**不會**變成 paused / completed）
+→ 無 recording_pause / session_end / finalize_ok
+→ NSSM AppExit Default=Exit → Service 轉 Stopped（不自動重啟）
+→ -Action start
+→ 取得 canonical Mutex（reason = acquired）
+→ recording_resume → 同一 session_id / folder / start_time
+→ #244 → #245 續接，不建立第二份 Session
+```
+
+實機：`20260814_163756_auto`，crash 後最後 `#244 @ 17:01:08`，
+Service 於 `17:37:32` 啟動並 `recording_resume`，
+`#245 @ 17:37:33` 續接，最終 1..293 連續、crash 前 244 筆逐筆未被覆寫。
+
+離線 regression：`test_phase4_recovery.py`（73 項，涵蓋 A~H 與 DoD 18 項）。
+
+**三項需要留意的契約**
+
+1. **`abandoned_taken` 不是 production crash 的必要條件。**
+   worker 是 canonical Mutex 的唯一 handle 持有者，被強殺後 OS 關閉其 handle、
+   kernel object 隨即消滅，下一個行程建立的是全新物件 → `acquired`、
+   `abandoned_takeover = False`。這是**正確的 production behavior**。
+   `WAIT_ABANDONED` 需要另有行程持有 handle 使 object 存活才會出現，
+   該路徑以離線 regression 驗證（`test_phase4_recovery.py` 契約 B）。
+
+2. **`orphan_detected` 只記錄，不改變流程。**
+   `last_sample_time` 距今超過 `ORPHAN_GAP_SEC`（300s）即記一筆事件並提示，
+   **仍照常續接**。實機曾記錄斷線間隔 2185s，未影響 resume。
+
+3. **`monitor_owner.json` 在 crash 後會保留舊 worker PID。**
+   強制終止不執行 `_delete_owner_file()`，屬預期現象。
+   Ownership 判定一律以 Windows Mutex 為準，不看此檔。
+
+**本次驗證後另發生的外部事件（非 Crash Recovery 缺陷）**
+
+Recovery 正常運作約 8 分鐘、新增 49 筆樣本後，於 17:43 起發生
+**整體設備通訊中斷**（authed 與 guest 端點全部 `連線逾時`）。
+產品正確地未誤觸發 Auth Recovery（該機制要求 authed 失敗但 guest 正常），
+而是走 `communication_error` 安全收尾：
+`session_end(reason=communication_error)` → `finalize_ok`，
+輸出檔完整、`output_status` 無 failed。
+此事件另行登記為設備／網路層問題，不列為 Crash Recovery 缺陷。
 
 Phase 5：Production Ready（正式版本）
 - 長時間穩定測試
