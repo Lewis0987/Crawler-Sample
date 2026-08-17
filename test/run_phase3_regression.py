@@ -59,6 +59,7 @@ COMPILE_TARGETS = [
     "test_phase4_mutex_dacl.py",
     "test_phase4_auth_recovery.py",
     "test_phase4_mutex_canon.py",
+    "test_phase4_recovery.py",
     "_p44_owner_child.py",
     "phase2_real_trigger_validation.py",
     "test_auto_schedule.py",
@@ -84,6 +85,7 @@ OFFLINE_SUITES = [
     ("Phase 4.6-B mutex DACL", ["test_phase4_mutex_dacl.py"]),
     ("Phase 4.6-B auth recovery", ["test_phase4_auth_recovery.py"]),
     ("Phase 4.6-C mutex canon", ["test_phase4_mutex_canon.py"]),
+    ("Phase 4.7 crash recovery", ["test_phase4_recovery.py"]),
 ]
 
 _COUNT_RE = re.compile(r"[（(](\d+)\s*/\s*(\d+)\s*檢查通過[）)]")
