@@ -605,7 +605,48 @@ stop → remove → install → verify → start → §7 health check
 
 ---
 
-## 12. Release Checklist（簡表）
+## 12. Deployment Package / 乾淨環境驗證
+
+### 12.1 ⚠️ 執行 Full Regression 前必須先建立 `*.env`
+
+`test\*.env` 由 `.gitignore` 排除，**不存在於任何 commit tree、也不會出現在
+Deployment package 中**。因此在**乾淨 checkout 或剛解壓的 package** 裡，
+`test\` 下沒有任何 `*.env`。
+
+此時直接執行 Full Regression，`Phase 4.6-A service env` 這一支會 **FAIL** ——
+該套件需要真實存在的 `*.env` 才能列舉憑證候選路徑。
+
+> **這屬於缺少 prerequisite，不是 regression defect。**
+> 實測（clean checkout）：16/17 套件通過且檢查數與正常環境完全一致，
+> 只有 service-env 這一支因找不到 env 檔而中止。
+
+**執行 Regression 之前**，請先依 [`../test/.env.example`](../test/.env.example)
+在 `test\` 下建立本機檔案，例如 `test\login.env`，並填入該環境所需的登入設定
+（欄位清單見 §5.1）。
+
+⚠️ **絕對禁止**：
+
+- 不可把實際 `*.env` 放進 Deployment package
+- 不可 commit 任何 `*.env`
+- 不可在本文件或任何 troubleshooting 紀錄中寫入實際 username / password / token / key
+- 測試用的 env 檔留在本機，**不得寫回 package artifact**
+
+### 12.2 Deployment package 驗證流程
+
+```
+1. 解壓 Deployment package
+2. 確認 tools\nssm.exe、templates\ESS_Report_Template.xlsx、test\.env.example 存在
+3. 依 test\.env.example 建立本機 test\<任意名稱>.env  ← 缺這步 Regression 必定 FAIL
+4. 執行 Full Regression：py -3 run_phase3_regression.py
+      → 1802 / 1802 PASS，FAIL 0、SKIP 0
+5. install → start
+6. §7 Service Health Check 11 項
+```
+
+`tools\nssm.exe` 的 SHA-256 應與 [`../tools/README.md`](../tools/README.md)
+的版本資訊表相符；package 內不得含 `output\`、任何 `*.env` 或 `__pycache__\`。
+
+### 12.3 Release Checklist（簡表）
 
 完整驗收基準與判定標準見
 [`Phase5_Validation_Plan.md`](Phase5_Validation_Plan.md) §7，本節不複製。
