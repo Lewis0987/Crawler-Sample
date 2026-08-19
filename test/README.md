@@ -167,17 +167,34 @@ Environment      : PASS
 | Phase 2 | Auto Start | COMPLETE |
 | Phase 3 | Auto Lifecycle | COMPLETE |
 | Phase 4 | Auto Monitor Service | COMPLETE |
-| Phase 5 | Production Ready | IN PROGRESS |
+| Phase 5 | Production Ready | COMPLETE |
 
 **Phase 5 進度**
 
 | | 項目 | 狀態 |
 |---|---|---|
 | 5.1 | Production Validation Plan | COMPLETE |
-| 5.2 | Long-running Stability / Soak Test | — |
-| 5.3 | Stress / Boundary Test | — |
-| 5.4 | Production Documentation / Deployment | — |
-| 5.5 | Release Validation | — |
+| 5.2 | Long-running Stability / Soak Test | COMPLETE |
+| 5.3 | Stress / Boundary Test | COMPLETE |
+| 5.4 | Production Documentation / Deployment | COMPLETE |
+| 5.5 | Release Validation | COMPLETE |
+
+5.2：原始 Soak 發現 OpenBLAS 一次性資源成本；限制 Windows Service
+`OPENBLAS_NUM_THREADS=1` 後，部署與 Fix Validation 均 PASS。
+
+5.3：Stress / Boundary Test 完成，#1～#12 全部 PASS；Phase 5.3-A 244/244、
+Full Regression 1802/1802，正式 Service / Ownership / output 全程維持隔離。
+
+5.4：Production Documentation / Deployment 文件化完成；新增
+[`../docs/Operations_Guide.md`](../docs/Operations_Guide.md)，涵蓋部署、設定、
+Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 8/8 PASS。
+
+5.5：Release Validation 驗證性項目全數 PASS —— Full Regression 1802/1802、
+實機 Session evidence 3 份各 8/8、Service health 11/11、Security 無 Critical/High。
+收尾報告見 [`../docs/Phase5_Closure_Report.md`](../docs/Phase5_Closure_Report.md)。
+
+> **Phase 5 = COMPLETE 指的是 Validation 完成。**
+> tag / push / deployment package 屬**後續人工 Release 動作，尚未執行**。
 
 ## 11. 文件
 
@@ -187,7 +204,9 @@ Environment      : PASS
 | [`../docs/Phase4.6_Closure_Report.md`](../docs/Phase4.6_Closure_Report.md) | Windows Service 包裝與 NSSM 驗證 |
 | [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md) | Phase 4 整體收尾：架構、Ownership、Recovery、已知限制 |
 | [`../docs/Phase5_Validation_Plan.md`](../docs/Phase5_Validation_Plan.md) | Phase 5 驗證計畫與驗收基準 |
-| [`../tools/README.md`](../tools/README.md) | NSSM 版本、授權、SHA-256 與部署 |
+| [`../docs/Phase5_Closure_Report.md`](../docs/Phase5_Closure_Report.md) | Phase 5 收尾：Soak / Stress / 文件 / Release Validation 結果 |
+| [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md) | **部署 / 維運手冊**：安裝、操作、設定、健康檢查、更新、Rollback、Troubleshooting |
+| [`../tools/README.md`](../tools/README.md) | NSSM 版本、授權、SHA-256；**Service action 權威來源** |
 
 ## 12. 注意事項
 

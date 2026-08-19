@@ -3,7 +3,12 @@
 **建立日期**：2026-08-17
 **基線**：Phase 4 COMPLETE（HEAD `eb3a702`），Full Regression **1529/1529 PASS**、
 FAIL 0、SKIP 0、Environment residue PASS
-**狀態**：5.1 COMPLETE（本文件即交付物）；5.2～5.5 未開始
+**狀態**：5.1 COMPLETE（本文件即交付物）；5.2 COMPLETE（原始 Soak FAIL → Root Cause
+ONE-TIME COST → Fix → Deployment PASS → Fix Validation PASS，詳見 §4.4）；
+5.3 COMPLETE（#1～#12 全部 PASS，Phase 5.3-A 244/244、Full Regression
+1802/1802，詳見 §5.4）；5.4 COMPLETE（`docs/Operations_Guide.md` 已建立，
+文件 DoD 8/8 PASS，詳見 §6.3）；5.5 COMPLETE（驗證性項目全數 PASS，
+詳見 §7.1；tag / push / deployment package 保留人工決定）
 
 > Phase 5 的目的**不是重做 Phase 4 已完成的功能**，
 > 而是確認目前版本能否進入正式使用 / Release。
@@ -12,14 +17,14 @@ FAIL 0、SKIP 0、Environment residue PASS
 
 ## 1. Phase 5 Definition of Done
 
-- [ ] 5.1 Validation Plan 完成並確認 —— **本文件**
-- [ ] 5.2 Soak PASS（或 PASS with warnings，須逐項說明）
-- [ ] 5.3 Stress / Boundary PASS
-- [ ] 5.4 Production Documentation 完成
-- [ ] 5.5 Release Validation 全項通過
-- [ ] Full Regression **≥ 1529**，FAIL 0、SKIP 0、Environment residue PASS
-- [ ] `git diff --check` exit 0、working tree clean
-- [ ] 無未處理 Critical / High defect
+- [x] 5.1 Validation Plan 完成並確認 —— **本文件**
+- [x] 5.2 Soak 收尾完成 —— 原始 Soak FAIL、修正後 Fix Validation PASS（§4.4）
+- [x] 5.3 Stress / Boundary PASS —— #1～#12 全部 PASS（§5.4）
+- [x] 5.4 Production Documentation 完成 —— `docs/Operations_Guide.md`，文件 DoD 8/8 PASS（§6.3）
+- [x] 5.5 Release Validation —— 驗證性項目全數 PASS（§7.1）；tag / push / deployment package 保留人工決定
+- [x] Full Regression **≥ 1529** —— 實際 **1802/1802**，FAIL 0、SKIP 0、Environment residue PASS
+- [ ] `git diff --check` exit 0、working tree clean —— `diff --check` 已 clean；**working tree clean 待 commit**
+- [x] 無未處理 Critical / High defect —— 掃描結果見 §7.1
 
 ### 測試數量原則
 
@@ -376,27 +381,119 @@ buffer 屬 **import 初始化成本，與 Session sample 數無關**（離線實
 
 **交付物**：`docs/Operations_Guide.md` —— 與 Closure Report 交叉引用，不重複技術分析。
 
+### 6.3 執行結果（2026-08-18）—— **Phase 5.4 = COMPLETE**
+
+**交付物已建立**：[`Operations_Guide.md`](Operations_Guide.md)（635 行，12 章 + 附錄）——
+Production Operations / Deployment Runbook。定位為「**怎麼做**」，與 Closure Report
+（為什麼這樣設計）、本文件（怎麼驗證與驗證結果）三者分工，**不重複技術分析**。
+
+章節：Purpose/Scope、Prerequisites、Initial Deployment、Daily Service Operations、
+Configuration（`*.env` 必要欄位／`AppEnvironmentExtra` 7 項／`OPENBLAS_NUM_THREADS=1`／
+12 個維運參數）、Log/Output、Service Health Check（11 項）、Production Upgrade
+（三種情境分流）、Rollback（baseline／安全窗口／失敗處置／三種還原）、
+Troubleshooting（15 個已驗證案例）、Security、Release Checklist（連結 §7）。
+
+**§6.2 的 11 項缺口全部關閉。** 同步修正的既有文件：
+
+| 文件 | 修正 |
+|---|---|
+| `tools/README.md` | 確立為 **Service action 權威來源**；「更新 NSSM binary」步驟 5 由「視需要 remove → install」改為 `-Action start`，並新增獨立小節區隔「nssm.exe 遺失需重新註冊」的特殊情境 |
+| `test/README.md` | Service 指令改為基本入口 + 連結（消除與 `tools/README.md` 雙份維護的漂移風險）；文件索引加入 Operations Guide |
+| `charge_discharge_report_DESIGN.md` | 三處 openpyxl「尚待同意加入 dependency」改為歷史註記（`Historical decision`），**未刪除原始紀錄** |
+
+**文件 DoD = 8/8 PASS**
+
+| # | 項目 | 結果 |
+|---|---|---|
+| 1 | 部署方式可操作 | PASS —— 六個 action 含用途／權限／預期結果／失敗不繼續條件 |
+| 2 | update / rollback 文件完整 | PASS —— Guide §8.2 + §9 |
+| 3 | env / NSSM / OpenBLAS 設定有紀錄 | PASS —— Guide §5.1／§5.2／§5.3 |
+| 4 | Service 操作指令完整 | PASS —— 權威來源已收斂 |
+| 5 | 日誌 / output / troubleshooting 有說明 | PASS —— Guide §6 + §10 |
+| 6 | 文件沒有失效連結 | PASS —— **relative links 30/30** |
+| 7 | README 與 `tools/README` 不矛盾 | PASS —— 過時建議已修正 |
+| 8 | Phase 4 / Phase 5 技術紀錄可追溯 | PASS —— 分工表 + 附錄索引 + 交叉引用 |
+
+**自動化文件驗證 11/11 PASS**：relative links 30/30、六個 action 名稱齊全、
+所有 `remove → install` 皆位於特殊情境脈絡（5 處）、`OPENBLAS_NUM_THREADS` 四份文件
+可追溯、Guide 的 7 項與 ps1 `$EnvLines` **逐項比對完全一致**、完整 `-Action` 清單不再
+兩份維護、Rollback SOP 要素齊備、Troubleshooting 未出現未驗證修法、
+所有 `.md` 不含 credential 實值、過時 openpyxl 描述已處理。
+
+**本階段未修改任何產品碼** —— 只動 4 份 Markdown（新增 1、修改 3），
+未觸碰任何 `.py` / `.ps1`，未重啟 Service（文件變更不涉及程式碼）。
+
+#### 已知現況（非缺口）
+
+repo **尚無 `requirements.txt`**。經確認**不屬於 Phase 5.4 COMPLETE 的必要條件** ——
+相依套件已在 Guide §2 明列（`requests`、`openpyxl`，並註明 `openpyxl` 會間接帶入
+`numpy`），並說明套件安裝屬環境變更、由負責人自行執行。
+本階段刻意不為了讓文件看起來完整而新增 dependency-management 機制。
+
 ---
 
 ## 7. Phase 5.5 — Release Validation DoD
 
-- [ ] Full Regression PASS（≥1529、FAIL 0、SKIP 0、Environment residue PASS）
-- [ ] Phase 5 新增 regression PASS
-- [ ] 5.2 Soak PASS
-- [ ] 5.3 Stress / Boundary PASS
-- [ ] 實機 Validation PASS（含至少一次完整自然 Session 生命週期）
-- [ ] Service health PASS
+- [x] Full Regression PASS —— **1802/1802**、FAIL 0、SKIP 0、Environment residue PASS
+- [x] Phase 5 新增 regression PASS —— 5.2 守門 29 項／5.3-A suite 244/244
+- [x] 5.2 Soak 收尾完成（Fix Validation PASS）
+- [x] 5.3 Stress / Boundary PASS —— #1～#12 全部 PASS（§5.4）
+- [x] 實機 Validation PASS —— 三份自然 Session 各 8/8（§7.1）
+- [x] Service health PASS —— 11/11（§7.1）
 - [ ] working tree clean、`git diff --check` exit 0
-- [ ] Production Documentation 完成
-- [ ] 無未處理 Critical / High defect
+- [x] Production Documentation 完成 —— `docs/Operations_Guide.md`（屬 5.4 交付）
+- [x] 無未處理 Critical / High defect —— Security 掃描無違規（§7.1）
 - [ ] **Release version 機制**（專案目前無版本號定義，須先建立）
 - [ ] **Release tag** 規劃
 - [ ] **Deployment package** 內容確定（含 `tools/nssm.exe`，SHA-256 `EEE9C44C29C2BE011F1F1E43BB8C3FCA888CB81053022EC5A0060035DE16D848`；排除 `output/`、`*.env`）
-- [ ] Rollback instructions
-- [ ] Final release report（`docs/Phase5_Closure_Report.md`）
+- [x] Rollback instructions —— Operations Guide §9（屬 5.4 交付）
+- [x] Final release report —— [`Phase5_Closure_Report.md`](Phase5_Closure_Report.md)
 - [ ] **Phase 4 commits 是否先 push / 建立遠端分支** —— 列為 Release 前置事項
 
 **未經確認：不建立 tag、不 push、不 Release、不 merge develop / main。**
+
+### 7.1 執行結果（2026-08-19）—— **Phase 5.5 = COMPLETE（驗證性項目）**
+
+完整彙整見 [`Phase5_Closure_Report.md`](Phase5_Closure_Report.md)。
+
+| 項目 | 結果 |
+|---|---|
+| Full Regression | **1802 / 1802 PASS**，FAIL 0、SKIP 0、Environment residue PASS |
+| Phase 5 新增 regression | 5.2 守門 29 項（含於 159/159）／5.3-A suite **244/244**（連續 3 次相同） |
+| 實機 Validation | 三份自然 Session 各 **8/8 PASS**（自動建立／RUNNING／自然結束／finalize／completed／xlsx 正常／integrity／`output_status` 無 failed） |
+| Service health | **11/11 PASS** |
+| Security / Critical / High | 無違規、無待處理缺陷 |
+| Documentation | 8/8；relative links 全數有效 |
+| working tree baseline | 10 檔 sha256 全數未變、0 個非預期變動、`git diff --check` clean |
+
+**實機 evidence**（未為 5.5 人工改動設備）：
+
+| Session | 角色 | samples | end_reason |
+|---|---|---|---|
+| `20260818_150301_auto` | **主要** —— 部署後新 worker 16512 首次自然 finalize | 151 | `auto_stop` |
+| `20260818_093254_auto` | 輔助（部署前，discharge） | 919 | `auto_stop` |
+| `20260817_160250_auto` | 輔助（部署前，charge） | 1273 | `battery_off` |
+
+Release 當下設備為 `mode=manual` / `sched=False` / `state=IDLE` / `session=None`
+—— Service 依設計不建立 Session，屬正確行為。
+
+### Phase 5 Validation = COMPLETE ／ Release 發布動作 = 尚未執行
+
+**必須明確區分兩者**：
+
+| | 狀態 |
+|---|---|
+| **Phase 5 Validation**（5.1 ~ 5.5） | **COMPLETE** |
+| Release tag（`背景監控_V5.2` ~ `V5.5`） | **未建立** |
+| push（remote / 目標分支未定；本分支無 upstream，領先 remote 4 個 commit） | **未執行** |
+| 建立 upstream / merge develop / main_new | **未執行** |
+| Deployment package 實際打包與驗證 | **未執行**（內容已確定） |
+| Release version 機制 | 已決定沿用既有 tag 慣例 `背景監控_V<Phase>`，**不新增 SemVer** |
+
+**「Phase 5 = COMPLETE」僅代表 Validation 完成，不代表已發布。**
+上述發布動作屬後續人工 Release，未經確認不得執行。
+
+---
 
 ---
 
