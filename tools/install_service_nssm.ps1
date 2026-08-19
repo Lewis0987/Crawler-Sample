@@ -33,7 +33,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('install', 'start', 'stop', 'status', 'remove')]
+    [ValidateSet('install', 'update', 'start', 'stop', 'status', 'remove')]
     [string]$Action,
 
     [string]$ServiceName = 'ESSAutoMonitor',
@@ -68,6 +68,27 @@ $EnvFile     = Join-Path $TestDir 'login.env'
 $LogDir      = Join-Path $ProjectRoot 'output\logs'
 $StdoutLog   = Join-Path $LogDir 'auto_monitor_service.log'
 $StderrLog   = Join-Path $LogDir 'auto_monitor_service.err.log'
+
+# ---- Service 環境變數（Service 不繼承使用者環境）----
+#   這是**唯一**的環境變數來源：Apply-ServiceSettings 用它寫入，
+#   Assert-InstalledSettings 用它回讀比對。兩邊共用同一份，避免日後漂移。
+#   API_ENV_FILE : 明確指定憑證檔，避免多個 *.env 造成探索順序不確定
+#   NO_PROXY     : 設備為區域網路 IP，絕不可經 proxy
+#   PYTHONIOENCODING / PYTHONUTF8：無 console 時仍確保 UTF-8 輸出
+#   OPENBLAS_NUM_THREADS：openpyxl 會間接 import numpy，其 OpenBLAS 後端
+#       會依 CPU 核心數建立 native thread pool。本產品不做任何 BLAS 運算
+#       （openpyxl 只拿 numpy 做 isinstance 型別判斷），該 pool 是純負擔。
+#       限制為 1 是 Phase 5.2 的資源最佳化，**不可移除**。
+#       必須由 OS 在行程啟動前設定 —— numpy 一旦載入就來不及。
+$EnvLines = @(
+    "API_ENV_FILE=$EnvFile",
+    "NO_PROXY=$DeviceHost,localhost,127.0.0.1",
+    "no_proxy=$DeviceHost,localhost,127.0.0.1",
+    "PYTHONIOENCODING=utf-8",
+    "PYTHONUTF8=1",
+    "PYTHONUNBUFFERED=1",
+    "OPENBLAS_NUM_THREADS=1"
+)
 
 function Assert-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -290,6 +311,74 @@ function Get-NssmValue {
     return (Remove-NulChars (Invoke-Nssm @('get', $ServiceName, $Key))).Trim()
 }
 
+function Apply-ServiceSettings {
+    <#
+        install / update **共用**的唯一設定來源。
+
+        為什麼要抽出來：install 與 update 若各寫一份 nssm set，日後一定漂移
+        （改了 install 忘了改 update，服務更新後設定就不一致）。此處是唯一入口。
+
+        本函式**不**呼叫 nssm install / nssm remove —— 服務的建立與移除分別由
+        install 分支與 Remove-SvcIdempotent 負責，設定套用與生命週期嚴格分離。
+
+        Application / AppParameters 也在此明確設定：nssm install 雖然會寫入它們，
+        但 update 不跑 install，仍必須能把這兩項校正回腳本定義的值。
+    #>
+    # ---- 執行檔與參數 ----
+    # ⚠️ AppParameters 一律使用**不含空白的相對腳本名**（原因見 install 分支註解）。
+    Invoke-Nssm @('set', $ServiceName, 'Application', $PythonExe)         | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppParameters',
+                  $ScriptName, '--interval', "$Interval")                 | Out-Null
+
+    # ---- 基本設定 ----
+    Invoke-Nssm @('set', $ServiceName, 'AppDirectory', $TestDir)          | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'DisplayName',
+                  'ESS Auto Monitor Service')                            | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'Description',
+                  '智慧排程自動建立充放電報告（無需開啟 Dashboard）')      | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'Start', 'SERVICE_AUTO_START')     | Out-Null
+    # LocalSystem：本機檔案全權、具 SeCreateGlobalPrivilege（Global\ Mutex 需要）
+    Invoke-Nssm @('set', $ServiceName, 'ObjectName', 'LocalSystem')       | Out-Null
+
+    # ---- 環境變數（定義見腳本頂部的 $EnvLines，此處只負責寫入）----
+    Invoke-Nssm @('set', $ServiceName, 'AppEnvironmentExtra',
+                  ($EnvLines -join "`r`n"))                               | Out-Null
+
+    # ---- Log 與 rotation（Phase 4.6 的 (a) 層）----
+    # ⚠️ 本專案有**兩套互相獨立**的 rotation，不要混為一談：
+    #   (a) NSSM（此處）：AppRotateBytes 達 10MB 時把現有 log 改名為帶時間戳的檔案。
+    #       **沒有「保留 N 份」的上限** —— 舊檔會一直累積，需自行或以排程清理。
+    #   (b) auto_monitor_service.py 的 _rotate_log()：僅在「未經 NSSM 直接執行」
+    #       或以 --log 指定時生效，採 .1~.5 輪替，固定保留 5 份。
+    #   正式以 NSSM 部署時走 (a)；(b) 是不經 NSSM 時的第二層保障。
+    Invoke-Nssm @('set', $ServiceName, 'AppStdout', $StdoutLog)           | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppStderr', $StderrLog)           | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppRotateFiles', '1')             | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppRotateOnline', '1')            | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppRotateBytes', '10485760')      | Out-Null   # 10MB
+    Invoke-Nssm @('set', $ServiceName, 'AppStdoutCreationDisposition', '4') | Out-Null # append
+    Invoke-Nssm @('set', $ServiceName, 'AppStderrCreationDisposition', '4') | Out-Null
+
+    # ---- Stop：必須送 Ctrl+C，且給足 report_pause() 的時間 ----
+    # report_pause() 內含 thread.join(SAMPLE_INTERVAL + 10) -> 最長約 15s。
+    # 逾時設太短會在正常停止時被強制終止 -> 留下 recording 的孤兒 Session。
+    Invoke-Nssm @('set', $ServiceName, 'AppStopMethodSkip', '0')          | Out-Null   # 不跳過任何階段
+    Invoke-Nssm @('set', $ServiceName, 'AppStopMethodConsole', '30000')   | Out-Null   # Ctrl+C 等 30s
+    Invoke-Nssm @('set', $ServiceName, 'AppStopMethodWindow', '5000')     | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppStopMethodThreads', '5000')    | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppKillProcessTree', '1')         | Out-Null
+
+    # ---- Exit code：Phase 4.6 一律不自動重啟 ----
+    #   0 正常結束 / 3 held_by_other（預期競爭，非故障）/ 4 ownership API 失敗
+    #   自動重啟策略屬 Phase 4.7，此處刻意全部 Exit。
+    Invoke-Nssm @('set', $ServiceName, 'AppExit', 'Default', 'Exit')      | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppExit', '0', 'Exit')            | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppExit', '3', 'Exit')            | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppExit', '4', 'Exit')            | Out-Null
+    Invoke-Nssm @('set', $ServiceName, 'AppThrottle', '0')                | Out-Null
+}
+
+
 function Assert-InstalledSettings {
     <#
         安裝後回讀驗證：確認 NSSM 實際存進 Registry 的值與預期一致。
@@ -331,6 +420,50 @@ NSSM AppParameters 中的含空白絕對路徑可能遺失引號，
 請改用不含空白的相對腳本名（AppDirectory 已指向 $TestDir）。
 "@
     }
+    # ---- AppEnvironmentExtra ----
+    # 這是 Phase 5.2 的資源最佳化設定所在，必須回讀確認，否則寫入失敗不會被發現。
+    # ⚠️ 一律用**集合比較**：NSSM 回讀 REG_MULTI_SZ 不保證順序，硬綁順序會誤判。
+    $envRaw = Get-NssmValue 'AppEnvironmentExtra'
+    $envActual = @($envRaw -split "`r?`n" |
+                   ForEach-Object { $_.Trim() } |
+                   Where-Object { $_ -ne '' })
+    Write-Host ("  {0,-14}: {1} 項" -f 'AppEnvExtra', $envActual.Count)
+    foreach ($e in $envActual) { Write-Host "                  $e" }
+
+    # ⚠️ 一律用**大小寫敏感**運算子（-cnotcontains / -clike）：
+    #    本專案刻意同時設定 NO_PROXY 與 no_proxy（有些函式庫只讀小寫），
+    #    預設的 -notcontains 不分大小寫，會把兩者視為同一項而放行錯誤設定。
+    $envBad  = @()
+    $missing = @($EnvLines  | Where-Object { $envActual -cnotcontains $_ })
+    $extra   = @($envActual | Where-Object { $EnvLines  -cnotcontains $_ })
+    $blas    = @($envActual | Where-Object { $_ -clike 'OPENBLAS_NUM_THREADS=*' })
+    if ($envActual.Count -ne $EnvLines.Count) {
+        $envBad += "項數為 $($envActual.Count)，預期 $($EnvLines.Count)"
+    }
+    if ($missing.Count -gt 0) { $envBad += "缺少：$($missing -join ' ｜ ')" }
+    if ($extra.Count   -gt 0) { $envBad += "多出：$($extra   -join ' ｜ ')" }
+    if ($blas.Count -ne 1) {
+        $envBad += "OPENBLAS_NUM_THREADS 出現 $($blas.Count) 次（必須恰好 1 次）"
+    } elseif ($blas[0] -cne 'OPENBLAS_NUM_THREADS=1') {
+        $envBad += "OPENBLAS 值為 $($blas[0])，預期 OPENBLAS_NUM_THREADS=1"
+    }
+    if ($envBad.Count -gt 0) {
+        $envMsg = ($envBad | ForEach-Object { "  - $_" }) -join "`n"
+        $actMsg = ($envActual | ForEach-Object { "  $_" }) -join "`n"
+        $expMsg = ($EnvLines  | ForEach-Object { "  $_" }) -join "`n"
+        throw @"
+
+[NSSM] AppEnvironmentExtra 驗證失敗（fail closed —— 不得繼續 start）
+$envMsg
+
+實際回讀（$($envActual.Count) 項）：
+$actMsg
+
+預期（$($EnvLines.Count) 項）：
+$expMsg
+"@
+    }
+
     if ($bad.Count -gt 0) {
         $lines = ($bad | ForEach-Object { "  $($_.Key)`n    實際：$($_.Actual)`n    預期：$($_.Want)" }) -join "`n"
         throw @"
@@ -339,7 +472,7 @@ NSSM AppParameters 中的含空白絕對路徑可能遺失引號，
 $lines
 "@
     }
-    Write-Host "  → 三項均符合預期"
+    Write-Host "  → 三項基本設定與 $($EnvLines.Count) 項環境變數均符合預期"
 }
 
 switch ($Action) {
@@ -359,62 +492,8 @@ switch ($Action) {
         Invoke-Nssm @('install', $ServiceName, $PythonExe,
                       $ScriptName, '--interval', "$Interval") | Write-Host
 
-        # ---- 基本設定 ----
-        Invoke-Nssm @('set', $ServiceName, 'AppDirectory', $TestDir)          | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'DisplayName',
-                      'ESS Auto Monitor Service')                            | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'Description',
-                      '智慧排程自動建立充放電報告（無需開啟 Dashboard）')      | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'Start', 'SERVICE_AUTO_START')     | Out-Null
-        # LocalSystem：本機檔案全權、具 SeCreateGlobalPrivilege（Global\ Mutex 需要）
-        Invoke-Nssm @('set', $ServiceName, 'ObjectName', 'LocalSystem')       | Out-Null
-
-        # ---- 環境變數（Service 不繼承使用者環境）----
-        #   API_ENV_FILE : 明確指定憑證檔，避免多個 *.env 造成探索順序不確定
-        #   NO_PROXY     : 設備為區域網路 IP，絕不可經 proxy
-        #   PYTHONIOENCODING / PYTHONUTF8：無 console 時仍確保 UTF-8 輸出
-        $envLines = @(
-            "API_ENV_FILE=$EnvFile",
-            "NO_PROXY=$DeviceHost,localhost,127.0.0.1",
-            "no_proxy=$DeviceHost,localhost,127.0.0.1",
-            "PYTHONIOENCODING=utf-8",
-            "PYTHONUTF8=1",
-            "PYTHONUNBUFFERED=1"
-        ) -join "`r`n"
-        Invoke-Nssm @('set', $ServiceName, 'AppEnvironmentExtra', $envLines)  | Out-Null
-
-        # ---- Log 與 rotation（Phase 4.6 的 (a) 層）----
-        # ⚠️ 本專案有**兩套互相獨立**的 rotation，不要混為一談：
-        #   (a) NSSM（此處）：AppRotateBytes 達 10MB 時把現有 log 改名為帶時間戳的檔案。
-        #       **沒有「保留 N 份」的上限** —— 舊檔會一直累積，需自行或以排程清理。
-        #   (b) auto_monitor_service.py 的 _rotate_log()：僅在「未經 NSSM 直接執行」
-        #       或以 --log 指定時生效，採 .1~.5 輪替，固定保留 5 份。
-        #   正式以 NSSM 部署時走 (a)；(b) 是不經 NSSM 時的第二層保障。
-        Invoke-Nssm @('set', $ServiceName, 'AppStdout', $StdoutLog)           | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppStderr', $StderrLog)           | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppRotateFiles', '1')             | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppRotateOnline', '1')            | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppRotateBytes', '10485760')      | Out-Null   # 10MB
-        Invoke-Nssm @('set', $ServiceName, 'AppStdoutCreationDisposition', '4') | Out-Null # append
-        Invoke-Nssm @('set', $ServiceName, 'AppStderrCreationDisposition', '4') | Out-Null
-
-        # ---- Stop：必須送 Ctrl+C，且給足 report_pause() 的時間 ----
-        # report_pause() 內含 thread.join(SAMPLE_INTERVAL + 10) -> 最長約 15s。
-        # 逾時設太短會在正常停止時被強制終止 -> 留下 recording 的孤兒 Session。
-        Invoke-Nssm @('set', $ServiceName, 'AppStopMethodSkip', '0')          | Out-Null   # 不跳過任何階段
-        Invoke-Nssm @('set', $ServiceName, 'AppStopMethodConsole', '30000')   | Out-Null   # Ctrl+C 等 30s
-        Invoke-Nssm @('set', $ServiceName, 'AppStopMethodWindow', '5000')     | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppStopMethodThreads', '5000')    | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppKillProcessTree', '1')         | Out-Null
-
-        # ---- Exit code：Phase 4.6 一律不自動重啟 ----
-        #   0 正常結束 / 3 held_by_other（預期競爭，非故障）/ 4 ownership API 失敗
-        #   自動重啟策略屬 Phase 4.7，此處刻意全部 Exit。
-        Invoke-Nssm @('set', $ServiceName, 'AppExit', 'Default', 'Exit')      | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppExit', '0', 'Exit')            | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppExit', '3', 'Exit')            | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppExit', '4', 'Exit')            | Out-Null
-        Invoke-Nssm @('set', $ServiceName, 'AppThrottle', '0')                | Out-Null
+        # 設定一律走 Apply-ServiceSettings（install / update 共用，避免兩份邏輯漂移）
+        Apply-ServiceSettings
 
         # 全部 set 完成後才回讀驗證；任一項不符即 throw（服務已知無法啟動，不可放行）
         Assert-InstalledSettings
@@ -435,6 +514,58 @@ switch ($Action) {
         Write-Host "                    獨立機制，僅在不經 NSSM 直接執行時生效。"
         Write-Host "  Stop            : Ctrl+C，逾時 30s"
         Write-Host "  Exit code       : 0/3/4 皆不自動重啟（Phase 4.6 規定）"
+        Write-Host ""
+        Write-Host "下一步： .\install_service_nssm.ps1 -Action start"
+    }
+
+    'update' {
+        <#
+            更新**既有**服務的設定，不建立、不移除服務。
+
+            為什麼要有這個動作：
+              對已存在的服務執行 -Action install 時，nssm install 會失敗，但因為
+              Invoke-Nssm 刻意不 throw，後續 nssm set 仍會照跑 —— 設定確實會更新。
+              那是**副作用**，不是設計契約，也沒有測試保證。Production 的設定更新
+              不應依賴它，故獨立出 update 這條正式路徑。
+
+            契約：
+              · 服務不存在 → throw（fail closed），**不**偷偷退化成 install
+              · 不呼叫 nssm install、不呼叫 nssm remove
+              · 設定來源與 install 完全相同（Apply-ServiceSettings）
+              · 回讀驗證不通過即 throw，不得繼續 start
+              · 不改動 ServiceName 與各路徑（皆由腳本參數決定，與 install 同源）
+
+            設定於服務執行中亦可寫入，但**要下次啟動才生效** ——
+            正式流程為 stop → update → start。
+        #>
+        Assert-Admin; $nssm = Assert-Nssm; Assert-Paths
+        Write-Host "使用 NSSM：$nssm"
+
+        $st = Get-SvcStatus
+        if ($st -eq 'Absent') {
+            throw @"
+
+[NSSM] 服務不存在：$ServiceName
+update 只能更新**既有**服務，不會自動改為安裝（fail closed）。
+若要首次安裝，請改用：
+    .\install_service_nssm.ps1 -Action install
+"@
+        }
+        Write-Host "更新既有服務：$ServiceName（目前狀態：$st）"
+        if ($st -eq 'Running') {
+            Write-Warning ("服務執行中 —— 設定會寫入，但要下次啟動才生效。" +
+                           "正式流程建議：-Action stop → -Action update → -Action start")
+        }
+
+        Apply-ServiceSettings
+        Assert-InstalledSettings
+
+        Write-Host ""
+        Write-Host "已更新服務設定：$ServiceName"
+        Write-Host "  執行            : $PythonExe $ScriptName --interval $Interval"
+        Write-Host "  工作目錄        : $TestDir"
+        Write-Host "  環境變數        : $($EnvLines.Count) 項（含 OPENBLAS_NUM_THREADS=1）"
+        Write-Host "  服務未被移除或重建，僅套用設定。"
         Write-Host ""
         Write-Host "下一步： .\install_service_nssm.ps1 -Action start"
     }

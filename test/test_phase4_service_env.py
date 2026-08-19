@@ -495,6 +495,119 @@ check("未以修改 code page 當修法（無 chcp / 65001 / OutputEncoding / ic
 check("Start-SvcAndWait 的成功訊息由腳本自行輸出 Unicode 中文",
       "服務已啟動（Running）" in _swait and "服務已在執行（Running）" in _swait)
 
+# ----------------------------------------------------------------------
+# Phase 5.2：OpenBLAS 資源最佳化守門
+#   openpyxl 會間接 import numpy，其 OpenBLAS 後端依 CPU 核心數建立 native
+#   thread pool（實測 +19 threads / +650MB Private），而本產品全程不做 BLAS
+#   運算。OPENBLAS_NUM_THREADS=1 是 Phase 5.2 的正式修法，必須守住不被移除。
+#   ⚠️ 一律比對**剝除註解後**的 _ps_code —— 上面這段說明本身就含該字串
+#      （本專案累犯項：守門比對到自己的註解）。
+# ----------------------------------------------------------------------
+print("\n[Phase 5.2] AppEnvironmentExtra 資源最佳化與 update 動作契約")
+
+
+def _env_array(code):
+    """取出 $EnvLines 陣列的字面片段（傳入的 code 需已剝除註解）。"""
+    i = code.find("$EnvLines = @(")
+    if i < 0:
+        return ""
+    seg = code[i:]
+    j = seg.find("\n)")
+    return seg[:j] if j > 0 else seg
+
+
+def _env_items(code):
+    """陣列內的環境變數字面值清單。"""
+    return re.findall(r'"([A-Za-z_][A-Za-z0-9_]*=[^"]*)"', _env_array(code))
+
+
+def _branch(code, name):
+    """取出 switch 分支 '<name>' { ... } 的完整內容（大括號配對）。"""
+    i = code.index("'%s' {" % name)
+    depth = 0
+    for k in range(i, len(code)):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[i:k + 1]
+    return code[i:]
+
+
+_items = _env_items(_ps_code)
+_ORIG6 = ("API_ENV_FILE=$EnvFile",
+          "NO_PROXY=$DeviceHost,localhost,127.0.0.1",
+          "no_proxy=$DeviceHost,localhost,127.0.0.1",
+          "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1", "PYTHONUNBUFFERED=1")
+
+# ---- 環境變數集合 ----
+check("$EnvLines 定義恰好 1 處（單一設定來源）",
+      _ps_code.count("$EnvLines = @(") == 1)
+check(f"AppEnvironmentExtra 共 7 項（實際 {len(_items)}）", len(_items) == 7)
+check("執行碼（非註解）內設定 OPENBLAS_NUM_THREADS=1",
+      "OPENBLAS_NUM_THREADS=1" in _items)
+check("OPENBLAS_NUM_THREADS 在 $EnvLines 內恰好 1 筆",
+      sum(1 for x in _items if x.startswith("OPENBLAS_NUM_THREADS=")) == 1)
+for _e in _ORIG6:
+    check(f"原有環境變數未被移除：{_e}", _e in _items)
+check("AppEnvironmentExtra 只有一個寫入點",
+      _ps_code.count("'AppEnvironmentExtra',") == 1)
+
+# ---- update 動作契約 ----
+_vs = re.search(r"ValidateSet\(([^)]*)\)", _ps_code)
+_actions = re.findall(r"'(\w+)'", _vs.group(1)) if _vs else []
+check(f"ValidateSet 含 update（{_actions}）", "update" in _actions)
+_upd = _branch(_ps_code, "update")
+_ins = _branch(_ps_code, "install")
+check("update 分支不呼叫 nssm install（不偷偷退化成安裝）", "'install'" not in _upd)
+check("update 分支不呼叫 nssm remove（不重建服務）", "'remove'" not in _upd)
+check("update 對不存在的服務 fail closed（比對 Absent 後 throw）",
+      "Absent" in _upd and "throw" in _upd)
+check("update 不修改 ServiceName 或任何 runtime 路徑",
+      not re.search(r"\$(ServiceName|TestDir|PythonExe|ScriptName|LogDir|EnvFile)"
+                    r"\s*=[^=]", _upd))
+check("update 呼叫 Assert-InstalledSettings（驗證不過不得放行）",
+      "Assert-InstalledSettings" in _upd)
+
+# ---- install / update 共用設定來源 ----
+check("install 與 update 皆呼叫 Apply-ServiceSettings",
+      "Apply-ServiceSettings" in _ins and "Apply-ServiceSettings" in _upd)
+check("兩分支內皆已無自己的 nssm set（設定邏輯不會漂移）",
+      _ins.count("Invoke-Nssm @('set'") == 0
+      and _upd.count("Invoke-Nssm @('set'") == 0)
+check("Apply-ServiceSettings 為唯一設定來源（定義 1 處，含全部 nssm set）",
+      _ps_code.count("function Apply-ServiceSettings") == 1
+      and _ps_code.count("Invoke-Nssm @('set'") >= 20)
+
+# ---- Assert-InstalledSettings 的回讀驗證 ----
+_asrt = _ps_code[_ps_code.index("function Assert-InstalledSettings"):]
+_asrt = _asrt[:_asrt.index("\n}")]
+check("Assert-InstalledSettings 回讀驗證 AppEnvironmentExtra",
+      "AppEnvironmentExtra" in _asrt)
+check("回讀比對使用 $EnvLines（與寫入同一來源）", "$EnvLines" in _asrt)
+check("以集合比較，未硬綁 NSSM 回讀順序", "-cnotcontains" in _asrt)
+check("比對大小寫敏感（NO_PROXY 與 no_proxy 必須可區分）",
+      "-cnotcontains" in _asrt and "-clike" in _asrt
+      and "-notcontains" not in _asrt.replace("-cnotcontains", ""))
+check("OPENBLAS_NUM_THREADS 必須恰好 1 筆", "$blas.Count -ne 1" in _asrt)
+check("驗證不符即 throw（fail closed，不得繼續 start）",
+      "$envBad.Count -gt 0" in _asrt and "throw" in _asrt)
+
+# ---- 守門自我驗證：設定被移除時本守門必須失敗 ----
+#   擋不住的守門沒有價值 —— 在記憶體中破壞執行碼，確認判定會翻成 False。
+_broken = _ps_code.replace('"OPENBLAS_NUM_THREADS=1"', '', 1)
+_bi = _env_items(_broken)
+check("負面測試：移除 OPENBLAS 後，7 項與存在性兩項判定皆會失敗",
+      "OPENBLAS_NUM_THREADS=1" not in _bi and len(_bi) != 7)
+_broken4 = _ps_code.replace('"OPENBLAS_NUM_THREADS=1"',
+                            '"OPENBLAS_NUM_THREADS=4"', 1)
+check("負面測試：值被改成 4 時，存在性判定會失敗",
+      "OPENBLAS_NUM_THREADS=1" not in _env_items(_broken4))
+_brokenNP = _ps_code.replace('"NO_PROXY=$DeviceHost,localhost,127.0.0.1",\n', '', 1)
+check("負面測試：原有項目被刪時，7 項判定會失敗",
+      len(_env_items(_brokenNP)) != 7)
+
 print("\n[Phase 4.6-A] H  既有套件不退步")
 _mon_now = open(os.path.join(HERE, "report_monitor.py"), encoding="utf-8").read()
 check("H  report_monitor.py 未因 Phase 4.6 而需要修改（仍無 input()）",
