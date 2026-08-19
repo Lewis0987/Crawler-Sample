@@ -289,7 +289,9 @@ communication_error / control_failed / unknown`（中文對照見需求第三點
 工作表：`測試摘要 / 時序數據 / 告警紀錄 / 開始與結束狀態 / 統計分析`。
 圖表（各自獨立、不混單位）：SOC-t、實際功率-t、電壓-t、電流-t、設定vs實際功率-t。
 
-> 需新增相依套件：`openpyxl`（Excel）。目前 requirements 只用 `requests`，需你同意加入。
+> **Historical decision（已完成）**：`openpyxl` dependency 已完成導入，
+> 目前為 production report path 的正式 dependency（`report.xlsx` 由它產生）。
+> 相依清單見 [`docs/Operations_Guide.md`](docs/Operations_Guide.md) §2。
 
 ---
 
@@ -342,7 +344,7 @@ Session ID / 動作 / 設定功率 / 經過時間 / 目前 SOC / 實際功率 / 
 - `device_control_operator.py` / `device_control_scraper.py` / 其他 scraper（只 import 重用）。
 
 **相依**
-- 新增 `openpyxl`（Excel 與圖表）。
+- `openpyxl`（Excel 與圖表）—— **已完成導入**，現為正式 dependency。
 
 ---
 
@@ -358,7 +360,7 @@ Session ID / 動作 / 設定功率 / 經過時間 / 目前 SOC / 實際功率 / 
 | R6 | 結束觸發來源 | 報告如何得知「控制已停止」：讀 operator 結果檔 / 監測 PCS 狀態 / 使用者手動 | 選定結束判定來源 |
 | R7 | 告警恢復時間 | row 無恢復時間欄位，只有 alarmStatus | 是否需要恢復時間（可能要另找 API） |
 | R8 | 選單整合時機 | 修改 menu 屬既有控制檔 | 先獨立版、後整合？（建議） |
-| R9 | 新增 openpyxl | 目前僅依賴 requests | 是否同意加入相依 |
+| R9 | 新增 openpyxl | ~~目前僅依賴 requests~~ | **已決議並完成導入** —— openpyxl 為正式 dependency |
 | R10 | 操作人員欄位 | 目前登入為固定 `hmiUser`，無「實際操作人員」來源 | 是否以登入帳號充當、或留空 |
 
 ---

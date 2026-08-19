@@ -97,21 +97,29 @@ Windows SCM → NSSM → auto_monitor_service.py → report_monitor.py → Sessi
 - Service 可在 **Dashboard 未開啟時獨立監控**。
 - Service 為 **Monitor Owner**；Dashboard 為 **Observer**（唯讀，不寫報告）。
 - `tools\nssm.exe` 是 **runtime dependency**，安裝後不可刪除、改名或搬移。
+- Windows Service 限制 OpenBLAS 為單執行緒，以降低背景服務資源占用。
 
-以**系統管理員** PowerShell 操作：
+以**系統管理員** PowerShell 操作（`install` / `update` / `start` / `stop` /
+`status` / `remove` 六個動作）：
 
 ```powershell
-.\tools\install_service_nssm.ps1 -Action install
-.\tools\install_service_nssm.ps1 -Action start
-.\tools\install_service_nssm.ps1 -Action status
-.\tools\install_service_nssm.ps1 -Action stop
-.\tools\install_service_nssm.ps1 -Action remove
+.\tools\install_service_nssm.ps1 -Action status    # 查詢
+.\tools\install_service_nssm.ps1 -Action start     # 啟動
+.\tools\install_service_nssm.ps1 -Action stop      # 停止
 ```
+
+| 情境 | 流程 |
+|---|---|
+| 首次安裝 | `install` → `start` |
+| Service 設定更新 | `stop` → `update` → `start` |
+| 純 Python 程式碼更新 | `stop` → 更新 `.py` → `start` |
 
 Service log：`output\logs\auto_monitor_service.log`
 
-> NSSM 版本、授權、SHA-256 與詳細部署／更新說明見
-> [`../tools/README.md`](../tools/README.md)。
+> 六個動作的完整說明、預期結果與失敗處置見
+> [`../tools/README.md`](../tools/README.md)（Service action 權威來源）。
+> 部署、設定確認、健康檢查、Rollback、Troubleshooting 見
+> [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md)。
 
 ## 8. Recovery
 
@@ -143,7 +151,7 @@ recording → worker 中斷 → Service start → resume
 目前正式 baseline：
 
 ```
-Automated checks : 1529 / 1529 PASS
+Automated checks : 1802 / 1802 PASS
 FAIL             : 0
 SKIP             : 0
 Environment      : PASS

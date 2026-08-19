@@ -78,14 +78,47 @@ Service 的 ImagePath 直接指向這個檔案路徑，因此**安裝後不可�
 
 clone 專案後，`tools\nssm.exe` 已隨 repo 提供，**不需要另外下載 NSSM**。
 
-以**系統管理員** PowerShell 執行：
+> 📌 **本節是 Service action 的權威來源。** 其他文件（含 `test/README.md`）
+> 只保留最基本入口並連回此處，避免兩份完整版本各自漂移。
+> 操作步驟、預期結果與失敗處置見
+> [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md)。
+
+以**系統管理員** PowerShell 執行（`install` / `update` / `start` / `stop` /
+`remove` 一律需要系統管理員）：
 
 ```powershell
-.\tools\install_service_nssm.ps1 -Action install
+.\tools\install_service_nssm.ps1 -Action install   # 首次建立 Service 並套用設定
+.\tools\install_service_nssm.ps1 -Action update    # 更新既有 Service 的設定
 .\tools\install_service_nssm.ps1 -Action start
+.\tools\install_service_nssm.ps1 -Action stop
+.\tools\install_service_nssm.ps1 -Action status
+.\tools\install_service_nssm.ps1 -Action remove
 ```
 
-其他動作：`-Action stop` / `-Action status` / `-Action remove`。
+| Action | 用途 |
+|---|---|
+| `install` | **首次**建立 Service 並套用全部設定，最後回讀驗證 |
+| `update` | 更新**既有** Service 的設定 —— **不建立、不移除**服務；服務不存在即 throw（不會退化成 install） |
+| `start` / `stop` | 啟動／停止（stop 送 Ctrl+C，逾時 30 秒） |
+| `status` | 查詢狀態與診斷資訊 |
+| `remove` | 移除 Service（log 保留）；Running 時會先自動停止，停止失敗即不移除 |
+
+**正式流程**
+
+| 情境 | 流程 |
+|---|---|
+| 首次安裝 | `install` → `start` |
+| **Service 設定更新** | **`stop` → `update` → `start`** |
+| 純 Python 程式碼更新 | `stop` → 更新 `.py` → `start`（不需 `update`；理由見 Operations Guide §8.3） |
+| 移除 | `stop` → `remove` |
+
+`install` 與 `update` 共用同一份設定來源（腳本內的 `Apply-ServiceSettings`），
+兩者不會漂移；`Assert-InstalledSettings` 會回讀驗證三項基本設定與
+`AppEnvironmentExtra`（7 項，含 `OPENBLAS_NUM_THREADS=1`），任一不符即 throw、
+**不放行到 start**（fail closed）。
+
+> ⚠️ **`remove` → `install` 不是一般更新方式。** 它會刪除服務定義，
+> 只用於「需要重新註冊 Service」的特殊情境（見下方〈nssm.exe 遺失〉）。
 
 腳本一律以 SCM 的實際狀態（`Get-Service`）判定成敗，不解析也不顯示 NSSM 的
 原生輸出 —— NSSM 在行程內部就會把非 ASCII 訊息轉成 `?`，那些文字無法還原，
@@ -97,12 +130,33 @@ clone 專案後，`tools\nssm.exe` 已隨 repo 提供，**不需要另外下載 
 
 **不要在 Service 為 Running 狀態時直接覆蓋 `nssm.exe`。**
 
-若未來需要更新：
+若未來需要更新 **`nssm.exe` binary**：
 
 1. `-Action stop`
 2. 確認 Service 已 `Stopped`
-3. 更換 binary
+3. 就地更換 binary（**檔名與路徑保持不變**）
 4. 確認版本 / x64 / SHA-256，並同步更新本文件的版本資訊表
-5. 視需要 remove → install
+5. `-Action start`
 6. 重跑 Phase 4.6 Service regression
 7. 驗證 start / stop / boot auto-start / log / `AppExit` / log rotation
+
+> **不需要 `remove` → `install`** —— Service 的 ImagePath 指向的是同一個路徑，
+> 就地更換 binary 後 `start` 即生效。只有下面這個情境才需要重新註冊。
+
+### nssm.exe 遺失 / ImagePath 已失效（需重新註冊）
+
+若 `nssm.exe` 被刪除、改名或搬移，症狀不是「裝不起來」，而是
+**已安裝的服務下次開機起不來**，且**無法**用 `-Action start` 修復。
+
+此時才需要重新註冊 Service：
+
+1. 先把 `nssm.exe` 還原到 `tools\nssm.exe`（SHA-256 需與版本資訊表相符）
+2. `-Action stop`（若服務仍在）
+3. `-Action remove`
+4. `-Action install`
+5. `-Action start`
+6. 驗證 Service health
+
+⚠️ `remove` 會刪除服務定義；若後續 `install` 失敗會處於「完全沒有服務」的狀態。
+執行前請先依 [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md) §9.1
+記錄 baseline。

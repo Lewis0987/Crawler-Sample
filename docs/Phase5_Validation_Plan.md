@@ -160,6 +160,110 @@ log 無 `token` / `cookie` / `password` / `authorization` / `_raw` / `accessToke
 | 出現 recording orphan | 不人工 finalize；讓 Service 自然 resume 收尾 |
 | 需人工重啟 Service（任何原因） | soak **重跑**，先前資料保留為參考 |
 
+### 4.4 執行結果與 Root Cause（2026-08-17 ~ 08-18）
+
+**Phase 5.2 Soak = FAIL** —— 依 §4.2 B. Resource stability：WorkingSet 24.293 MB → 78.34 MB
+（+222%，>50% 即 FAIL），於 T0+3.09h 觸發，採樣器依設計保存證據後停止。
+**此判定為定案，不因後續查明 Root Cause 而改寫為 PASS。**
+
+中斷前其餘五組：A / C / D / F 均 PASS；E 在第一份 Session 自動建立並自然收尾後由 WARN 轉 PASS。
+
+#### Root Cause = ONE-TIME COST
+
+來源鏈：
+
+```
+finalize → _regenerate_outputs() → _write_xlsx() → import openpyxl.chart
+        → openpyxl.compat.numbers → import numpy → scipy-openblas
+        → OpenBLAS native thread pool（依 os.cpu_count() 建立）
+```
+
+- 產品碼完全不做 BLAS 運算；openpyxl 只拿 numpy 做 `isinstance` 型別判斷
+- 實測 +19 threads / +650 MB Private
+- `gc.collect()` 回收 0 MB —— 非 Python heap，GC 觸及不到，故不採此修法
+
+判定依據（第二次自然 finalize 實測）：
+
+| | Private | Threads | Handles |
+|---|---|---|---|
+| finalize #1（pre → T+0） | +672.49 MB | +21 | +21 |
+| finalize #2（pre → T+0） | −0.31 MB | −1 | −3 |
+| stable baseline #1 → #2 | −0.21 MB | ±0 | ±0 |
+
+⇒ 屬每個 worker process 的**一次性**初始化成本，非累積性洩漏。
+
+#### 修法
+
+`OPENBLAS_NUM_THREADS=1`，實作於 `tools/install_service_nssm.ps1` 的 `AppEnvironmentExtra`
+（該處本來就是 Service 環境變數的正式來源，每次 install 重寫，設定不會遺失）。
+
+離線驗證（1273 samples 真實 fixture）：Private −610.7 MB、Threads −19、VirtualSize −662.6 MB；
+報告保真度 12 項全通過（統計數值逐欄一致）；產出時間無可測量退步。
+
+守門：`test_phase4_service_env.py` 的 Phase 5.2 區塊（10 項），防止日後被移除。
+
+#### 部署（2026-08-18）
+
+為避免依賴「對既有服務執行 `-Action install` 時 `nssm install` 失敗但後續 `nssm set`
+仍會跑」這個**副作用**，先為 `install_service_nssm.ps1` 補上正式的 `-Action update`
+路徑：只更新既有服務（不存在即 throw，不退化成 install）、不呼叫 `nssm install` /
+`nssm remove`，設定由 install / update 共用的 `Apply-ServiceSettings` 提供；
+`Assert-InstalledSettings` 同時擴充為回讀驗證 `AppEnvironmentExtra`（7 項集合比較、
+大小寫敏感、`OPENBLAS_NUM_THREADS` 恰好 1 筆，不符即 throw / fail closed）。
+
+部署流程：`-Action stop` → `-Action update` → 獨立回讀驗證 → `-Action start`，
+未 remove、未手改 Registry。部署後 16 項驗證全數 PASS（新 worker PID 16512）。
+
+**Deployment = PASS**
+
+#### Fix Validation（2026-08-18）
+
+驗證對象刻意鎖定「**部署後全新 worker 的第一次**自然 finalize」——
+舊 worker 早已 import 過 numpy，其第二次 finalize 不漲只能證明 ONE-TIME COST，
+無法證明修法有效。
+
+| pre → T+0 | ΔPrivate | ΔThreads | ΔHandles |
+|---|---|---|---|
+| 舊環境第一次 finalize | +672.49 MB | +21 | +21 |
+| **修正後新 worker 第一次 finalize** | **+48.32 MB** | **+2** | **+1** |
+
+Private 降低約 **92.8%**；+19 條 OpenBLAS native thread 未再出現。
+
+T+30m：Private 約 77.8 MB 且穩定（漂移 0.035 MB）、Threads 1~2、Handles 170~171。
+Session Integrity **14/14 PASS**（completed、samples.csv 列數 == sample_count、
+`sample_index` 連續無斷點、`output_status` 無 failed、`report.xlsx` 13 worksheets /
+2 charts、無重複 Session、log 無 Traceback、err.log 0）。
+
+**Fix Validation = PASS** —— `OPENBLAS_NUM_THREADS=1` 實機修法成立。
+
+證據：`output\soak_evidence\fix_validation_openblas\`。
+
+##### 比較限制（保留）
+
+舊 Session 為 1273 samples，新 Session 為 151 samples，故 workbook 建構本身的記憶體
+成本不是完全同規模比較。但 OpenBLAS 的 +19 native threads / 約 650 MB committed
+buffer 屬 **import 初始化成本，與 Session sample 數無關**（離線實測：`import numpy`
+單獨一行即產生 +19 threads / +652 MB，未觸碰任何資料）；修正後 ΔThreads 僅 +2，
+因此不影響 OpenBLAS 修法成立的結論。
+
+完全對等的 ~1200 samples Session 列為**後續補強觀察**，**不是** Phase 5.2 COMPLETE
+的必要條件。
+
+#### Phase 5.2 最終狀態
+
+| 項目 | 結果 |
+|---|---|
+| Original Soak | **FAIL**（2026-08-17，T0+3.09h，B Resource） |
+| Root Cause | **ONE-TIME COST** |
+| Fix | **OPENBLAS_NUM_THREADS=1** |
+| Deployment | **PASS** |
+| Fix Validation | **PASS** |
+| **Phase 5.2** | **COMPLETE** |
+
+`Phase 5.2 = COMPLETE` 的定義是：**原始測試發現問題 → Root Cause 查明 → 修正 →
+部署 → 修正後驗證 PASS → 收尾完成**。
+原始 Soak 的 **FAIL 為定案，不得改寫為 PASS** —— 上表保留完整歷史。
+
 ---
 
 ## 5. Phase 5.3 — Stress / Boundary Test
@@ -195,6 +299,51 @@ log 無 `token` / `cookie` / `password` / `authorization` / `_raw` / `accessToke
 新增 suite 全 PASS，且既有 1529 項一項不減、一項不 FAIL。
 若任一項揭露真實產品缺陷 → **停止並回報根因、影響、最小修法、測試方式**，
 不自行修改產品碼。
+
+### 5.4 執行結果（2026-08-18）—— **Phase 5.3 = COMPLETE**
+
+交付物：`test/test_phase5_stress_boundary.py`（#1～#12 全部）與
+`test/_p53_stress_child.py`（#11 跨行程 helper；刻意不動 Phase 4.4 的
+`_p44_owner_child.py`，避免波及既有測試）。已註冊進 `run_phase3_regression.py`。
+
+| 項目 | 結果 |
+|---|---|
+| #1～#12 | **全部 PASS**（分 8 個 Batch 遞增執行，每批通過才進下一批） |
+| Phase 5.3-A suite | **244 / 244 PASS**（連續執行 3 次皆相同） |
+| Full Regression | **1802 / 1802 PASS**，FAIL 0、SKIP 0 |
+| 既有測試 | 一項不減（267/372/122/23/22/84/56/62/64/159/43/56/116/39/73 逐項相同） |
+| Isolation Guard | **12 / 12 PASS**（未全過即中止，不執行任何壓力項目） |
+| #11 Ownership contention | PASS —— 6 行程同時競爭恰好 1 個 Owner；落敗者一律 `held_by_other`；release 後可 takeover；崩潰（唯一 handle 持有者）→ 下一行程得 `acquired`／`abandoned=False`；另有 handle 存活時 Wait 回 **WAIT_ABANDONED (0x80)**，符合 Phase 4.4/4.7 契約 |
+| #12 canonicalization / malformed / timeout | PASS —— 7 種路徑表示法收斂為同一 Mutex、4 個不同 root → 4 個不同 Mutex；壞 JSON／空檔／缺欄位／時間格式錯一律安全回 `None`；全端點逾時記入 `_fail`、`communication_ok=False`、正確回 `guest_also_down` 且 `_fail` 不夾帶敏感字樣 |
+| 正式 Mutex | **零接觸** —— 執行期攔截器逐次比對，放行的 mutex 集合不含正式 canonical |
+| 正式 `monitor_owner.json` | **零修改**（size + mtime_ns + sha256 三項前後相同） |
+| 正式 output 指紋 | **前後完全一致**（156 檔 `dc152f61c61814fc…`） |
+| worker PID / start time | **16512 / 2026-08-18T14:45:09 全程未變**，Service 持續 Running |
+| 產品 Python 執行碼 | **零修改** |
+
+隔離手法：全程 temp root、零網路（`read_all` / `_fetch_cell_packs` 取代）、
+`_report_output_root` 於任何 Mutex 呼叫前先指向暫存目錄；#11 另加三條前置硬性
+斷言（父與每個子行程回報的 mutex 皆 ≠ 正式 canonical；所有 root 位於暫存目錄
+且不在正式 root 之下；正式 output 指紋前後一致），未過即中止。崩潰情境以子行程
+自行 `os._exit(0)` 模擬，**不使用任何強制終止指令**。
+
+### 5.5 已知硬化機會（Known hardening opportunities / defense-in-depth）
+
+#12 以刻意畸形的輸入探測時，發現三處在**極端型別／內容**下會拋例外而非安全回值。
+三者在**目前正式產品呼叫鏈皆不可達**，上游已有型別／資料來源契約守門：
+
+| 現象 | 為何目前不可達 |
+|---|---|
+| `session_state.json` 內容為 JSON **陣列** 時，`_orphan_gap_seconds` 的 `st.get` 拋 `AttributeError`（`_load_json(...) or {}` 對非空 list 為真） | `find_active_session()` 以 `isinstance(st, dict)` 過濾，陣列型 state 永遠不會被選為 active；而本函式只被 `report_resume_on_launch()` 以 `active` 呼叫，前面另有 `if not active: return` |
+| `_auth_session_lost({"_fail": 純量})` → `_ep_failed` 迭代純量拋 `TypeError` | `_fail` 一律由 `CDR.read_all._get()` 建構為 list，不會是純量 |
+| `find_active_session(None)` → `os.path.isdir(None)` 拋 `TypeError` | 產品一律傳入 `_report_output_root()` 的回傳字串 |
+
+處置：**未修改產品碼**，也**未**將其升格為 Phase 5.3 FAIL。測試中以
+`[已知硬化機會]` 標記並鎖定現況，避免日後行為悄悄改變而無人察覺。
+
+⚠️ **未來若上述任一上游呼叫契約改變**（例如 `find_active_session` 放寬型別過濾、
+`_fail` 改由其他來源建構、或 `_orphan_gap_seconds` 被新的呼叫點使用），
+**必須重新評估**是否需要加入型別守門。本階段刻意不擴大產品契約。
 
 ---
 
