@@ -168,6 +168,7 @@ Environment      : PASS
 | Phase 3 | Auto Lifecycle | COMPLETE |
 | Phase 4 | Auto Monitor Service | COMPLETE |
 | Phase 5 | Production Ready | COMPLETE |
+| Phase 6 | Meter-based Auto Charge / Discharge | IN PROGRESS |
 
 **Phase 5 進度**
 
@@ -195,6 +196,21 @@ Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 
 
 > **Phase 5 = COMPLETE 指的是 Validation 完成。**
 > tag / push / deployment package 屬**後續人工 Release 動作，尚未執行**。
+
+**Phase 6 進度**
+
+| | 項目 | 狀態 |
+|---|---|---|
+| 6.0 | Production Meter Verify（正式環境電表確認） | COMPLETE |
+| 6.1 | Meter Client（電表資料讀取） | COMPLETE |
+| 6.2 | Power Classification（功率狀態判斷） | COMPLETE |
+| 6.2b | TOU Calendar（尖峰／離峰時段判斷） | COMPLETE |
+| 6.3 | Decision Engine（自動充放電決策） | READY |
+| 6.4 | Safety Gate（安全條件檢查） | PENDING |
+| 6.5 | PCS Control Integration（PCS 自動充放電控制） | PENDING |
+| 6.6 | Auto Report Integration（自動報告整合） | PENDING |
+| 6.7 | Field Validation（實機驗證） | PENDING |
+| 6.8 | Regression & Closure（完整回歸與結案） | PENDING |
 
 ## 11. 文件
 
