@@ -207,8 +207,8 @@ Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 
 | 6.2b | TOU Calendar（尖峰／離峰時段判斷） | COMPLETE |
 | 6.3-A | Decision Engine Framework（決策骨架） | COMPLETE |
 | 6.3-B | Decision Policy（充放電策略規則） | COMPLETE |
-| 6.4 | Safety Gate（安全條件檢查） | READY |
-| 6.5 | PCS Control Integration（PCS 自動充放電控制） | PENDING |
+| 6.4 | Safety Gate（安全條件檢查） | COMPLETE |
+| 6.5 | PCS Control Integration（PCS 自動充放電控制） | READY |
 | 6.6 | Auto Report Integration（自動報告整合） | PENDING |
 | 6.7 | Field Validation（實機驗證） | PENDING |
 | 6.8 | Regression & Closure（完整回歸與結案） | PENDING |
