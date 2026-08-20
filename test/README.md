@@ -205,8 +205,9 @@ Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 
 | 6.1 | Meter Client（電表資料讀取） | COMPLETE |
 | 6.2 | Power Classification（功率狀態判斷） | COMPLETE |
 | 6.2b | TOU Calendar（尖峰／離峰時段判斷） | COMPLETE |
-| 6.3 | Decision Engine（自動充放電決策） | READY |
-| 6.4 | Safety Gate（安全條件檢查） | PENDING |
+| 6.3-A | Decision Engine Framework（決策骨架） | COMPLETE |
+| 6.3-B | Decision Policy（充放電策略規則） | COMPLETE |
+| 6.4 | Safety Gate（安全條件檢查） | READY |
 | 6.5 | PCS Control Integration（PCS 自動充放電控制） | PENDING |
 | 6.6 | Auto Report Integration（自動報告整合） | PENDING |
 | 6.7 | Field Validation（實機驗證） | PENDING |
