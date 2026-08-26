@@ -76,15 +76,30 @@ def build_ess_reader(client=None):
     return lambda: CDR.read_all(client)
 
 
-def build_api_client():
+def build_api_client(login=True):
     """
-    建立 production API client。**只有呼叫端明確要求時才會用到。**
+    建立 production API client。回傳 `(client, token)`。
 
-    ⚠️ 這裡會登入與連線 —— 因此刻意獨立成一個必須被明確呼叫的函式，
-       不放在任何 build_* 的預設路徑上。
+    🔴 **必須登入**（Phase 6.7 實機驗證發現的 wiring 缺口）：
+       `getRunMode` / `getScheduleSwitch` / `getDOAndDIMsg` 三支需要認證，
+       未登入時回 401 → `pcs_schedule_enabled` / `pcs_manual_switch` 皆為 None
+       → ESS 觀測 `PCS_MODE_UNAVAILABLE` → 整條鏈永遠 Fail Closed。
+       行為本身是安全的，但**永遠不會有可用觀測**，等於整個 orchestrator 空轉。
+    ⚠️ 登入失敗**不拋例外、不重試** —— 回傳 token=None 讓上層自行 Fail Closed；
+       控制服務不得因登入失敗而改變任何控制判斷。
+    ⚠️ 這裡會連線與認證，因此刻意獨立成必須被明確呼叫的函式，
+       不放在任何 build_* 的預設路徑上。登入只取讀取權限，**不送任何控制**。
     """
     from api_client import ApiClient
-    return ApiClient()
+    import charge_discharge_report as CDR
+    client = ApiClient()
+    if not login:
+        return client, None
+    try:
+        token = client.login_hmi(CDR.USERNAME)
+    except Exception:                     # noqa: BLE001 —— 邊界，交由上層 Fail Closed
+        token = None
+    return client, token
 
 
 def build_meter_source(meter_client=None):

@@ -653,6 +653,91 @@ def _read_device_state(client):
         return None
     _check_auth_session(reading)
     return reading
+# ======================================================================
+# Phase 6.6：Direction-driven Auto Report Trigger（R1）
+# ======================================================================
+# 🔴 **注入式，預設關閉** —— `_control_session_provider = None` 時，
+#    本檔行為與 Phase 6 導入前**完全相同**（既有 A/B 條件原封不動生效）。
+#
+# 為什麼需要它：既有自動報告的建立條件是「智慧模式 ＋ 排程主開關開」，
+# 而 Phase 6 自動控制的前提**恰好相反**（排程 ON 時 Control Authority 一律
+# 判為 EXTERNAL，Phase 6 不介入）。兩者互斥 → Phase 6 在控時報告永遠不會開始。
+# R1 讓報告改由「**實際控制方向與擁有權**」驅動，取代「排程開關」這個條件。
+#
+# 🔴 責任分離（不得違反）
+#    · 本檔**不** import 任何 Phase 6 模組；只接受一個唯讀的狀態提供者。
+#    · 提供者**只回報狀態**，不得、也無法讓報告層產生任何控制決策。
+#    · 報告失敗不得回頭改寫 Decision / Safety Gate / Control Authority。
+#
+# 提供者契約：zero-arg callable → None 或
+#    {"owned": bool, "action": "charge"|"discharge", "target_power_kw": float|None}
+_control_session_provider = None
+
+# 由 R1 觸發時的來源標記（與既有 origin=manual/scheduler 並列）
+ORIGIN_PHASE6 = "phase6"
+
+
+def set_control_session_provider(fn):
+    """
+    注入 Phase 6 控制狀態提供者。傳 None 即完全還原既有行為。
+
+    ⚠️ 刻意做成注入而非 import —— 報告層不得相依控制層。
+    """
+    global _control_session_provider
+    _control_session_provider = fn
+
+
+def clear_control_session_provider():
+    set_control_session_provider(None)
+
+
+def _control_session_state():
+    """
+    取得 Phase 6 目前的控制擁有權狀態。**任何例外一律視為「沒有」**：
+    報告層的問題不得影響控制層，控制層的問題也不得讓報告層當掉。
+    """
+    fn = _control_session_provider
+    if fn is None:
+        return None
+    try:
+        st = fn()
+    except Exception as e:                    # noqa: BLE001 —— 邊界，刻意吞
+        print(f"[AUTO] 控制狀態提供者例外（忽略，退回既有條件）：{e}")
+        return None
+    if not isinstance(st, dict) or st.get("owned") is not True:
+        return None
+    if st.get("action") not in ("charge", "discharge"):
+        return None
+    return st
+
+
+def _start_gate(mode_code, sched_on, direction):
+    """
+    是否允許自動建立報告。回傳 (ok, reason, origin, setpoint)。
+
+    兩條互斥的路徑，**任一成立即可**：
+      既有路徑：智慧模式 ＋ 排程主開關開            → origin=scheduler
+      R1 路徑 ：Phase 6 擁有該作業且方向一致        → origin=phase6
+
+    🔴 R1 路徑額外要求「Phase 6 宣稱的方向」與「設備實際方向」一致 ——
+       兩者不符代表擁有權有疑義，此時**不建立報告**（Fail Closed）。
+    """
+    st = _control_session_state()
+    if st is not None:
+        if st.get("action") != direction:
+            _auto_note(f"[AUTO] Phase 6 宣稱方向為 {st.get('action')}，"
+                       f"但設備實際方向為 {direction} → 不建立報告")
+            return False, "phase6_direction_mismatch", None, None
+        return True, "phase6_owned", ORIGIN_PHASE6, st.get("target_power_kw")
+    if mode_code != "smart":
+        _auto_note(f"[AUTO] 控制模式非智慧模式（{mode_code}）→ 不自動建立報告")
+        return False, f"control_mode={mode_code}", None, None
+    if not sched_on:
+        _auto_note("[AUTO] 排程主開關未開啟 → 不自動建立報告")
+        return False, "schedule_off", None, None
+    return True, "scheduler", "scheduler", None
+
+
 def _actual_direction(r):
     """回傳 (direction, fault)：direction ∈ charge/discharge/idle/unknown；fault=PCS 是否故障。"""
     if not isinstance(r, dict):
@@ -1619,13 +1704,13 @@ def auto_schedule_check(r, client=None, source="auto"):
         if fault:
             _auto_note("[AUTO] PCS 故障中（pcs_fault_flag）→ 不建立新報告")
             return "skipped", "pcs_fault"
-        # A / B：非智慧模式或排程主開關未開 → 不自動建立
-        if mode_code != "smart":
-            _auto_note(f"[AUTO] 控制模式非智慧模式（{mode_code}）→ 不自動建立報告")
-            return "skipped", f"control_mode={mode_code}"
-        if not sched_on:
-            _auto_note("[AUTO] 排程主開關未開啟 → 不自動建立報告")
-            return "skipped", "schedule_off"
+        # A / B：既有「智慧模式＋排程開」條件；R1 起另可由 Phase 6 擁有權驅動。
+        # ⚠️ 其餘所有守門（C 方向、D 已有 session、E 故障、F pending、
+        #    cooldown、G debounce、owner、主開關）**一項都沒有放寬**。
+        _gate_ok, _gate_reason, _origin, _setpoint = _start_gate(
+            mode_code, sched_on, direction)
+        if not _gate_ok:
+            return "skipped", _gate_reason
         # C：尚未實際充/放電（含 idle / unknown）→ 只等待，不建立
         if direction not in ("charge", "discharge"):
             _auto_note(f"[AUTO] 智慧模式＋排程已開，但設備方向為 {direction}"
@@ -1665,18 +1750,24 @@ def auto_schedule_check(r, client=None, source="auto"):
         _auto["template_status"] = _auto_enabled_plan_state(client or _report["client"])
         print(f"[AUTO] 排程配置清單：{_auto['template_status']}（僅供資訊，不影響報告建立）")
         ev_type = "auto_charge_start" if direction == "charge" else "auto_discharge_start"
+        _origin = _origin or "scheduler"
+        # R1：由 Phase 6 驅動時，把控制 action 與 target_power_kw 一併記入
+        # （setpoint 沿用既有參數，不擴充 CSV schema）。
+        _extra = (f"｜控制來源 Phase 6｜action={direction}"
+                  f"｜target_power_kw={_setpoint}") if _origin == ORIGIN_PHASE6 else ""
         sess, _created = _report_start_session(      # 內部自行取得 _SESSION_LOCK（RLock）
             direction,
             r.get("pcs_power_control_mode") or "交流有功",
-            None,
-            origin="scheduler",
+            _setpoint,
+            origin=_origin,
             # detail 開頭寫入 origin=scheduler：讓 events.csv 本身能自證「誰建立了這份報告」，
             # 不必回頭看當時的 console 輸出（origin 與 source 語意不同：
             #   origin=scheduler/manual → 誰建立；source=auto/manual → 哪種刷新觸發）。
             # 僅增加 detail 文字，不改 CSV schema、不增欄位。
             extra_events=[(ev_type, "info",
-                           f"origin=scheduler｜智慧排程自動開始{zh}｜方向持續 {held:.0f}s｜"
-                           f"排程配置 {_auto['template_status']}｜刷新來源 {source}")],
+                           f"origin={_origin}｜自動開始{zh}｜方向持續 {held:.0f}s｜"
+                           f"排程配置 {_auto['template_status']}｜刷新來源 {source}"
+                           f"{_extra}")],
         )
     finally:
         with _SESSION_LOCK:                          # 瞬時：離開 pending（成功或失敗都要）

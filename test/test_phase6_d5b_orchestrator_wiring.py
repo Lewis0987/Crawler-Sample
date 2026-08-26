@@ -202,6 +202,21 @@ def main():
            and rb.stability_samples == 1 and rb.ready is True)(w.readback))
     check("★★ A. 一輪觀測可完整跑完整條鏈（不 crash、不需設備）",
           st.run() is not None)
+    # 🔴 Phase 6.7 實機驗證發現的 wiring 缺口：ESS reader 需要**已登入**的 client。
+    #    getRunMode / getScheduleSwitch / getDOAndDIMsg 未登入會回 401 →
+    #    pcs_schedule_enabled / pcs_manual_switch 皆為 None →
+    #    ESS 觀測 PCS_MODE_UNAVAILABLE → 整條鏈永遠 Fail Closed（安全但空轉）。
+    _cli, _tok = PRD.build_api_client(login=False)
+    check("★★ A. build_api_client 回傳 (client, token) 兩元組",
+          _cli is not None and _tok is None)
+    _prd_src = io.open(os.path.join(HERE, "pcs_auto_control_production.py"),
+                       encoding="utf-8").read()
+    check("★★ A. 預設會登入，且明載未登入將導致整條鏈空轉",
+          "def build_api_client(login=True)" in _prd_src
+          and "PCS_MODE_UNAVAILABLE" in _prd_src
+          and "401" in _prd_src)
+    check("★★ A. 登入失敗不拋例外、不重試（交由上層 Fail Closed）",
+          "不拋例外、不重試" in _prd_src)
 
     # ---------------- B/C. dispatch_enabled=False ----------------
     print("\nB/C. 上游全部放行時仍 0 calls")
@@ -464,10 +479,14 @@ def main():
                   "device_control_menu"}))
     _prd_src = io.open(os.path.join(HERE, "pcs_auto_control_production.py"),
                        encoding="utf-8").read()
+    # ⚠️ `pcs_schedule_enabled` 已不適合當判準 —— 它是 ESS 讀值欄位名，
+    #    本模組的註解會合理提到它（說明未登入時該欄位為 None）。
+    #    改為只看真正的報告 session lifecycle 函式名稱。
     check("★★ R1. 未觸碰任何報告 session lifecycle 函式",
           not any(k in _prd_src for k in ("start_session", "should_auto_end",
                                           "find_active_session",
-                                          "pcs_schedule_enabled")))
+                                          "auto_schedule_check",
+                                          "_report_finalize")))
     check("★★ R1. 只用到 read_all（唯讀取樣），不使用報告產出路徑",
           "read_all" in _prd_src)
 

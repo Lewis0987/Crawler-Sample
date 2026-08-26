@@ -210,8 +210,8 @@ Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 
 | 6.4 | Safety Gate（安全條件檢查） | COMPLETE |
 | 6.5 | PCS Control Integration（PCS 自動充放電控制） | **READY / Go-Live BLOCKED** |
 | 6.5-H | Control Authority / Command Arbitration（控制權判定） | IMPLEMENTED / OFFLINE VERIFIED |
-| 6.6 | Auto Report Integration（自動報告整合） | PENDING |
-| 6.7 | Field Validation（實機驗證） | PENDING |
+| 6.6 | Auto Report Integration（自動報告整合） | **COMPLETE / OFFLINE VERIFIED**（R1 已接線，預設關閉） |
+| 6.7 | Field Validation（實機驗證） | **OBSERVE_ONLY FIELD VALIDATED**（實機 command = 0） |
 | 6.8 | Regression & Closure（完整回歸與結案） | PENDING |
 
 **Phase 6.5 Go-Live Blockers / Check Items**
@@ -789,6 +789,62 @@ authority_power_tolerance_kw ← fresh observation ← authority_ttl_sec
 🔴 **`dispatch_ready` 與 `dispatch_enabled` 完全分離**：
    即使七項全部補齊使 `dispatch_ready=True`，`dispatch_enabled` 仍為 False、
    executor / verifier 仍不建立 —— 開啟派工必須是另一次明確授權。
+
+**Phase 6.6 已完成（Auto Report Integration / R1，離線）**
+
+**問題**：既有自動報告的建立條件是「智慧模式 ＋ 排程主開關 ON」，
+而 Phase 6 自動控制的前提**恰好相反**（排程 ON 時 Control Authority 一律判為
+EXTERNAL，Phase 6 不介入）。兩者互斥 → Phase 6 在控時報告永遠不會開始。
+
+**R1 —— Direction-driven Auto Report Trigger**：報告改由**實際控制方向與擁有權**
+驅動，取代「排程開關」這一個條件。其餘守門**一項都沒有放寬** ——
+方向、已有 session、PCS 故障、pending 狀態、cooldown、start debounce、
+Owner 檢查、主開關全部原封不動。
+
+🔴 **未建立第二套報告系統**：完全沿用既有 session / resume / finalize /
+   ownership / Named Mutex / observer 機制，report engine 一行未重寫。
+   收尾本來就是**方向無關**的（idle debounce），因此 STOP → finalize 不需任何修改。
+
+🔴 **唯一整合點是一座橋**：報告層**不** import 任何 Phase 6 模組（只多一個注入式
+   hook，預設 `None`）；Phase 6 wiring 層**不** import 任何報告模組。
+   兩邊只在 `phase6_report_bridge` 相遇，要拆除只需一行 `uninstall()`。
+
+🔴 **控制與報告解耦**：橋接只**單向**餵唯讀狀態，不呼叫任何控制函式、
+   不碰任何 Mutex（AST 驗證）。報告層拿不到任何可以改變控制的把手；
+   提供者拋例外時報告層安全退回既有條件，控制側完全不受影響。
+
+🔴 **擁有權判準**：Authority == `OWNED_BY_PHASE6` —— 代表 durable LastControl
+   存在、信任度足夠、狀態相符、TTL 內、且已完成指令後的功率佐證。
+   只有 LastControl 存在不算；只有設備在運轉更不算。
+   Phase 6 宣稱的方向與設備實際方向不符 → **Fail Closed，不建立報告**。
+
+⚠️ **OBSERVE_ONLY 期間橋接恆回 None** —— Phase 6 不會產生任何 verified
+   direction，因此既有報告行為**完全不受影響**。這是目前的實際狀態。
+
+**Phase 6.7 已完成（Production Field Validation — OBSERVE_ONLY）**
+
+以**正式 production stack**（真實電表、真實 ESS、正式 Tariff／年度日曆／
+Decision／Safety／Authority／Interlock 設定）在現場資料上連續觀察，
+全程**未送出任何 PCS 指令**。
+
+🔴 **實機驗證發現一個 production wiring 缺口並已修正**：
+   `build_api_client()` 原本回傳**未登入**的 client。
+   `getRunMode` / `getScheduleSwitch` / `getDOAndDIMsg` 需要認證，未登入回 **401**
+   → 排程／手動開關讀不到 → ESS 觀測 `PCS_MODE_UNAVAILABLE`
+   → **整條鏈永遠 Fail Closed**。行為本身安全，但 orchestrator 等於空轉，
+   在真機上跑之前看不出來。已改為預設登入（登入只取讀取權限，不送任何控制），
+   並補上 regression。⚠️ 登入失敗**不拋例外、不重試** —— 交由上層 Fail Closed。
+
+修正後現場觀測正常：排程開關 / 手動開關可讀、時段判定有效、Control Authority
+可判為 IDLE、決策鏈可完整走完並停在 **NO DISPATCH**。
+
+⚠️ 觀察期間現場自然狀態為 SOC 極低且時段為尖峰，因此**未自然出現**
+   CHARGE / DISCHARGE candidate —— 如實記為 **NOT OBSERVED**，
+   未以人工改動電表或控制設備的方式製造情境。
+
+Fail Closed 情境（電表陳舊／無效、時段 UNKNOWN、ESS 陳舊、通訊失敗、
+Safety BLOCK、Authority UNKNOWN、OWNERSHIP_PENDING、EXTERNAL_CONTROL、
+Interlock BLOCK）一律沿用既有離線 regression 驗證，**不以破壞現場設備的方式取得**。
 
 控制服務的例外處理原則與報告服務**相反**且不得照抄：報告監看遇到例外必須續行
 （監看不得停擺），控制 runtime 遇到未知例外一律 **Fail Closed**，不再產生任何指令。
