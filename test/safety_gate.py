@@ -70,6 +70,19 @@ BATT_OFF = "已下電"
 _ALARM_ACTIVE_VALUES = (True, 1, "1", "true", "True")
 _ALARM_RECOVERED_VALUES = (False, 0, "0", "false", "False")
 
+# 告警端點（與 charge_discharge_report.EP_ALARM 相同字串；本模組不呼叫它，只用於比對 _fail）
+EP_ALARM_PATH = "/hmiGuest/unauthorizedAccess/alarm/list"
+
+# alarm_source_complete 的判定原因
+A_OK = "ALARM_SOURCE_COMPLETE"
+A_INVALID_READING = "READING_UNAVAILABLE"
+A_FAIL_LIST_UNAVAILABLE = "FAIL_LIST_UNAVAILABLE"
+A_ENDPOINT_FAILED = "ALARM_ENDPOINT_FAILED"
+A_ROWS_UNAVAILABLE = "ALARM_ROWS_UNAVAILABLE"
+A_TOTAL_UNAVAILABLE = "ALARM_TOTAL_UNAVAILABLE"
+A_TOTAL_NOT_FROM_SOURCE = "ALARM_TOTAL_NOT_FROM_SOURCE"
+A_ROWS_TRUNCATED = "ALARM_ROWS_TRUNCATED"
+
 # ======================================================================
 # Reason 字彙
 # ======================================================================
@@ -169,6 +182,95 @@ STOP_CHECKS = (C_REQUEST, C_ESS_PRESENT, C_ESS_COMM)
 def _is_number(v):
     """bool 是 int 的子類，必須排除。"""
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+# ======================================================================
+# alarm_source_complete 判定（純函式；供呼叫端算出後注入 SafetyRequest）
+# ======================================================================
+@dataclass(frozen=True)
+class AlarmSourceStatus:
+    complete: bool
+    reason: str
+    detail: str = ""
+    total: int = None
+    fetched: int = None
+
+    def as_dict(self):
+        return asdict(self)
+
+    def __str__(self):
+        return (f"[ALARM_SRC] {'COMPLETE' if self.complete else 'INCOMPLETE':<10} "
+                f"reason={self.reason} fetched={self.fetched}/{self.total}")
+
+
+def alarm_source_complete_from_reading(reading, alarm_endpoint=EP_ALARM_PATH):
+    """
+    由 charge_discharge_report.read_all() 的 reading 判定告警來源是否完整。
+
+    ⚠️ **本函式不呼叫任何 API**，只解讀既有 reading。Safety Gate 本身也不呼叫它 ——
+       呼叫端算好後以 `SafetyRequest.alarm_source_complete` 注入。
+
+    判定（三者皆成立才算 complete）
+        1. alarm 端點不在 reading["_fail"]
+        2. **alarm_total_raw** 存在且為非負整數（＝後端確實提供了 total）
+        3. len(alarm_rows) == alarm_total_raw      （偵測 pageSize 截斷）
+
+    語意對照
+        A. 端點成功 + total=0 + rows=0        → complete=True（真的沒有告警）
+        B. 端點出現在 _fail                    → complete=False
+        C. len(rows) < total                   → complete=False（partial / 分頁未取完）
+        D. 後端未回 total、rows=18             → complete=False（**不得因 len(rows)=18 自稱完整**）
+        E. rows=[] 但端點在 _fail              → complete=False（**不得誤判成「沒有告警」**）
+
+    🔴 為何不能用 communication_ok 代替
+       read_all 的 communication_ok 只看 mainControlCollectsInformation 與 pcs 兩支
+       （`if main is None or pcs_data is None`），**告警端點失敗時它仍為 True**，
+       而此時 alarm_rows=[] 且 alarm_total=0 —— 與「真的沒有告警」完全無法區分。
+       唯一能分辨的是 _fail。
+
+    🔴 為何用 alarm_total_raw 而非 alarm_total
+       read_all 在後端未回 `total` 時會以 `len(rows)` 代入
+       （`r["alarm_total"] = total if total is not None else len(rows)`）。
+       若拿 alarm_total 去比對 len(rows)，等於自己跟自己比、恆成立 ——
+       「後端真的回 total=18」與「後端沒回、read_all 自己補 18」將無法區分。
+       故 read_all 另存 `alarm_total_raw`（後端實際提供值，未提供為 None），
+       本函式一律以它為準；缺少該欄位或其為 None 一律 fail closed。
+       （`alarm_total` 的原行為刻意保留不變，維持 Phase 1~5 相容。）
+    """
+    if not isinstance(reading, dict):
+        return AlarmSourceStatus(False, A_INVALID_READING,
+                                 f"reading 型別為 {type(reading).__name__}")
+    fails = reading.get("_fail")
+    if not isinstance(fails, (list, tuple)):
+        return AlarmSourceStatus(False, A_FAIL_LIST_UNAVAILABLE,
+                                 "reading 缺少 _fail，無法證明告警端點成功")
+    hit = [f for f in fails if isinstance(f, str) and f.startswith(alarm_endpoint)]
+    if hit:
+        return AlarmSourceStatus(False, A_ENDPOINT_FAILED, f"_fail 命中：{hit}")
+
+    rows = reading.get("alarm_rows")
+    if not isinstance(rows, (list, tuple)):
+        return AlarmSourceStatus(False, A_ROWS_UNAVAILABLE,
+                                 f"alarm_rows 型別為 {type(rows).__name__}")
+    # ⚠️ 一律使用 alarm_total_raw（後端**實際提供**的 total），**不得**使用 alarm_total ——
+    #    後者在後端未回 total 時會以 len(rows) 補值，拿它比對等於自己跟自己比，恆成立。
+    if "alarm_total_raw" not in reading:
+        return AlarmSourceStatus(False, A_TOTAL_NOT_FROM_SOURCE,
+                                 "reading 缺少 alarm_total_raw，無法證明 total 由後端提供",
+                                 None, len(rows))
+    raw_total = reading["alarm_total_raw"]
+    if raw_total is None:
+        return AlarmSourceStatus(False, A_TOTAL_NOT_FROM_SOURCE,
+                                 "後端未提供 total（alarm_total 為 len(rows) 補值，不得據以宣稱完整）",
+                                 None, len(rows))
+    if not isinstance(raw_total, int) or isinstance(raw_total, bool) or raw_total < 0:
+        return AlarmSourceStatus(False, A_TOTAL_UNAVAILABLE,
+                                 f"alarm_total_raw 不是非負整數：{raw_total!r}", None, len(rows))
+    if len(rows) != raw_total:
+        return AlarmSourceStatus(False, A_ROWS_TRUNCATED,
+                                 f"取回 {len(rows)} 筆但後端 total={raw_total}（分頁未取完）",
+                                 raw_total, len(rows))
+    return AlarmSourceStatus(True, A_OK, f"{len(rows)}/{raw_total} 筆完整", raw_total, len(rows))
 
 
 # ======================================================================

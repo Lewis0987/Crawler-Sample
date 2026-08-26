@@ -169,6 +169,87 @@ def main():
           run(req(alarm_rows=tuple({"level": 3, "alarmStatus": True} for _ in range(100)),
                   alarm_source_complete=True)).allowed)
 
+    # ---- alarm_source_complete 判定（Phase 6.5-G 核可基準）----
+    print("\nE2. alarm_source_complete_from_reading（由 read_all reading 判定）")
+    EP = SG.EP_ALARM_PATH
+
+    def rd(**over):
+        """模擬 read_all() 的 reading；alarm_total_raw = 後端實際提供的 total。"""
+        r = {"_fail": [], "alarm_rows": [], "alarm_total": 0, "alarm_total_raw": 0}
+        r.update(over)
+        return r
+
+    s = SG.alarm_source_complete_from_reading(rd())
+    check("★ Case B'. 端點成功 + total=0 + rows=0 → complete=True（真的沒有告警）",
+          s.complete and s.reason == SG.A_OK)
+    rows3 = [{"level": 1, "alarmStatus": True} for _ in range(3)]
+    s = SG.alarm_source_complete_from_reading(
+        rd(alarm_rows=rows3, alarm_total=3, alarm_total_raw=3))
+    check("  Case A. 正常有告警（後端 total=3、rows=3）→ complete=True",
+          s.complete and s.total == 3 and s.fetched == 3)
+    for f, label in ((EP, "取回 None"),
+                     (EP + ":Timeout", "例外"),
+                     (EP + ":_error500", "application error")):
+        s = SG.alarm_source_complete_from_reading(rd(_fail=[f]))
+        check(f"★ Case B. 端點在 _fail（{label}）→ complete=False / ALARM_ENDPOINT_FAILED",
+              (not s.complete) and s.reason == SG.A_ENDPOINT_FAILED)
+    s = SG.alarm_source_complete_from_reading(
+        rd(alarm_rows=rows3, alarm_total=18, alarm_total_raw=18))
+    check("★ Case C. len(rows)=3 < 後端 total=18 → complete=False / ALARM_ROWS_TRUNCATED",
+          (not s.complete) and s.reason == SG.A_ROWS_TRUNCATED and s.total == 18)
+
+    # ---- Case D：後端未回 total，read_all 以 len(rows) 補值 ----
+    rows18 = [{"level": 1, "alarmStatus": True} for _ in range(18)]
+    s = SG.alarm_source_complete_from_reading(
+        rd(alarm_rows=rows18, alarm_total=18, alarm_total_raw=None))
+    check("★★ Case D. 後端未回 total、rows=18（alarm_total 被補成 18）"
+          " → complete=False / ALARM_TOTAL_NOT_FROM_SOURCE",
+          (not s.complete) and s.reason == SG.A_TOTAL_NOT_FROM_SOURCE)
+    check("  Case D 不得因 len(rows)==alarm_total 就宣稱完整",
+          not SG.alarm_source_complete_from_reading(
+              rd(alarm_rows=rows18, alarm_total=18, alarm_total_raw=None)).complete)
+    _no_raw = {"_fail": [], "alarm_rows": rows18, "alarm_total": 18}
+    s = SG.alarm_source_complete_from_reading(_no_raw)
+    check("  reading 完全缺 alarm_total_raw（舊格式）→ 同樣 fail closed",
+          (not s.complete) and s.reason == SG.A_TOTAL_NOT_FROM_SOURCE)
+    check("★ 判定只採 alarm_total_raw：alarm_total 亂填也不影響",
+          SG.alarm_source_complete_from_reading(
+              rd(alarm_rows=rows3, alarm_total=999, alarm_total_raw=3)).complete)
+    s = SG.alarm_source_complete_from_reading(rd(_fail=[EP]))
+    check("★ Case E. rows=[] 但端點在 _fail → complete=False（不得誤判成沒有告警）",
+          (not s.complete) and s.reason == SG.A_ENDPOINT_FAILED)
+    s = SG.alarm_source_complete_from_reading(
+        {"communication_ok": True, "_fail": [EP], "alarm_rows": [], "alarm_total": 0})
+    check("★ communication_ok=True 也不能代表 complete（告警端點仍可能失敗）",
+          not s.complete)
+    check("其他端點失敗不影響告警完整性",
+          SG.alarm_source_complete_from_reading(
+              rd(_fail=["/can/v1/getDOAndDIMsg:Timeout"])).complete)
+    for bad, want, label in (
+            (None, SG.A_INVALID_READING, "reading=None"),
+            ("x", SG.A_INVALID_READING, "reading 非 dict")):
+        s = SG.alarm_source_complete_from_reading(bad)
+        check(f"{label} → {want}", (not s.complete) and s.reason == want)
+    s = SG.alarm_source_complete_from_reading({"alarm_rows": [], "alarm_total": 0})
+    check("缺 _fail → complete=False（無法證明端點成功）",
+          (not s.complete) and s.reason == SG.A_FAIL_LIST_UNAVAILABLE)
+    s = SG.alarm_source_complete_from_reading(rd(alarm_rows="oops"))
+    check("alarm_rows 非 list → ALARM_ROWS_UNAVAILABLE", s.reason == SG.A_ROWS_UNAVAILABLE)
+    for t, want in ((None, SG.A_TOTAL_NOT_FROM_SOURCE), (-1, SG.A_TOTAL_UNAVAILABLE),
+                    ("3", SG.A_TOTAL_UNAVAILABLE), (True, SG.A_TOTAL_UNAVAILABLE)):
+        s = SG.alarm_source_complete_from_reading(rd(alarm_total_raw=t))
+        check(f"alarm_total_raw={t!r} → {want}", s.reason == want)
+
+    # 端到端：判定結果直接注入 Gate
+    good = SG.alarm_source_complete_from_reading(
+        rd(alarm_rows=rows3, alarm_total=3, alarm_total_raw=3))
+    bad_src = SG.alarm_source_complete_from_reading(rd(_fail=[EP]))
+    check("★ 端到端：complete=True + 無 level0 → Gate 放行",
+          run(req(alarm_rows=tuple(rows3), alarm_source_complete=good.complete)).allowed)
+    check("★ 端到端：端點失敗 → Gate 擋下 ALARM_SOURCE_UNAVAILABLE",
+          run(req(alarm_rows=(), alarm_source_complete=bad_src.complete)).reason
+          == SG.R_ALARM_SOURCE_UNAVAILABLE)
+
     # ---------------- F. 控制模式 ----------------
     print("\nF. 控制模式（依 read-back，不採信『上次控制成功』）")
     check("手動模式（0/1）→ 放行",

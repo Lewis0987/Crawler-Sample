@@ -575,6 +575,12 @@ def read_all(client):
         total = alarm.get("total")
     r["alarm_rows"] = rows if isinstance(rows, list) else []
     r["alarm_total"] = total if total is not None else len(r["alarm_rows"])
+    # ⚠️ alarm_total 在後端未回 total 時會以 len(rows) 補值 —— 該補值**不可**用來判斷
+    #    「告警清單是否完整」，否則「後端真的回 total=N」與「後端沒回、我們自己補 N」
+    #    會變得無法區分。alarm_total_raw 保留後端**實際提供**的值（未提供即 None），
+    #    供 Phase 6 Safety Gate 的 alarm_source_complete 判定使用。
+    #    alarm_total 的原行為刻意不變，維持 Phase 1~5 相容。
+    r["alarm_total_raw"] = total
 
     # 通訊判定：關鍵來源（電池主資訊 + PCS 有功）任一失敗 → 通訊異常
     if main is None or pcs_data is None:
