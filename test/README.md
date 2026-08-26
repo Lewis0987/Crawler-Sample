@@ -208,11 +208,11 @@ Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 
 | 6.3-A | Decision Engine Framework（決策骨架） | COMPLETE |
 | 6.3-B | Decision Policy（充放電策略規則） | COMPLETE |
 | 6.4 | Safety Gate（安全條件檢查） | COMPLETE |
-| 6.5 | PCS Control Integration（PCS 自動充放電控制） | **READY / Go-Live BLOCKED** |
+| 6.5 | PCS Control Integration（PCS 自動充放電控制） | **COMPLETE / LIVE AUTHORIZATION PENDING** |
 | 6.5-H | Control Authority / Command Arbitration（控制權判定） | IMPLEMENTED / OFFLINE VERIFIED |
-| 6.6 | Auto Report Integration（自動報告整合） | **COMPLETE / OFFLINE VERIFIED**（R1 已接線，預設關閉） |
-| 6.7 | Field Validation（實機驗證） | **OBSERVE_ONLY FIELD VALIDATED**（實機 command = 0） |
-| 6.8 | Regression & Closure（完整回歸與結案） | PENDING |
+| 6.6 | Auto Report Integration（自動報告整合） | **COMPLETE / OFFLINE VERIFIED** |
+| 6.7 | Field Validation（實機驗證） | **COMPLETE / OBSERVE_ONLY FIELD VALIDATED** |
+| 6.8 | Regression & Closure（完整回歸與結案） | **COMPLETE / TECHNICALLY READY FOR EXPLICIT LIVE AUTHORIZATION** |
 
 **Phase 6.5 Go-Live Blockers / Check Items**
 
@@ -845,6 +845,63 @@ Decision／Safety／Authority／Interlock 設定）在現場資料上連續觀�
 Fail Closed 情境（電表陳舊／無效、時段 UNKNOWN、ESS 陳舊、通訊失敗、
 Safety BLOCK、Authority UNKNOWN、OWNERSHIP_PENDING、EXTERNAL_CONTROL、
 Interlock BLOCK）一律沿用既有離線 regression 驗證，**不以破壞現場設備的方式取得**。
+
+**Phase 6 技術面結案 —— 剩餘為部署授權閘門，非技術缺口**
+
+```
+Technical Blockers : NONE
+Operational Gate   : LIVE_AUTHORIZATION_REQUIRED
+Production Go-Live : NOT ENABLED
+```
+
+`LIVE_AUTHORIZATION_REQUIRED` **不是** technical blocker，而是**部署授權閘門**：
+功能、參數、整合、現場驗證皆已完成，唯一未做的是「有人明確決定要讓它真的動」。
+
+Non-blocking：Blocker 10（同向目標功率變更語意）、Layer 2 DEFERRED、
+`test_pcs_modes` 既有 regression debt、CHARGE/DISCHARGE candidate 自然現場觀測
+NOT OBSERVED。
+
+**Phase 6.8 已完成（Regression & Closure）**
+
+把散落在各階段的關鍵不變量收斂成**單一結案閘門**（21 條，A~U）。
+本階段**未新增任何功能**。
+
+最終閘門的核心命題：
+
+> **所有必要參數皆已就緒，但結構上仍不可能送出任何指令。**
+
+```
+dispatch_ready   = True      ← 9 項必要參數全部就緒
+dispatch_enabled = False     ← 未啟用
+mode             = OBSERVE_ONLY
+executor         = None      ← 不建立，非「有出口但被擋住」
+verifier         = None
+can_dispatch     = False
+```
+
+三者互相獨立且同時成立 —— 參數齊備**不等於**允許派工。
+非 OBSERVE_ONLY 的模式（DISPATCH / LIVE / ACTIVE）一律拒絕建立出口。
+
+**功率雙層防線**：Safety Gate 於 150.0 kW 放行、150.1 kW 起 BLOCK（充放電雙向）；
+operator 在送出前另有獨立的 0~150 kW 範圍檢查，兩層皆不可繞過。
+Production 操作功率仍為 **±5 kW**，遠低於上限。
+
+**Fail Closed 全覆蓋**：時段 UNKNOWN、電表無資料／`demand_state=fault`、
+ESS 通訊失敗／陳舊、Authority 非 IDLE/OWNED、EXTERNAL_CONTROL —— 一律未授權、0 calls。
+`OWNERSHIP_PENDING` 為獨立 runtime 狀態，不在派工集合內。
+
+**責任分離**：報告層不 import 任何控制模組、不含任何控制指令字串；
+控制層不 import 任何報告監看模組；橋接未建立第二套 report engine，
+既有 session 入口仍是唯一的一個，收尾仍由既有單一決策點負責。
+未安裝橋接時 scheduler 舊路徑**完全不退化**。
+
+**相依性稽核**：16 個 production path 模組**全部**不相依量測工具；
+5 個時段／日曆模組**全部**無網路相依；年度資料為靜態已驗收資料，
+不掃描目錄、未涵蓋年度不 fallback。
+
+🔴 **Phase 6.8 全數通過 ≠ Go-Live**。目前狀態為
+**TECHNICALLY READY FOR EXPLICIT LIVE AUTHORIZATION** ——
+`dispatch_enabled` 的切換必須是另一次獨立、明確的裁示。
 
 控制服務的例外處理原則與報告服務**相反**且不得照抄：報告監看遇到例外必須續行
 （監看不得停擺），控制 runtime 遇到未知例外一律 **Fail Closed**，不再產生任何指令。
