@@ -213,6 +213,8 @@ Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 
 | 6.6 | Auto Report Integration（自動報告整合） | **COMPLETE / OFFLINE VERIFIED** |
 | 6.7 | Field Validation（實機驗證） | **COMPLETE / OBSERVE_ONLY FIELD VALIDATED** |
 | 6.8 | Regression & Closure（完整回歸與結案） | **COMPLETE / TECHNICALLY READY FOR EXPLICIT LIVE AUTHORIZATION** |
+| 6.9 | Controlled LIVE Enablement（受控單次上線） | **OFFLINE COMPLETE / FIRST LIVE ATTEMPTED-BLOCKED** |
+| 6.9-A | CLI Entry Wiring（上線入口接線） | **OFFLINE IMPLEMENTED / VERIFIED**（入口已接通，尚未執行任何實機 LIVE） |
 
 **Phase 6.5 Go-Live Blockers / Check Items**
 
@@ -846,16 +848,188 @@ Fail Closed 情境（電表陳舊／無效、時段 UNKNOWN、ESS 陳舊、通�
 Safety BLOCK、Authority UNKNOWN、OWNERSHIP_PENDING、EXTERNAL_CONTROL、
 Interlock BLOCK）一律沿用既有離線 regression 驗證，**不以破壞現場設備的方式取得**。
 
-**Phase 6 技術面結案 —— 剩餘為部署授權閘門，非技術缺口**
+**Phase 6.9 / 6.9-A Controlled Single-Leg LIVE（OFFLINE COMPLETE / FIRST LIVE ATTEMPTED-BLOCKED）**
+
+第一次上線**不採**永久旗標，也**不直接進入無人值守自動排程**。
 
 ```
-Technical Blockers : NONE
-Operational Gate   : LIVE_AUTHORIZATION_REQUIRED
-Production Go-Live : NOT ENABLED
+啟用方式：CLI  --live-leg charge|discharge  --confirm
+不採：config flag／環境變數／自動恢復 LIVE
 ```
 
-`LIVE_AUTHORIZATION_REQUIRED` **不是** technical blocker，而是**部署授權閘門**：
-功能、參數、整合、現場驗證皆已完成，唯一未做的是「有人明確決定要讓它真的動」。
+🔴 **`--live-leg` 不代表立即動作** —— 它只代表「本 process 最多允許執行一次
+   該方向的 leg」。真正 dispatch 仍須同時滿足 Decision／Safety／Authority／
+   Interlock／fresh precheck／一次性控制授權／leg 授權，**缺一不可**。
+
+🔴 **授權不落盤**：隨 process 生命週期存在。服務重啟即消失，預設回 OBSERVE_ONLY。
+
+🔴 **人工確認不是 YES** —— 必須輸入完整語句（例：`CONFIRM CHARGE 5KW`）。
+   `--confirm` 本身只表示「願意進入確認流程」；輸入錯誤即中止，不建立任何出口。
+
+🔴 **出口建立時機**：CLI → 人工確認 → **fresh precheck（16 項，確認後重新取得）**
+   → leg 授權有效 → 才建立 executor / verifier。任一前置失敗即維持 None。
+
+🔴 **leg 授權下推到 executor 層** —— 送出前的最後一道閘。
+   若只在執行鏈跑完後才比對方向，指令**已經送出去了**；因此方向不符時
+   operator 完全不會被呼叫。
+
+🔴 **已 dispatch 後失去擁有權 → 不自動 STOP**。對 ownership 不確定的設備送 STOP
+   本身也是新的控制行為，可能中斷外部操作者。一律 `ABORTED_UNCERTAIN_OWNERSHIP`
+   → 禁止任何新指令 → STOP AND REPORT，交由人工處置。
+   只有 Authority 明確為 `OWNED_BY_PHASE6` 且 Safety 放行，才由本 leg 正常收尾。
+
+🔴 **LIVE 功率只能來自正式 ProductionConfig**（±5 kW）。
+   CLI **沒有** `--power`，授權物件也不接受任何 power 參數；
+   150 kW 仍只是 Safety Gate 上限，**不可能**成為操作目標。
+
+leg 完成後自動：授權 consumed → executor/verifier 銷毀 → 回 OBSERVE_ONLY。
+
+**6.9-A：CLI 入口接線（順序本身就是安全性質）**
+
+```
+啟動 service → 解析 --live-leg → 檢查 --confirm
+   → 人工確認（完整語句）
+   → fresh read（確認前的快照一律作廢）
+   → 自然 Decision 必須自己形成該方向
+   → fresh precheck／Safety／Authority／Interlock 全數通過
+   → 才核發 LiveLegAuthorization
+   → 才建立 executor / verifier
+   → 才進 ControlledLiveLeg
+```
+
+🔴 **`--live-leg` 是 permission，不是 decision override**。
+   自然 Decision 不是該方向（含 IDLE、反向、no_action、None）一律 NO DISPATCH。
+
+🔴 **確認之前取得的任何觀測，一律不得作為 dispatch 依據**。
+   確認失敗時連 fresh read 都不會發生。
+
+🔴 **確認階段不持有授權** —— 以「意向」物件供顯示，其 armed 恆為 False，
+   即使被誤傳進出口建構函式也只會得到 None（Fail Closed）。
+
+🔴 **process 級 one-shot**：本 process 一旦核發過 leg 授權即不再核發第二次
+   （不論同向、反向、前次成功與否）。one-shot 不只靠 process 邊界成立。
+
+🔴 **LIVE 分支不進入常駐迴圈**：一個 leg 結束就結束 process，
+   因此不存在「服務持續處於 LIVE」這種狀態，重啟自然回 OBSERVE_ONLY。
+
+🔴 **模組層永不 import operator**。控制出口只在 LIVE 路徑被明確呼叫時，
+   由單一函式延後取得；該延後 import 被回歸釘死在那一個函式內。
+
+⚠️ 本階段**僅完成離線實作與回歸**，尚未執行任何實機 LIVE。
+
+**Phase 6 技術面結案 —— 剩餘為控制權衝突，非技術缺口**
+
+```
+Phase 6.9                      OFFLINE COMPLETE / FIRST LIVE ATTEMPTED-BLOCKED
+FIRST LIVE                     NOT EXECUTED
+FIRST LIVE Safety Behavior     PASS
+Control Authority Detection    FIELD VERIFIED
+External Controller Existence  FIELD VERIFIED
+External Automation Type       SEPARATE OFF-PEAK CONTROL PROGRAM / USER CONFIRMED
+PCS OEM Built-in Automation    NOT THE SOURCE FOR THIS EVENT
+External Program Location      RESOLVED
+External Program Identity      RESOLVED
+Observed Behavior              POWER-ON → 約 20 s → CHARGE
+Manual-control API Match       CONSISTENT_WITH_MANUAL_CONTROL_API
+                               / NOT SERVER-LOG CONFIRMED
+Technical Blockers             NONE
+Operational Blocker            KNOWN COMPETING EXTERNAL CONTROLLER
+                               / PAUSE NOT YET AUTHORIZED
+FIRST LIVE RETRY               HOLD
+Production Go-Live             BLOCKED BY OWNERSHIP CONFLICT
+```
+
+**FIRST LIVE 現場實測（2026-09-01）**
+
+第一次受控上線於絕對觀測窗口 00:00:00~00:10:00 執行。四項自然條件**首度全部成立**：
+
+```
+00:00:03 ~ 00:00:48   Authority = IDLE   PCS = STOPPED
+                      TOU = OFF_PEAK     Natural Decision = CHARGE
+                      通訊健康（endpoint 失敗 0，取樣遠低於既有新鮮度契約）
+```
+
+隨後設備被 Phase 6 以外的來源接管：
+
+```
+約 00:00:55   PCS 由 STOPPED 被啟動至 STANDBY
+約 00:01:16   PCS 進入 CHARGING
+              Authority → EXTERNAL_OR_UNKNOWN
+```
+
+同一時間**併網點 import 增加約 80 kW**，與既有的 external charging event 高度一致。
+⚠️ 這是併網點量測，**不等於**「外部 command = 80 kW」。
+
+Phase 6 的 ownership observation 即時偵測到外部控制 → **ABORT → NO DISPATCH**：
+
+```
+本次 Phase 6 實機 command：CHARGE = 0 / DISCHARGE = 0 / STOP = 0
+```
+
+🔴 **這是 Fail Closed 正確動作，不是 Phase 6 技術失敗。**
+擁有權偵測依 PCS 旗標而非 AC 功率，因此在 AC 暫存器落後更新之前就已判定。
+
+Field evidence（**MUST_KEEP**，Phase 6 驗收完成前不得刪除）：
+
+```
+output\phase6_live_charge\first_live_20260831_235901.log
+output\phase6_live_charge\first_live_20260831_235901.json
+```
+
+**External Controller 已定位（2026-09-01，READ-ONLY source inspection）**
+
+```
+EXTERNAL_PROGRAM_HOST    192.168.70.201（Ubuntu 22.04.5 LTS，user etica）
+EXTERNAL_PROGRAM_NAME    /home/etica/ems/auto_control.py
+RUNTIME                  screen 1128.auto → /bin/bash → python3 auto_control.py
+SCREEN_1128_AUTO         CONFIRMED
+AUTO_CONTROL_PY          CONTROLLER CONFIRMED
+BESS_REQUEST_PY          PCS/HMI API CLIENT CONFIRMED
+CONTROL_TRIGGER          OFF-PEAK + METER + SOC + DEMAND
+PAUSE_METHOD             built-in "stop"  / CONFIRMED / NOT YET EXECUTED
+                                          / NOT YET AUTHORIZED
+RESTORE_METHOD           built-in "start" / CONFIRMED / NOT YET EXECUTED
+PAUSE_VERIFICATION       DEFINED
+RESTORE_VERIFICATION     DEFINED
+```
+
+🔴 該 controller 的 `stop` **不等於** PCS 的 STOP 指令 —— 它停的是 automation loop
+並把 active power command 收斂到 0，PCS 可能停在 STANDBY 而非 STOPPED。
+Phase 6 本來就接受兩者皆為 legal idle（precheck `pcs_idle`、Layer 1
+`DIRECTION_ISOLATED_STATES`），因此**不需要為此修改任何 production 邏輯**。
+
+⚠️ 交叉驗證：該 controller 採 `negative setpoint = CHARGE` / `positive = DISCHARGE`，
+與本專案記載的第三種 kW 語意（PCS Command）**完全一致**；其 `MIN_SOC=2 / MAX_SOC=98`
+亦與現場觀測到的 SOC 擺盪邊界吻合。兩者為獨立來源的相互佐證。
+
+**下一步不是重新排一次 FIRST LIVE。**
+
+外部控制程式若未先暫停，重排只會再次得到相同的 ABORT。順序為：
+使用者明確核准 temporary pause → fresh read-only precheck → built-in `stop`
+→ PAUSE_VERIFICATION → ownership observation → fresh Phase 6 precheck
+→ FIRST LIVE retry → 完成後 built-in `start` → RESTORE_VERIFICATION。
+
+`PAUSE_VERIFICATION` 最關鍵 —— 暫停後須持續觀測，確認 PCS 維持 legal idle、
+功率收斂至約 0、Authority 維持 IDLE、無外部 LastControl、PCS 不自行 Power-On
+或充放電、通訊健康、fault/alarm clean。
+
+**充電時間窗（HISTORICAL OBSERVATION ONLY）**
+
+2026-09-01 夜間實測：外部 controller 以約 80 kW 充電，SOC 由 2% 上升至 85%
+約耗時 2 小時 40 分（約 5% / 10 分鐘）。因此**當日**可用的 FIRST LIVE charge
+window 約為離峰開始後的前 2.5 小時。
+
+🔴 **THIS IS HISTORICAL OBSERVATION ONLY.**
+`00:00 ~ 02:40` **不是** production hard-coded window，也**不是** Safety Gate
+或 production rule。FIRST LIVE 的真正判斷條件一律使用 **fresh SOC**：
+
+```
+SOC <= 85%  → charge latch 可成立
+SOC >  85%  → natural decision 不應強制 CHARGE
+```
+
+選擇離峰開始後 00:00~00:30 只是**較佳的 operational window**（SOC 最低、餘裕最大），
+不得寫入任何判定邏輯。
 
 Non-blocking：Blocker 10（同向目標功率變更語意）、Layer 2 DEFERRED、
 `test_pcs_modes` 既有 regression debt、CHARGE/DISCHARGE candidate 自然現場觀測

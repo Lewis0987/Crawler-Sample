@@ -509,14 +509,40 @@ def main():
     # ---------------- K. 零 operator / 零 executor ----------------
     print("\nK. 零實機出口（AST + sys.modules 雙重驗證）")
     # 三個模組一律不得具備控制/網路能力（模組層 + 函式內延後 import）
+    # 🔴 Phase 6.9-A 起，service 有**唯一一個**經裁示核准的例外：
+    #    `build_live_operator_run()` 內的延後 import —— 它是 `--live-leg`
+    #    受控單次上線的控制出口來源。不變量因此改寫為「更精確」而非「更寬鬆」：
+    #      ① 模組層仍完全不得 import（維持原樣）
+    #      ② 函式內延後 import 只允許 device_control_operator，
+    #         且**只能出現在 build_live_operator_run 這一個函式**
+    #      ③ 匯入模組的當下行程內仍不得存在 operator（下方 sys.modules 斷言，維持原樣）
+    SANCTIONED_DEFERRED = {SVC: ("build_live_operator_run",
+                                 {"device_control_operator"})}
     for mod in (RT, SVC, CFG):
         base = os.path.basename(mod.__file__)
-        hit_top = _top_imports(_tree(mod)) & FORBIDDEN_CAPABILITY
-        hit_all = _all_imports(_tree(mod)) & FORBIDDEN_CAPABILITY
+        tree = _tree(mod)
+        fn_name, allowed = SANCTIONED_DEFERRED.get(mod, (None, set()))
+        hit_top = _top_imports(tree) & FORBIDDEN_CAPABILITY
+        hit_all = (_all_imports(tree) & FORBIDDEN_CAPABILITY) - allowed
         check(f"★★ K. {base} 模組層未 import 任何控制/網路模組（命中={sorted(hit_top)}）",
               not hit_top)
-        check(f"★★ K. {base} 連函式內延後 import 也沒有（命中={sorted(hit_all)}）",
+        check(f"★★ K. {base} 函式內延後 import 也沒有"
+              f"（核准例外 {sorted(allowed)} 除外；命中={sorted(hit_all)}）",
               not hit_all)
+        if fn_name is None:
+            continue
+        # 核准的例外必須被釘死在那一個函式裡 —— 不得擴散到其他任何函式
+        elsewhere = set()
+        for f in ast.walk(tree):
+            if not isinstance(f, ast.FunctionDef) or f.name == fn_name:
+                continue
+            elsewhere |= (_all_imports(f) & allowed)
+        check(f"★★ K. {base} 的 operator 延後 import 只存在於 {fn_name}()"
+              f"（其他函式命中={sorted(elsewhere)}）", not elsewhere)
+        target = [f for f in ast.walk(tree)
+                  if isinstance(f, ast.FunctionDef) and f.name == fn_name]
+        check(f"★★ K. {fn_name}() 存在且確實只做延後 import 取得出口",
+              len(target) == 1 and (_all_imports(target[0]) & allowed) == allowed)
     # Runtime core / config 更嚴格：連零 I/O 的 Phase 6 純邏輯 library 也不得 import
     for mod in (RT, CFG):
         base = os.path.basename(mod.__file__)

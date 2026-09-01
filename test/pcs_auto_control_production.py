@@ -42,9 +42,16 @@ import pcs_auto_control_runtime as RT
 # 模式
 # ======================================================================
 MODE_OBSERVE_ONLY = "OBSERVE_ONLY"
-# 🔴 目前**只有這一種**模式。要新增 dispatch 模式必須是另一次明確授權，
-#    不得由旗標預設值悄悄開啟。
-SUPPORTED_MODES = (MODE_OBSERVE_ONLY,)
+# 🔴 Phase 6.9：受控單次上線。**只在本 process 內存在**、只允許執行一個
+#    control leg（一個方向指令 ＋ 其後的 STOP），消費後立即失效。
+#    要進入這個模式，必須同時通過：CLI 明示 → 人工確認字串 → fresh precheck。
+#    ⚠️ 它是 **deployment / operational authorization**，
+#       **不是** Control Authority 的替代品 —— 兩者都必須通過才可能送出指令。
+MODE_CONTROLLED_SINGLE_LEG = "CONTROLLED_SINGLE_LEG"
+SUPPORTED_MODES = (MODE_OBSERVE_ONLY, MODE_CONTROLLED_SINGLE_LEG)
+
+# 允許建立控制出口的模式 —— **只有一個**
+DISPATCH_CAPABLE_MODES = frozenset({MODE_CONTROLLED_SINGLE_LEG})
 
 # ---- 來源就緒狀態 ----
 SRC_WIRED = "WIRED"                 # 已注入且可用
@@ -199,24 +206,217 @@ def build_readback_config(config=None):
         stability_samples=c.readback_stability_samples)
 
 
-def build_executor(mode=MODE_OBSERVE_ONLY):
+def build_executor(mode=MODE_OBSERVE_ONLY, leg=None, operator_run=None):
     """
     控制出口。
 
     🔴 **OBSERVE_ONLY 一律回 None** —— 不建立 executor、不 import operator。
        這讓「不送指令」成為**結構事實**，而不是靠旗標判斷。
        即使上游全部放行、即使參數全部齊備，也沒有東西可以被呼叫。
+
+    🔴 CONTROLLED_SINGLE_LEG 才可能建立，且**必須**同時提供：
+         leg          —— 已通過人工確認與 fresh precheck 的 LiveLegAuthorization
+         operator_run —— 真正的送出函式（由呼叫端注入；離線測試注入 Fake）
+       任一缺少即回 None。**不會自己 import operator、不會自己接上真機。**
     """
-    if mode != MODE_OBSERVE_ONLY:
-        raise ValueError(f"未支援的模式：{mode!r}（目前只允許 {MODE_OBSERVE_ONLY}）")
-    return None
+    if mode not in SUPPORTED_MODES:
+        raise ValueError(f"未支援的模式：{mode!r}（允許 {list(SUPPORTED_MODES)}）")
+    if mode == MODE_OBSERVE_ONLY:
+        return None
+    if leg is None or not leg.armed or operator_run is None:
+        return None
+    # 🔴 一律包上 leg 授權閘 —— 送出前的最後一道，不可繞過。
+    return LegBoundExecutor(
+        EXC.PcsControlExecutor(operator_run=operator_run, execute=True), leg)
 
 
-def build_verifier(mode=MODE_OBSERVE_ONLY):
-    """ReadBack 驗證器。OBSERVE_ONLY 同樣不建立（沒有指令可驗）。"""
-    if mode != MODE_OBSERVE_ONLY:
+def build_verifier(mode=MODE_OBSERVE_ONLY, leg=None, reader=None, config=None):
+    """
+    ReadBack 驗證器。OBSERVE_ONLY 一律不建立（沒有指令可驗）。
+
+    🔴 CONTROLLED_SINGLE_LEG 下需有已 armed 的 leg 與 reader 才建立；
+       參數取自正式 ProductionConfig（75 / 5 / 1），不接受覆寫。
+    """
+    if mode not in SUPPORTED_MODES:
         raise ValueError(f"未支援的模式：{mode!r}")
-    return None
+    if mode == MODE_OBSERVE_ONLY:
+        return None
+    if leg is None or not leg.armed or reader is None:
+        return None
+    return EXC.ReadBackVerifier(config=build_readback_config(config),
+                                reader=reader)
+
+
+# ======================================================================
+# LiveLegAuthorization（Phase 6.9）
+# ======================================================================
+# 🔴 這是 **deployment / operational authorization**，語意是
+#    「本 process 最多允許執行一次 <action> leg」——
+#    **不是**「立即執行」，也**不是** Control Authority 的替代品。
+#    真正要 dispatch，仍必須同時滿足：
+#      Decision = 該方向 / Safety PASS / Authority 合法 / Interlock PASS
+#      / fresh precheck PASS / 一次性控制授權有效 / 本 leg 授權 armed
+#    缺一不可 → NO DISPATCH。
+LEG_ARMED = "ARMED"
+LEG_CONSUMED = "CONSUMED"
+LEG_ABORTED = "ABORTED"
+LEG_ACTIONS = ("charge", "discharge")
+
+
+def leg_power_kw(action, config=None):
+    """
+    LIVE leg 功率的**唯一**解析點。意向與授權共用同一個來源，
+    結構上不可能出現「確認畫面顯示 A、實際送出 B」。
+
+    🔴 只讀 ProductionConfig；沒有參數可以覆寫，也不接受呼叫端傳功率。
+    """
+    if action not in LEG_ACTIONS:
+        raise ValueError(f"leg action 只能是 {LEG_ACTIONS}：{action!r}")
+    c = config if config is not None else CFG.DEFAULT_CONTROL_CONFIG
+    power = (c.charge_power_kw if action == "charge" else c.discharge_power_kw)
+    if power is None:
+        raise ValueError(f"{action} 的 production 功率未設定 → 不核發 leg 授權")
+    return float(power)
+
+
+class LiveLegIntent(object):
+    """
+    人工確認階段的**顯示用意向** —— 刻意**不是**授權。
+
+    🔴 為什麼需要一個獨立型別
+        裁示要求「人工確認 → fresh read → fresh Decision/Safety/Authority/
+        Interlock → 才建立 LiveLegAuthorization」。若確認階段就先造出授權，
+        「授權存在」這件事就早於它應該成立的時點。意向讓確認畫面拿得到
+        action / power_kw，同時**不帶任何 dispatch 能力**。
+
+    🔴 armed 恆為 False：即使被誤傳進 build_executor 也只會得到 None
+       （Fail Closed），而不是拋例外或意外造出出口。
+    🔴 沒有 allows()：不可能通過 LegBoundExecutor 那一道閘。
+    """
+
+    armed = False                    # 🔴 恆為 False，不是屬性也不可被設定
+
+    def __init__(self, action, config=None):
+        self.action = action
+        self.power_kw = leg_power_kw(action, config)
+
+    def as_dict(self):
+        return {"action": self.action, "power_kw": self.power_kw,
+                "armed": False, "kind": "INTENT_NOT_AUTHORIZATION"}
+
+    def __str__(self):
+        return (f"[LIVE-LEG-INTENT {self.action} {self.power_kw:g}kW] "
+                f"尚未授權")
+
+
+class LiveLegAuthorization(object):
+    """
+    一次性、綁動作、只存在於本 process、不落盤的上線授權。
+
+    🔴 `power_kw` **只能**來自正式 ProductionConfig；建構時不接受任何覆寫參數。
+       沒有 --power、沒有 override、150 kW 更不可能成為操作目標。
+    """
+
+    def __init__(self, action, config=None):
+        self.action = action
+        self.power_kw = leg_power_kw(action, config)   # 來源唯一：ProductionConfig
+        self.state = LEG_ARMED
+        self.dispatched_direction = False    # 方向指令是否已送出（one-shot）
+        self.dispatched_stop = False
+        self.abort_reason = None
+
+    @property
+    def armed(self):
+        return self.state == LEG_ARMED
+
+    def allows(self, action):
+        """本 leg 是否允許這個動作。STOP 屬同一 leg 的收尾，方向指令只准一次。"""
+        if not self.armed:
+            return False
+        if action == self.action:
+            return not self.dispatched_direction
+        if action == "stop":
+            return self.dispatched_direction and not self.dispatched_stop
+        return False                          # 方向不符 → 一律拒絕
+
+    def mark_dispatched(self, action):
+        if action == self.action:
+            self.dispatched_direction = True
+        elif action == "stop":
+            self.dispatched_stop = True
+
+    def consume(self):
+        if self.armed:
+            self.state = LEG_CONSUMED
+        return self.state
+
+    def abort(self, reason):
+        if self.armed:
+            self.state = LEG_ABORTED
+            self.abort_reason = reason
+        return self.state
+
+    def as_dict(self):
+        return {"action": self.action, "power_kw": self.power_kw,
+                "state": self.state,
+                "dispatched_direction": self.dispatched_direction,
+                "dispatched_stop": self.dispatched_stop,
+                "abort_reason": self.abort_reason}
+
+    def __str__(self):
+        return (f"[LIVE-LEG {self.action} {self.power_kw:g}kW] {self.state} "
+                f"dir_sent={self.dispatched_direction} "
+                f"stop_sent={self.dispatched_stop}")
+
+
+# 🔴 leg 授權必須在**送出之前**被檢查，而不是事後才發現送錯。
+#    執行鏈一旦 run()，它自己那一層的守門通過後就會呼叫 executor；
+#    若把 leg 檢查放在 run() 之後，方向不符的指令**已經送出去了**。
+#    因此把它下推到 executor —— operator 之前的最後一道閘。
+R_LEG_NOT_AUTHORIZED = "LIVE_LEG_NOT_AUTHORIZED"
+
+
+class LegBoundExecutor(object):
+    """
+    包住真正的 executor，只有本 leg 授權允許的動作才會被送出。
+
+    🔴 不允許時**完全不呼叫** operator —— 回一個未送出的結果，
+       語意與「operator 未注入」一致（COMMAND_NOT_SENT）。
+    🔴 只做「准不准送」這一件事；不改寫任何既有判定、不吞例外。
+    """
+
+    def __init__(self, inner, leg):
+        self._inner = inner
+        self._leg = leg
+        self.refusals = []
+
+    def send(self, ctrl, safety=None):
+        action = getattr(ctrl, "action", None)
+        if self._leg is None or not self._leg.allows(action):
+            self.refusals.append(action)
+            return EXC.OperatorResult(
+                outcome=EXC.COMMAND_NOT_SENT,
+                control_action=action,
+                target_power_kw=getattr(ctrl, "target_power_kw", None),
+                sent=False,
+                reason=R_LEG_NOT_AUTHORIZED,
+                detail=(f"本次上線授權為 "
+                        f"{getattr(self._leg, 'action', None)!r}"
+                        f"（狀態 {getattr(self._leg, 'state', None)}）"
+                        f"，不允許 {action!r} → 不送出"))
+        res = self._inner.send(ctrl, safety=safety)
+        if getattr(res, "sent", False):
+            self._leg.mark_dispatched(action)
+        return res
+
+
+def confirmation_phrase(leg):
+    """
+    人工確認字串。刻意**不是**模糊的 YES —— 必須把動作與功率一起唸出來。
+
+    例：CONFIRM CHARGE 5KW
+    """
+    return f"CONFIRM {leg.action.upper()} {leg.power_kw:g}KW"
 
 
 # ======================================================================
@@ -250,7 +450,7 @@ class WiringReport(object):
         """
         return bool(self.dispatch_enabled
                     and self.sources.get("executor") == SRC_WIRED
-                    and self.mode != MODE_OBSERVE_ONLY)
+                    and self.mode in DISPATCH_CAPABLE_MODES)
 
     def as_dict(self):
         return {"mode": self.mode, "sources": dict(self.sources),

@@ -66,6 +66,17 @@ def _all_imports(tree):
     return out
 
 
+def _top_imports(tree):
+    """只看模組層 —— 延後 import 由呼叫端另行逐函式檢查。"""
+    out = set()
+    for n in tree.body:
+        if isinstance(n, ast.Import):
+            out |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            out.add((n.module or ".").split(".")[0])
+    return out
+
+
 # ======================================================================
 # 測試替身
 # ======================================================================
@@ -448,9 +459,22 @@ def main():
     check("★★ 未經裁示的參數仍為 None（未為了就緒而亂補）",
           prod.min_switch_interval_sec is None
           and prod.meter_stale_grace_sec is None)
-    check("★★ service 模組不 import operator / api 控制出口",
-          not (_all_imports(_tree("pcs_auto_control_service.py"))
-               & {"device_control_operator"}))
+    # 🔴 Phase 6.9-A：service 取得了一個經裁示核准的控制出口來源
+    #    （`build_live_operator_run()` 內的延後 import）。
+    #    不變量改寫為「更精確」而非「更寬鬆」：模組層仍完全不得 import，
+    #    且該延後 import 只能存在於那一個函式裡。
+    _svc_tree = _tree("pcs_auto_control_service.py")
+    check("★★ service 模組層不 import operator / api 控制出口",
+          not (_top_imports(_svc_tree) & {"device_control_operator",
+                                          "api_client"}))
+    _elsewhere = set()
+    for _f in ast.walk(_svc_tree):
+        if isinstance(_f, ast.FunctionDef) and _f.name != "build_live_operator_run":
+            _elsewhere |= (_all_imports(_f) & {"device_control_operator"})
+    check(f"★★ service 的 operator 延後 import 只存在於 build_live_operator_run()"
+          f"（其他函式命中={sorted(_elsewhere)}）", not _elsewhere)
+    check("★★ OBSERVE_ONLY 組裝完成後行程內仍無 operator",
+          "device_control_operator" not in sys.modules)
     check("★★ 執行鏈的 executor / verifier / store 皆為 None",
           (lambda ch: ch.executor is None and ch.verifier is None
            and ch.store is None)(st._chain()))
