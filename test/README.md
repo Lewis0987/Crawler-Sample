@@ -1,9 +1,16 @@
-# Crawler Sample — HMI / BESS 資料擷取與設備控制工具
+# Crawler Sample — BESS Monitoring / Control / Auto Report
 
 ## 1. 專案簡介
 
-儲能櫃（BESS）HMI 的資料擷取（爬蟲）＋設備控制工具集，
-並提供**自動充放電報告**與**背景監控服務（Auto Monitor Service）**。
+儲能櫃（BESS）HMI 的資料擷取與設備控制工具集，涵蓋：
+
+- BESS HMI 資料擷取
+- PCS / Battery / Environment 狀態解析
+- 人工設備控制（CLI）
+- 自動充放電報告
+- Windows Service 背景監控
+- Meter-based Phase 6 自動充放電決策
+- Phase 6.10 無人值守 ownership handoff
 
 | 項目 | 值 |
 |---|---|
@@ -11,155 +18,326 @@
 | 前端 HMI | `http://192.168.128.110:8853/`（Vue，Yudao/ruoyi-vue-pro） |
 | 輸出目錄 | `D:\Crawler Sample\output` |
 
-## 2. 主要功能
+Phase 1~5 已 COMPLETE；Phase 6 決策鏈完成但**實機控制尚未啟用**，
+Phase 6.10 離線開發完成並已凍結。目前狀態一律以 [§9](#9-development-progress) 為準。
 
-- **設備資料擷取** —— 電池／PCS／空調／進排風／冷卻循環等區塊，逐欄對齊 HMI UI。
-- **PCS／排程控制** —— CLI 選單操作，控制指令需二次確認。
-- **自動充放電報告** —— 智慧排程開始充放電時自動建立 Session，結束時自動收尾產表。
-- **Windows Service 背景監控** —— 不開 Dashboard 也能自動建立與收尾報告。
-- **Session Recovery** —— Service 正常停止或異常中斷後，重啟可續接同一份 Session。
-- **Auth Recovery** —— 登入態失效時自動重新登入，不需人工介入。
-- **Ownership / Dashboard Observer** —— 同一時間只有一個寫入者，Dashboard 為唯讀觀察者。
+## 2. 核心功能
 
-## 3. 主要檔案
+| 功能 | 說明 |
+|---|---|
+| HMI / BESS data scraping | 電池／PCS／空調／進排風／冷卻循環，逐欄對齊 HMI UI |
+| PCS / Battery status | 依 HMI `pcsMode_US` 規則解析，旗標一律讀 `oldValue`（語言無關） |
+| Manual control CLI | 選單式設備控制，控制指令需二次確認 |
+| Auto charge/discharge report | 排程開始自動建立 Session，結束自動收尾產表 |
+| Auto Monitor Windows Service | 不開 Dashboard 也能自動建立與收尾報告 |
+| Session / Auth Recovery | 服務重啟續接同一 Session；登入態失效自動重登 |
+| Ownership / Observer | 同時只有一個寫入者，Dashboard 為唯讀觀察者 |
+| Meter / TOU / Decision / Safety Gate | 電表功率分類、時段判定、決策引擎、安全閘 |
+| Control Authority | 控制權歸屬判定與一次性授權票 |
+| Unattended ownership handoff | 與外部控制程式的暫停／接管／歸還（Phase 6.10） |
+
+## 3. 系統架構
+
+```
+HMI / ESS
+   ↓
+Scraper / API Client
+   ↓
+Monitor / Decision
+   ↓
+Safety / Authority
+   ↓
+Report / Control
+```
+
+Phase 6.10 ownership handoff：
+
+```
+External Controller
+   → Pause
+   → Verify Idle
+   → Phase 6 Ownership
+   → Release
+   → Restore External Controller
+```
+
+任一環節無法確認，一律 **Fail Closed**（不送出、不接管、不清除恢復責任）。
+
+## 4. 主要檔案
 
 | 檔案 | 用途 |
 |---|---|
-| `api_client.py` | API 薄封裝：session、登入、`Authorization: Bearer`、統一 timeout。 |
-| `dashboard_scraper.py` | Dashboard 數據概覽擷取；輸出 `dashboard_data.json` / `.csv`。 |
-| `device_control_scraper.py` | 共用解析核心（PCS／電池／環控）；輸出 `device_control_readonly.json`。 |
-| `device_control_menu.py` | CLI 設備控制選單（查詢＋控制）。 |
-| `device_control_operator.py` | 控制指令的 payload 組裝與送出（需 `--execute` + YES）。 |
-| `report_monitor.py` | Monitor Core：監看決策、Session 生命週期、Ownership、Auth Recovery。 |
-| `auto_monitor_service.py` | 背景服務入口，由 NSSM 啟動並常駐。 |
-| `charge_discharge_report.py` | `ReportSession` 與報告產出（CSV／Excel／Summary／統計）。 |
-| `run_phase3_regression.py` | 一鍵執行完整 Regression 並輸出總表。 |
-| `run_all.py` | 一鍵執行全部擷取腳本。 |
+| `api_client.py` | API 薄封裝：session、登入、Bearer、統一 timeout |
+| `dashboard_scraper.py` | Dashboard 數據概覽擷取 |
+| `device_control_scraper.py` | 共用解析核心（PCS／電池／環控） |
+| `device_control_menu.py` | CLI 設備控制選單 |
+| `device_control_operator.py` | 控制指令組裝與送出（需 `--execute` + YES） |
+| `report_monitor.py` | Monitor Core：監看決策、Session 生命週期、Ownership |
+| `auto_monitor_service.py` | 背景服務入口，由 NSSM 啟動常駐 |
+| `charge_discharge_report.py` | Session 與報告產出（CSV／Excel／統計） |
+| `phase6_handoff_orchestrator.py` | Ownership 狀態機、Journal、恢復判定、交接流程 |
+| `phase6_remote_adapter.py` | 遠端 guard 契約、SSH timeout、capability 解析 |
+| `phase6_unattended_service.py` | 無人值守服務 lifecycle 與 live readiness |
+| `phase6_guard_deploy_plan.py` | Guard 部署／回滾套件（只產生指令，不執行） |
+| `run_all.py` | 一鍵執行全部擷取腳本 |
+| `run_phase3_regression.py` | Phase 2~5 Regression 總表 |
 
-## 4. 執行方式
+## 5. 快速使用
 
 ```bash
-python device_control_scraper.py     # 產生 device_control_readonly.json + 主控台摘要
-python dashboard_scraper.py --once   # Dashboard 抓一次 → dashboard_data.json / .csv
+python device_control_scraper.py     # 產生 device_control_readonly.json + 摘要
+python dashboard_scraper.py --once   # Dashboard 抓一次
 python dashboard_scraper.py --loop   # Dashboard 背景循環（Ctrl+C 停止）
 python device_control_menu.py        # CLI 設備控制選單
 python run_all.py                    # 一鍵執行全部擷取
-python run_phase3_regression.py      # 完整 Regression
+python run_phase3_regression.py      # Phase 2~5 Regression
 ```
 
-### 登入設定
+**登入設定**：放在 `test/` 下的 `*.env`（例如 `login.env`），
+可依 `.env.example` 建立本機檔。**`.env` 已由 `.gitignore` 排除，不可 commit。**
 
-登入資訊放在 `test/` 目錄下的 `*.env` 檔案（例如 `login.env`）。
-可依 `.env.example` 建立本機 env 檔。
-
-**`.env` 檔案已由 Git 排除，請勿提交。**
-
-## 5. PCS 當前狀態
-
-PCS 當前狀態依 HMI 實際顯示邏輯解析。
-
-- 使用 US 版本 `pcsMode_US` 規則
-- 顯示順序：啟停 → 故障 → 併網 → 離網 → 充電 → 放電
-- 啟停狀態固定顯示，其餘狀態於 `oldValue=1` 時顯示
-- 共用解析位於 `device_control_scraper.py`
-- 顯示結果需與 HMI Dashboard 一致
+## 6. Auto Monitor / Auto Report
 
 ```
-PCS當前狀態：執行 / 併網 / 充電
+排程 / 控制方向 → Session → Sampling → Finalize → report.xlsx
 ```
 
-自動監看層的旗標判斷一律讀 `oldValue`（語言無關），不比對翻譯後的中文字串。
-
-## 6. 自動充放電報告
-
-```
-排程開始 → 建立 Session → 持續取樣 → 自動停止 → 產生報告
-```
-
-輸出位置：`output\charge_discharge_reports\<session_id>\`
-
-| 檔案 | 內容 |
-|---|---|
-| `samples.csv` | 逐筆取樣資料 |
-| `events.csv` | Session 事件（開始／方向切換／暫停／續接／結束） |
-| `summary.json` | 報告摘要 |
-| `statistics.json` | 統計數據 |
-| `report.xlsx` | Excel 報告（含圖表） |
-
-另有 `alarms.csv`、`cell_snapshots.json`、`session_state.json`。
-
-## 7. Auto Monitor Service
+輸出：`output\charge_discharge_reports\<session_id>\`
+（`samples.csv`、`events.csv`、`summary.json`、`statistics.json`、`report.xlsx`
+及 `alarms.csv`、`cell_snapshots.json`、`session_state.json`）
 
 ```
-Windows SCM → NSSM → auto_monitor_service.py → report_monitor.py → Session / Report
+Windows SCM → NSSM → auto_monitor_service.py → report_monitor.py
 ```
 
-- Service 可在 **Dashboard 未開啟時獨立監控**。
-- Service 為 **Monitor Owner**；Dashboard 為 **Observer**（唯讀，不寫報告）。
-- `tools\nssm.exe` 是 **runtime dependency**，安裝後不可刪除、改名或搬移。
-- Windows Service 限制 OpenBLAS 為單執行緒，以降低背景服務資源占用。
+重點：
 
-以**系統管理員** PowerShell 操作（`install` / `update` / `start` / `stop` /
-`status` / `remove` 六個動作）：
+- Dashboard 未開啟時也能產生報告
+- **Service = Owner；Dashboard = Observer**（唯讀，不寫報告）
+- Graceful Recovery（正常停止）與 Crash Recovery（異常中斷）皆續接同一
+  `session_id` 與 folder，`sample_index` 繼續遞增，**不會建立第二份 Session**
+- `tools\nssm.exe` 為 runtime dependency，不可刪除／改名／搬移
+- Service log：`output\logs\auto_monitor_service.log`
 
-```powershell
-.\tools\install_service_nssm.ps1 -Action status    # 查詢
-.\tools\install_service_nssm.ps1 -Action start     # 啟動
-.\tools\install_service_nssm.ps1 -Action stop      # 停止
-```
-
-| 情境 | 流程 |
-|---|---|
-| 首次安裝 | `install` → `start` |
-| Service 設定更新 | `stop` → `update` → `start` |
-| 純 Python 程式碼更新 | `stop` → 更新 `.py` → `start` |
-
-Service log：`output\logs\auto_monitor_service.log`
-
-> 六個動作的完整說明、預期結果與失敗處置見
-> [`../tools/README.md`](../tools/README.md)（Service action 權威來源）。
-> 部署、設定確認、健康檢查、Rollback、Troubleshooting 見
+> Service 六個動作（install / update / start / stop / status / remove）的完整說明見
+> [`../tools/README.md`](../tools/README.md)（權威來源）。
+> 部署、健康檢查、Upgrade、Rollback、Troubleshooting 見
 > [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md)。
-
-## 8. Recovery
-
-**Graceful Recovery**（正常停止）
-
-```
-recording → Service stop → paused → Service start → resume
-```
-
-**Crash Recovery**（異常中斷）
-
-```
-recording → worker 中斷 → Service start → resume
-```
-
-兩者的共同結果：
-
-- 同一 `session_id`
-- 同一 folder
-- 舊 samples 完整保留
-- `sample_index` 繼續遞增
-- **不建立第二份 Session**
-
-> 兩條路徑的實機驗證證據與底層機制見
+> Recovery 兩條路徑的實機證據見
 > [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md)。
 
-## 9. Regression
+## 7. Phase 6 — Meter-based Auto Charge / Discharge
 
-目前正式 baseline：
+以電表功率、時段與 SOC 產生充放電決策，經 Safety Gate 與 Control Authority
+才可能送出 PCS 指令。逐階段狀態見
+[§9 Development Progress](#9-development-progress)。
+
+重點結論：
+
+- Production 正常控制目標 **±5 kW**。
+- `max_power_kw = 150 kW` **僅為 Safety Gate 的指令上限**，不是營運功率。
+- 方向反轉 **Layer 1 direction interlock 已完成**；
+  **Layer 2 `min_switch_interval` = DEFERRED**（無正式依據，不得自行填值）。
+- `dispatch_ready` 與 `dispatch_enabled` **分離** —— 條件齊備不等於允許送出。
+- 任一條件無法確認一律 **Fail Closed**。
+- **External Controller 已 field confirmed**（`192.168.70.201` 的
+  `~/ems/auto_control.py`）。
+- FIRST LIVE 因該 competing controller 自動接管而**安全 ABORT**，
+  Phase 6 即時偵測到外部控制並停止，未送出任何指令。
+- **Phase 6 實機 CHARGE / DISCHARGE / PCS STOP = 0 / 0 / 0。**
+
+> 三種 kW 語意（Grid Meter `+=IMPORT`、Battery `+=CHARGE`、
+> PCS Command `CHARGE→負 setpoint`）**嚴禁混用**。
+> 逐階段開發歷史見 [Appendix](#appendix--historical-development-notes)。
+
+## 8. Phase 6.10 — Unattended Ownership Handoff
+
+目的：安全完成 `External → Pause → Phase6 → Release → Restore External`。
+
+核心特性：Ownership State Machine、Fail Closed、Restore Responsibility、
+Crash / Restart Recovery、Durable JSONL Journal、Remote SSH Guard、
+Capability Reporting、Single Instance、Live Readiness Gate、
+Deployment / Rollback Package。
 
 ```
-Automated checks : 1802 / 1802 PASS
-FAIL             : 0
-SKIP             : 0
-Environment      : PASS
+Phase 6.10 OFFLINE DEVELOPMENT = COMPLETE / FROZEN
 ```
 
-執行：`python run_phase3_regression.py`
+逐子階段狀態見 [§9 Development Progress](#9-development-progress)。
 
-## 10. 開發階段
+### Production Parameters
+
+**Service**
+
+| 參數 | 值 |
+|---|---|
+| `decision_interval_sec` | 30 FINAL |
+| `retry_backoff_sec` | 5 FINAL |
+| `service_health_timeout_sec` | 300 FINAL |
+
+**SSH**
+
+| 項目 | 值 |
+|---|---|
+| connect | 5 FINAL |
+| probe | 5 FINAL |
+| status | 12 FINAL |
+| loopcheck | 26 FINAL |
+| pause | 12 **STRUCTURAL CANDIDATE / NOT FINAL**；production default = `None` |
+| restore | 12 **STRUCTURAL CANDIDATE / NOT FINAL**；production default = `None` |
+
+**Handoff**
+
+| 項目 | 值 |
+|---|---|
+| idle power | −3 ~ +1 kW |
+| pause settling | 120 s |
+| stable verify | 4 samples / 15 s / 45 s |
+| restore verify | 3 observations / 3 s / 6 s |
+
+> `pause` / `restore` 恆列於 `missing()` 與 `not_field_verified()`，
+> **不得升格 FINAL**，直到取得真正的控制路徑實測。
+> 各參數的推導與 evidence 見測試檔、`output/` 下的量測紀錄，
+> 以及 [Appendix](#appendix--historical-development-notes)。
+
+## 9. Development Progress
+
+| Phase | Item | Status |
+|---|---|---|
+| Phase 1 | Report Framework | COMPLETE |
+| Phase 2 | Auto Start | COMPLETE |
+| Phase 3 | Auto Lifecycle | COMPLETE |
+| Phase 4 | Auto Monitor Service | COMPLETE |
+| Phase 5 | Production Ready | COMPLETE |
+| 5.1 | Production Validation Plan | COMPLETE |
+| 5.2 | Long-running Stability / Soak Test | COMPLETE |
+| 5.3 | Stress / Boundary Test | COMPLETE |
+| 5.4 | Production Documentation / Deployment | COMPLETE |
+| 5.5 | Release Validation | COMPLETE |
+| Phase 6 | Meter-based Auto Charge / Discharge | OFFLINE COMPLETE / LIVE HOLD |
+| 6.0 | Production Meter Verify | COMPLETE |
+| 6.1 | Meter Client | COMPLETE |
+| 6.2 | Power Classification | COMPLETE |
+| 6.2b | TOU Calendar | COMPLETE |
+| 6.3-A | Decision Engine Framework | COMPLETE |
+| 6.3-B | Decision Policy | COMPLETE |
+| 6.4 | Safety Gate | COMPLETE |
+| 6.5 | PCS Control Integration | COMPLETE / LIVE HOLD |
+| 6.5-H | Control Authority / Arbitration | OFFLINE VERIFIED |
+| 6.6 | Auto Report Integration | COMPLETE |
+| 6.7 | Field Validation | COMPLETE / OBSERVE_ONLY |
+| 6.8 | Regression & Closure | COMPLETE |
+| 6.9 | Controlled FIRST LIVE | ATTEMPTED / BLOCKED |
+| 6.9-A | CLI Entry Wiring | OFFLINE VERIFIED |
+| Phase 6.10 | Unattended Ownership Handoff | OFFLINE COMPLETE / FROZEN |
+| 6.10 Core | Ownership Handoff Core | COMPLETE |
+| 6.10-A | Remote Adapter | COMPLETE |
+| 6.10-A1 | Verification | COMPLETE |
+| 6.10-B1 | Read-only Guard | COMPLETE |
+| 6.10-B1.5 | Production Preconditions | COMPLETE |
+| 6.10-B1.6 | Network Identity Blocker | COMPLETE / BLOCKER CONFIRMED |
+| 6.10-B1.7 | Network Identity Verification | DEFERRED / NOT VERIFIED |
+| 6.10-B2 | Offline Handoff | COMPLETE |
+| 6.10-B2 LIVE | Live Handoff Deployment | NOT STARTED / BLOCKED |
+| 6.10-C | Offline Unattended Service | COMPLETE |
+| 6.10-C1 | Service Timing | COMPLETE |
+| 6.10-C2 | SSH Architecture | COMPLETE |
+| 6.10-C3 | SSH Timing Evidence | COMPLETE |
+| 6.10-C4 | Live Readiness | COMPLETE |
+| 6.10-C LIVE | Unattended Service Live Deployment | NOT STARTED / BLOCKED |
+
+### Current Summary
+
+- Phase 1 ~ Phase 5：COMPLETE
+- Phase 6：OFFLINE COMPLETE / LIVE HOLD
+- Phase 6.10：OFFLINE COMPLETE / FROZEN
+- Phase 6.10-B1.7：DEFERRED / NOT VERIFIED
+- Phase 6.10-B2 LIVE：NOT STARTED / BLOCKED
+- Phase 6.10-C LIVE：NOT STARTED / BLOCKED
+- FIRST LIVE：HOLD
+- LIVE_READINESS：BLOCKED
+
+### Current Safety State
+
+- DISPATCH_ENABLED = False
+- MODE = DRY_RUN
+- DEPLOYED_GUARD_VARIANT = B1
+- RemoteSenders armed = False
+- NETWORK_IDENTITY_STABILITY = NOT VERIFIED
+
+Field command count：
+
+- Phase 6 CHARGE / DISCHARGE / PCS STOP = 0 / 0 / 0
+- External pause / restore / stop / start = 0 / 0 / 0 / 0
+
+### Live Blockers
+
+- DHCP Reservation = NOT CONFIRMED
+- B2 guard deployment = NOT AUTHORIZED
+- Remote Guard（field）：`probe` / `loopcheck` / `status` = AVAILABLE；
+  `pause` / `restore` = REFUSED（historical B1 evidence）
+- `pause` / `restore` command timeout = STRUCTURAL CANDIDATE，尚無實測
+
+### Next Field Sequence
+
+1. B1.7 Network Identity Verification
+2. B2 Guard Deployment
+3. B2 read-only post-deploy verification
+4. Controlled FIRST LIVE
+5. pause / restore timing evidence
+6. 評估 pause / restore timeout FINAL
+7. Phase 6.10-C Live Service Deployment
+
+> **上述任何 Field 階段均需要新的明確授權。**
+
+## 10. Regression
+
+| 範圍 | 基準 | 執行方式 |
+|---|---|---|
+| Phase 2~5 | **1802 / 1802 PASS**，0 FAIL / 0 SKIP | `python run_phase3_regression.py` |
+| Phase 6 | **4172 / 4172 PASS**，43 檔，0 FAIL | 逐檔執行 `test_phase6*.py` |
+
+> `run_phase3_regression.py` 只涵蓋 Phase 2~5，**不含 Phase 6**；
+> Phase 6 目前**沒有**專屬的 runner 入口，以逐檔執行為準。
+
+## 11. 文件
+
+| 文件 | 內容 |
+|---|---|
+| [`../docs/Phase3_Closure_Report.md`](../docs/Phase3_Closure_Report.md) | Phase 3 自動生命週期收尾報告 |
+| [`../docs/Phase4.6_Closure_Report.md`](../docs/Phase4.6_Closure_Report.md) | Windows Service 包裝與 NSSM 驗證 |
+| [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md) | Phase 4 收尾：架構、Ownership、Recovery、已知限制 |
+| [`../docs/Phase5_Validation_Plan.md`](../docs/Phase5_Validation_Plan.md) | Phase 5 驗證計畫與驗收基準 |
+| [`../docs/Phase5_Closure_Report.md`](../docs/Phase5_Closure_Report.md) | Phase 5 收尾：Soak / Stress / 文件 / Release Validation |
+| [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md) | **部署 / 維運手冊** |
+| [`../tools/README.md`](../tools/README.md) | NSSM 版本、授權、SHA-256；**Service action 權威來源** |
+
+> Phase 6 / Phase 6.10 目前**沒有**專屬 closure 文件；
+> 完整敘述保留在本檔 [Appendix](#appendix--historical-development-notes)、
+> 測試檔與 `output/` 下的實測紀錄。
+
+## 12. 注意事項
+
+- **`.env` 不可 commit**（已由 `.gitignore` 排除）。
+- **`tools/nssm.exe` 為 runtime dependency**，不可刪除／改名／搬移。
+- Service 運行時 **Dashboard 為 Observer**，不會寫入報告。
+- **不要同時啟動第二個 Monitor writer** —— Ownership 會擋下，但應避免。
+- **Phase 6 預設不允許實機控制**：`DISPATCH_ENABLED = False`、`MODE = DRY_RUN`。
+- 任一條件無法確認一律 **Fail Closed**；不確定不等於安全。
+- 詳細歷史、實機證據與量測紀錄請看 `docs/`、`test/`、`output/`。
+
+---
+
+## Appendix — Historical Development Notes
+
+> 以下為逐階段開發過程的原始紀錄，**內容未經刪改**，僅由主文搬移至此。
+> 這些是 field evidence 與設計論證的來源，目前沒有對應的獨立 docs 文件，
+> 因此保留全文。日常閱讀請看上方 §1~§12。
+
+<details>
+<summary><b>Phase 1~6 逐階段開發歷史（含 D.2~D.5 架構決議、6.5 blocker 推導、FIRST LIVE 逐秒紀錄、Source Authority / Annual Calendar / crash window 研究）</b></summary>
+
+#### 10. 開發階段
 
 | Phase | 內容 | 狀態 |
 |---|---|---|
@@ -1128,22 +1306,486 @@ Control Authority 為 IDLE，且確認無其他控制來源。
 Decision Policy 的運轉帶語意不同，兩者不得混用。
 ⚠️ SOC 恢復由現場既有正常作業執行，**Phase 6 不執行 SOC Recovery**。
 
-## 11. 文件
+</details>
 
-| 文件 | 內容 |
+<details>
+<summary><b>Phase 6.10 詳細設計紀錄（State Machine、Ownership Model、各子階段驗收、參數推導）</b></summary>
+
+#### 11. Phase 6.10 — Unattended Ownership Handoff
+
+##### 11.1 目標
+
+讓系統未來能在**無人工操作**下完成一次完整交接：
+
+```
+External Controller → safe pause → ownership release → Phase 6 takeover
+→ control → Phase 6 release → External Controller restore
+```
+
+四項核心原則：
+
+- **不允許雙重 controller** —— 任何時刻只能有一方持有控制權
+- **Fail Closed** —— 任一 Gate 不成立即停止前進，不猜、不續跑
+- **Crash 後保留 restore responsibility** —— 重開機不得讓恢復責任消失
+- **所有 handoff 留下 durable audit evidence**
+
+##### 11.2 State Machine
+
+```
+IDLE → PREFLIGHT → PAUSE_REQUESTED → PAUSE_VERIFYING → EXTERNAL_PAUSED
+     → PHASE6_ACTIVE → PHASE6_RELEASING → PHASE6_RELEASED
+     → RESTORE_REQUESTED → RESTORE_VERIFYING → RESTORED → COMPLETE
+```
+
+失敗／Critical 狀態：
+
+```
+ABORTED_PREFLIGHT              尚未動任何東西，無恢復責任
+ABORTED_PAUSE_FAILED           pause 未生效，external 仍在跑
+RESTORE_FAILED_CRITICAL        🔴 場站失去套利，需人工介入
+OWNERSHIP_CONFLICT_CRITICAL    🔴 雙方同時持有
+```
+
+轉移採**白名單**，非法轉移直接拋錯。`EXTERNAL_PAUSED` 不得直接跳 `COMPLETE` ——
+必須經過歸還。
+
+##### 11.3 Ownership Model
+
+```
+EXTERNAL / NEITHER / PHASE6 / UNKNOWN / BOTH
+```
+
+🔴 **`BOTH` 不是正常 operational state，而是 INVARIANT VIOLATION / CRITICAL。**
+它不出現在任何狀態的可接受集合中，一旦偵測到即寫入稽核並轉 critical。
+任一側無法判定 → `UNKNOWN`（Fail Closed），不猜測。
+
+##### 11.4 Phase 6.10 Core — COMPLETE
+
+已完成並離線驗證：State Machine、Crash Recovery、Watchdog、Idempotency、
+append-only JSONL Audit Log、DRY_RUN / OBSERVE / ARMED 三段模式架構。
+
+幾項語意值得記錄：
+
+- **意圖先寫、結果後寫** —— crash 落在中間時必須**以觀測驗證**，不得盲目重送
+- **Watchdog 逾時不會直接 restore** —— Phase 6 仍在 dispatch 時強行恢復
+  external 會造成雙方同時控制，因此逾時只會要求「先收斂，再歸還」
+- **恢復責任由 8 個狀態承載**，並以 durable journal + `recover()` 跨重開機保留
+
+```
+DISPATCH_ENABLED = False       MODE = DRY_RUN
+```
+
+##### 11.5 Remote Adapter — Phase 6.10-A COMPLETE
+
+remote adapter 提供三個注入點：`probe` / `pause_sender` / `restore_sender`。
+pause / restore sender **介面已備妥，但 production control 尚未啟用**
+（預設 `armed=False`，未注入 runner 即結構上送不出）。
+
+🔴 **`external_quiescent` 不得宣稱直接觀測到 `auto_control.py` 的
+`running == False`** —— 那是行程內部變數，外部讀不到。只能以外部可觀測行為
+（PCS 狀態、功率、Authority、通訊、告警、狀態穩定性）跨多筆樣本驗證。
+
+##### 11.6 Pause Verification — Phase 6.10-A1 COMPLETE
+
+兩階段：
+
+```
+SETTLING        允許正常收斂，**不判失敗**：
+                  CHARGING / DISCHARGING → STANDBY / STOPPED
+                  Authority EXTERNAL_OR_UNKNOWN → IDLE
+                  Power active → idle band
+                逾時仍未出現 candidate-idle → SETTLING_TIMEOUT
+
+STABLE_VERIFY   首次出現完整 candidate-idle 後才開始；
+                連續 fresh samples 全部成立才 external_quiescent = True
+```
+
+PCS 狀態穩定性**只在 STABLE_VERIFY window 內要求** —— SETTLING 期間的
+`CHARGING → STANDBY` 是正常收斂，不得因此判定 pause 失敗。
+
+Restore 驗證同樣兩層：runtime health（ssh / screen / pid / identity）＋
+loop activity（時間戳前進）。**不要求 PCS 一定出力**；證據不足一律
+`NEEDS_ADDITIONAL_PROBE`，不得假裝 PASS。
+
+##### 11.7 已核准 handoff 參數
+
+| 參數 | 值 |
 |---|---|
-| [`../docs/Phase3_Closure_Report.md`](../docs/Phase3_Closure_Report.md) | Phase 3 自動生命週期收尾報告 |
-| [`../docs/Phase4.6_Closure_Report.md`](../docs/Phase4.6_Closure_Report.md) | Windows Service 包裝與 NSSM 驗證 |
-| [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md) | Phase 4 整體收尾：架構、Ownership、Recovery、已知限制 |
-| [`../docs/Phase5_Validation_Plan.md`](../docs/Phase5_Validation_Plan.md) | Phase 5 驗證計畫與驗收基準 |
-| [`../docs/Phase5_Closure_Report.md`](../docs/Phase5_Closure_Report.md) | Phase 5 收尾：Soak / Stress / 文件 / Release Validation 結果 |
-| [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md) | **部署 / 維運手冊**：安裝、操作、設定、健康檢查、更新、Rollback、Troubleshooting |
-| [`../tools/README.md`](../tools/README.md) | NSSM 版本、授權、SHA-256；**Service action 權威來源** |
+| `idle_power_lower_kw` | −3.0 |
+| `idle_power_upper_kw` | +1.0 |
+| `pause_settling_timeout_sec` | 120.0 |
+| `stable_verify_min_samples` | 4 |
+| `stable_verify_interval_sec` | 15.0 |
+| `stable_verify_min_span_sec` | 45.0 |
+| `restore_loop_min_observations` | 3 |
+| `restore_loop_interval_sec` | 3.0 |
+| `restore_loop_min_span_sec` | 6.0 |
 
-## 12. 注意事項
+span 一律等於 `(samples − 1) × interval`（4@15s → t=0/15/30/45 → 45 s；
+3@3s → t=0/3/6 → 6 s），並由 `validate()` 檢查一致性以防 off-by-one。
 
-- **`.env` 檔案不可 commit**（已由 `.gitignore` 排除）。
-- **`tools/nssm.exe` 為 runtime dependency**，不可刪除、改名或搬移。
-- Service 運行時 **Dashboard 為 Observer**，不會寫入報告。
-- **不要同時啟動第二個 Monitor writer** —— Ownership 會擋下，但應避免。
-- 詳細測試結果、實機證據與歷史紀錄請查看 `docs/`。
+🔴 **參數已寫入 ≠ 實機 unattended control 已啟用。** 仍維持
+`DISPATCH_ENABLED = False`、`MODE = DRY_RUN`。
+
+##### 11.8 Remote Guard — Phase 6.10-B1 COMPLETE
+
+```
+dedicated key   phase6_firstlive_ed25519（ED25519，專用）
+來源限制        from="192.168.128.234"
+forced command  /home/etica/ems/phase6_remote_guard.sh
+```
+
+目前 deployed allowlist：
+
+```
+ENABLED   probe | loopcheck | status
+REFUSED   pause | restore | 任意 shell | kill | screen 任意指令
+```
+
+`authorized_keys` 中該 public key **恰好 1 條** forced-command entry ——
+必須 REPLACE 而非 APPEND，否則舊的無 forced-command 條目仍在，allowlist
+就完全失去意義。
+
+guard 本身：`set -euo pipefail`、PATH 與環境淨化、絕對路徑、每個動作有 timeout、
+明確 exit code、精確比對（非前綴）、不使用 eval、不把原始 command 交給 `sh -c`、
+screen 以 **session name** 定位（不寫死 PID）且要求恰好 1 個、hardcopy 用
+`mktemp` + `trap` 清理。
+
+##### 11.9 FIRST LIVE Handoff Plan
+
+```
+ 1 PRE_PAUSE_PREFLIGHT
+ 2 PAUSE                    → RESTORE RESPONSIBILITY = TRUE
+ 3 SETTLING                 ≤ 120 s
+ 4 STABLE_VERIFY            4 samples @ 15 s，span ≥ 45 s
+ 5 ownership = NEITHER
+ 6 POST_PAUSE_FRESH_PRECHECK
+ 7 FIRST LIVE CHARGE 5.0 kW
+ 8 VERIFY                   ReadBack / LastControl / Phase 6 Authority
+ 9 PHASE6 RELEASE           → idle verified → ownership = NEITHER
+10 RESTORE external
+11 RESTORE_VERIFY           3 observations @ 3 s，span ≥ 6 s
+12 COMPLETE
+```
+
+🔴 **`PRE_PAUSE_PREFLIGHT` 不要求 `Authority = IDLE`、`PCS idle`、
+`No external controller`** —— 暫停之前，external controller 本來就可能正在
+正常控制，那是預期狀態而非 failure。這三項**只有 `POST_PAUSE_FRESH_PRECHECK`
+才必須 PASS**，且不得沿用 Step 1 的資料。
+
+🔴 **RESTORE 完成後不要求 ownership 一定為 `EXTERNAL`。** 若 external policy
+此刻正確選擇 idle（`ownership = NEITHER`），仍可 `COMPLETE`，前提是：
+Phase 6 ownership released、external runtime healthy、external loop resumed、
+`ownership != BOTH`、no critical condition。
+
+##### 11.10 Network Identity Blocker — Phase 6.10-B1.6 COMPLETE / BLOCKER CONFIRMED
+
+```
+Wi-Fi MAC     04-EC-D8-6A-46-4A
+IPv4          192.168.128.234（PrefixOrigin = Dhcp）
+DHCP Server   192.168.128.16
+DHCP Reservation = NOT CONFIRMED
+```
+
+```
+UNATTENDED_NETWORK_IDENTITY_STABILITY = NOT VERIFIED
+DHCP Reservation                      = NOT CONFIRMED
+Phase 6.10-B1.7                       = DEFERRED / NOT VERIFIED
+```
+
+🔴 **`NOT VERIFIED` 不是 `PASS`。** B1.7 的欄位驗證（受控 reconnect / DHCP renew
+後重新確認 IP 與 guard）**尚未執行**，不得以「歷史 renew 都拿到 .234」推論為已驗證。
+
+⚠️ 正確描述：**DHCP 會週期性 renew，但因 reservation 尚未確認，無法保證
+reconnect / DHCP restart / lease reassignment 之後仍取得 `.234`。**
+（不可寫成「12 小時租約一定每 12 小時換 IP」。）
+
+風險路徑：external 已 pause → Windows IP 改變 → `from="192.168.128.234"`
+拒絕 SSH → restore 送不出去 → `RESTORE_FAILED_CRITICAL`。
+
+🔴 **不得**以 `from="192.168.128.0/24"` 作為解法 —— 那只是擴大 dedicated key
+的來源授權範圍，並未建立 stable network identity。unattended production 要的是
+**stable identity**，不是 **broader authorization scope**。
+
+需 IT 於 `192.168.128.16` 建立 reservation：MAC `04-EC-D8-6A-46-4A`
+→ IPv4 `192.168.128.234`（**是 DHCP Reservation，不是 Windows 端 Static IP**）。
+
+##### 11.11 Current Gate
+
+| 階段 | 狀態 |
+|---|---|
+| Phase 6.9 | FIRST LIVE RETRY HOLD |
+| Phase 6.10 Core | COMPLETE |
+| Phase 6.10-A | COMPLETE |
+| Phase 6.10-A1 | COMPLETE |
+| Phase 6.10-B1 | COMPLETE |
+| Phase 6.10-B1.5 | COMPLETE |
+| Phase 6.10-B1.6 | COMPLETE / BLOCKER CONFIRMED |
+| Phase 6.10-B1.7 | **DEFERRED / NOT VERIFIED** |
+| Phase 6.10-B2 OFFLINE | **COMPLETE** |
+| Phase 6.10-B2 LIVE | **NOT STARTED / BLOCKED** |
+| Phase 6.10-C OFFLINE | **COMPLETE** |
+| Phase 6.10-C LIVE DEPLOYMENT | **NOT STARTED / BLOCKED** |
+
+```
+Live blockers
+  NETWORK_IDENTITY_STABILITY   NOT VERIFIED
+  DHCP Reservation             NOT CONFIRMED
+  Remote deployed guard        B1（pause / restore = REFUSED）
+  retry_backoff_sec            UNRESOLVED
+  service_health_timeout_sec   UNRESOLVED
+  FIRST LIVE                   HOLD
+```
+
+FIRST LIVE / unattended live 之前，**必須**重新補做 B1.7，或以其他經驗證的
+stable network identity 方案解除此 blocker。
+
+B1.7 通過後才進 B2；即使進 B2，仍先維持 `DISPATCH_ENABLED = False` /
+`MODE = DRY_RUN`，先驗證 pause / restore 安全成立，再做 Controlled FIRST LIVE
+5 kW，之後才考慮 Phase 6.10-C Unattended Service，最後才可能
+`MODE = ARMED` / `DISPATCH_ENABLED = True`。
+
+##### 11.13 Phase 6.10-B2 — OFFLINE DEVELOPMENT / TEST ONLY
+
+B2 的程式與離線測試已完成；**實機 pause / restore 未授權，guard 亦未部署**。
+
+**HandoffRunner** —— 依 §11.9 的 12 步驅動整個交接，全部相依由注入取得：
+
+```
+1 PRE_PAUSE_PREFLIGHT   11 項；刻意**不含** authority_idle / pcs_idle /
+                        no_external_controller（以 PRE_PAUSE_MUST_NOT_REQUIRE
+                        常數固定，回歸直接驗）
+2 PAUSE                 送出後 restore_responsibility = True
+3+4 SETTLING/STABLE_VERIFY  由 PauseVerifier 以已核准參數驅動
+5 OWNERSHIP = NEITHER
+6 POST_PAUSE_PRECHECK   **這一階段才**要求那三項，且不得沿用 Step 1
+7 FIRST LIVE            受 DISPATCH_ENABLED 擋下（目前恆為 False）
+8~9 VERIFY / RELEASE
+10~12 RESTORE / RESTORE_VERIFY / COMPLETE
+```
+
+🔴 **不存在「漏歸還」的路徑** —— 只要 Step 2 曾成功，之後任一失敗都由統一的
+`_bail()` 導向歸還流程。離線測試涵蓋 Step 6 失敗、STABLE_VERIFY 期間出現
+external evidence、probe 異常三種情境，三者皆確認仍送出 restore。
+
+🔴 **restore 失敗（送不出或 loop 未恢復）→ `RESTORE_FAILED_CRITICAL`，
+且恢復責任不解除。**
+
+**Remote Guard B2** —— 已實作 `pause` / `restore` 兩個動詞，沿用 B1 全部強化，
+且兩者**皆必須先通過** `require_single_screen` 與 `require_identity`
+（B1 的 `probe` 刻意不強制，因為 probe 本就是用來診斷當下狀態；但控制動詞不同 ——
+對身分不確定的目標送控制指令不可接受）。
+
+```
+DEPLOYED_GUARD_VARIANT = "B1"    ← 遠端實際部署仍是唯讀動詞版本
+```
+
+模組中存在 `REMOTE_GUARD_B2_SH` **不代表已部署**。部署需另行授權，且必須
+REPLACE `authorized_keys` 的既有條目。
+
+##### 11.14 Phase 6.10-C — Unattended Service
+
+```
+Phase 6.10-C OFFLINE           COMPLETE
+Phase 6.10-C LIVE DEPLOYMENT   NOT STARTED / BLOCKED
+SERVICE_MAIN_LOOP              IMPLEMENTED / OFFLINE VERIFIED
+```
+
+**主迴圈**
+
+```
+BOOT → RECOVER → STARTUP GATES → OBSERVE → EVALUATE ELIGIBILITY
+     → HANDOFF RUNNER → AUDIT → LOOP
+```
+
+只有 `recovery = CLEAN` 才可進入正常 observation loop。
+
+**Startup Recovery**
+
+```
+CLEAN            → 允許正常 loop
+PENDING_RESTORE  → 禁止新 handoff，承接既有 restore responsibility
+CRITICAL         → 拒絕 live operation
+UNKNOWN          → Fail Closed
+```
+
+🔴 Windows reboot / Service restart **不得**把 ownership 或 restore
+responsibility 重設為 IDLE / NONE。
+
+**Live Gate（10 項，任一不成立即 REFUSED）**
+
+```
+MODE == ARMED                       DISPATCH_ENABLED == True
+NETWORK_IDENTITY_STABILITY == PASS  REMOTE_GUARD_VARIANT == B2
+pause capability == PASS            restore capability == PASS
+recovery == CLEAN                   local data fresh
+remote probe fresh                  FIRST LIVE prerequisite satisfied
+```
+
+現場實況：
+
+```
+DISPATCH_ENABLED           False
+MODE                       DRY_RUN
+NETWORK_IDENTITY_STABILITY NOT VERIFIED
+DEPLOYED_GUARD_VARIANT     B1
+pause_capable              False
+restore_capable            False
+FIRST LIVE                 HOLD
+→ live_handoff_allowed 必定 False
+```
+
+⚠️ `remote_pause_capable()` / `remote_restore_capable()` 依**實際部署的 guard
+版本**判定 —— 原始碼中存在 `REMOTE_GUARD_B2_SH` 不代表現場具備 B2 能力。
+
+**Single Instance**
+
+只允許單一 unattended orchestrator。判斷**不只使用 PID**，而是
+`pid` + `boot_id` + `cmdline` 三者確認，並處理四種情境：
+
+```
+stale PID              前行程已死          → 可接手
+PID reuse              PID 活著但 cmdline 不符 → 視為 stale，可接手
+peer liveness unknown  死活不可知          → 拒絕啟動（不假設已死）
+corrupt lock           lock 檔損毀         → 拒絕啟動
+```
+
+第二 instance 不得啟動，且**不寫入 `SERVICE_START`**。
+production 應改用本專案既有的 Windows Named Mutex 機制（可注入）。
+
+**Durable Journal**
+
+append-only JSONL，必要事件八種：
+
+```
+SERVICE_START / SERVICE_SHUTDOWN / RECOVERY_RESULT / ELIGIBILITY_DECISION
+HANDOFF_BEGIN / PHASE6_TAKEOVER / PHASE6_RELEASE / CRITICAL_FAILURE
+```
+
+加上既有的 pause / restore `INTENT` / `OUTCOME`。restart 不清除、seq 單調遞增、
+partial tail 可容忍，且**不得因資料不足而猜測 ownership**。
+
+**Restore Responsibility**
+
+只要 external pause **可能已發生**，責任就必須保留到 `RESTORED`。
+exception / process crash / Windows reboot / service restart / SSH failure
+都不得讓責任消失。
+
+🔴 **本輪修正的真實缺陷**
+
+crash 若發生在「PAUSE INTENT 已 durable」但「STATE 尚未寫入」之間，
+舊 `recover()` 的 `last_state()` 會回 `None` → **可能誤判 CLEAN**，
+服務照常啟動，但 external 其實可能已被暫停。
+
+已新增 `_has_unresolved_pause()`：只要存在 PAUSE `INTENT` 且其後沒有成功的
+RESTORE `OUTCOME`，即視為可能仍背負責任，再配合 remote probe 判為
+`PENDING_RESTORE` / `CLEAN` / `UNKNOWN` —— **不得直接假設 CLEAN**。
+此修正已由 crash tests 驗證（八個切點）。
+
+**Graceful Shutdown**
+
+```
+無 responsibility                        → CLEAN
+Phase6 active → release → verify idle
+  → restore external → verify loop resumed → CLEAN
+restore 送不出 / loop 未恢復              → RESTORE_FAILED_CRITICAL
+```
+
+🔴 **不得記成 clean shutdown。** DRY_RUN 下若 journal 顯示存在真實 restore
+responsibility，因禁止實機 sender，**也不得假裝已成功 restore** ——
+同樣判為 CRITICAL。
+
+**Crash Recovery**
+
+八個切點皆驗證：pause INTENT 後 / pause success 後 / SETTLING /
+STABLE_VERIFY / PHASE6_ACTIVE / PHASE6_RELEASED / restore INTENT 後 /
+restore outcome 未落盤。每一個都 boot REFUSED、承接責任，且
+**pause / restore sender 呼叫數皆為 0（不盲目重送）**。
+
+**DRY_RUN E2E**
+
+```
+boot READY → 5 loop ticks → shutdown CLEAN
+pause sender = 0 / restore sender = 0 / dispatcher = 0
+```
+
+即使 `eligibility = True`，只要 `live_handoff_allowed = False` 仍為 `NO_HANDOFF`
+—— 兩層判定彼此獨立。
+
+**Scheduling**
+
+無硬編碼 `00:05` / `00:15` / `00:30`（AST 排除 docstring 後掃 HH:MM，
+兩個模組命中皆為 0）。eligibility 一律由 Asia/Taipei TOU、fresh SOC、
+Natural Decision、Authority、PCS、Meter、fault/alarm 決定。
+**歷史 operational window 不得成為 production schedule。**
+
+**Polling / Backoff**
+
+```
+decision_interval_sec       30.0     沿用既有已核准 production 值
+retry_backoff_sec           None     RETRY_BACKOFF = UNRESOLVED
+service_health_timeout_sec  None     SERVICE_HEALTH_TIMEOUT = UNRESOLVED
+```
+
+後兩者目前沒有足夠 field evidence 支持 production 數值，因此**刻意留 None
+並列入 `missing()`**，不自行填值。它們不是 C Offline 的完成 blocker，
+但屬於 **C Live Deployment 前待定的 production parameters**。
+
+**Critical States**
+
+```
+OWNERSHIP_CONFLICT_CRITICAL / RESTORE_FAILED_CRITICAL
+RECOVERY_UNKNOWN            / REMOTE_IDENTITY_MISMATCH
+```
+
+共同規則：禁止 new handoff、禁止 blind retry control、寫 durable critical
+event、Fail Closed。
+
+**測試**
+
+| 測試 | 結果 |
+|---|---|
+| `test_phase6_610c_service.py` | 102 / 102 PASS |
+| `test_phase6_610b2_handoff_runner.py` | 77 / 77 PASS |
+| `test_phase6_610a_remote_adapter.py` | 83 / 83 PASS |
+| `test_phase6_610_handoff.py` | 145 / 145 PASS |
+| **Phase 6 full regression** | **3694 / 3694 PASS，39 檔，0 FAIL 檔** |
+
+**Live Deployment Blockers**
+
+```
+NETWORK_IDENTITY_STABILITY   NOT VERIFIED（B1.7 DEFERRED）
+DHCP Reservation             NOT CONFIRMED
+Deployed remote guard        B1 —— pause / restore = REFUSED
+retry_backoff_sec            UNRESOLVED
+service_health_timeout_sec   UNRESOLVED
+FIRST LIVE                   HOLD（外部控制程式仍在運行）
+```
+
+以上任一未解除，`live_handoff_allowed()` 即為 False。
+**不得**以「離線測試全過」為由部署為常駐服務。
+
+**本輪安全狀態**
+
+```
+DISPATCH_ENABLED   False              MODE            DRY_RUN
+Windows Task       未建立              Service / NSSM  未安裝、未啟動
+實機 Phase 6       CHARGE / DISCHARGE / STOP = 0 / 0 / 0
+External           stop / start / pause / restore = 0 / 0 / 0 / 0
+```
+
+##### 11.15 Current Safety State
+
+```
+Remote Guard          probe / loopcheck / status = ENABLED
+                      pause / restore            = REFUSED
+DISPATCH_ENABLED      False
+MODE                  DRY_RUN
+PAUSE_AUTHORIZATION   NOT GRANTED
+FIRST LIVE RETRY      HOLD
+
+實機 Phase 6          CHARGE / DISCHARGE / STOP = 0 / 0 / 0
+External              stop / start              = 0 / 0
+```
+
+</details>
