@@ -611,10 +611,12 @@ def test_15_no_real_ssh():
         tr.run(v)
     check(f"★★ 本輪唯一被呼叫的「外部」是注入的假 runner（{len(r.calls)} 次）",
           len(r.calls) == len(RA.GUARD_ALLOWED_VERBS))
-    check("  部署中的 guard 仍是 B1（pause / restore 在現場會被拒）",
-          RA.DEPLOYED_GUARD_VARIANT == "B1"
-          and not RA.guard_b1_would_accept("pause")
-          and not RA.guard_b1_would_accept("restore"))
+    check("  部署中的 guard 為 B2（allowlist 含五個動詞）",
+          RA.DEPLOYED_GUARD_VARIANT == "B2"
+          and RA.guard_b2_would_accept("pause")
+          and RA.guard_b2_would_accept("restore"))
+    check("★★ 但本模組仍不可能真的送出 —— senders 預設未武裝",
+          RA.RemoteSenders().armed is False)
 
 
 # ======================================================================
@@ -622,7 +624,16 @@ def test_15_no_real_ssh():
 # ======================================================================
 def test_16_taxonomy():
     print("\n[16] timeout result taxonomy")
-    check("  outcome 詞彙共 7 種", len(RA.SSH_OUTCOMES) == 7)
+    # 🔴 先驗語意、再驗數量 —— 數量只是輔助，語意才是契約
+    check("★★ 四種 guard 端拒絕皆為獨立 outcome（未互相合併）",
+          len({RA.SSH_REFUSED, RA.SSH_GUARD_MISSING,
+               RA.SSH_GUARD_AMBIGUOUS, RA.SSH_GUARD_IDENTITY}) == 4)
+    check("★★ 四者皆屬 DEFINITELY_NOT_EXECUTED",
+          all(x in RA.SSH_DEFINITELY_NOT_EXECUTED
+              for x in (RA.SSH_REFUSED, RA.SSH_GUARD_MISSING,
+                        RA.SSH_GUARD_AMBIGUOUS, RA.SSH_GUARD_IDENTITY)))
+    check("  outcome 詞彙共 10 種（輔助檢查）", len(RA.SSH_OUTCOMES) == 10)
+    check("  無重複詞彙", len(set(RA.SSH_OUTCOMES)) == len(RA.SSH_OUTCOMES))
     check("★★ 不存在把一切壓成一個值的 REMOTE_FAILED",
           not hasattr(RA, "REMOTE_FAILED"))
     check("★★ CONNECT_TIMEOUT 屬於「可斷定未執行」",
@@ -652,6 +663,245 @@ def test_16_taxonomy():
 
 
 # ======================================================================
+# 16b. exit 44 / 45 —— field-discovered correctness gap（2026-09-07）
+# ======================================================================
+def test_16b_guard_refusal_exit_codes():
+    print("\n[16b] guard exit 44 / 45 = DEFINITELY NOT EXECUTED")
+
+    class R(object):
+        """回固定 exit code 的假 runner；記錄是否被呼叫。"""
+
+        def __init__(self, code):
+            self.code = code
+            self.calls = []
+
+        def __call__(self, verb, c, x):
+            self.calls.append(verb)
+            return {"exit_code": self.code, "stdout": ""}
+
+    def run(code, verb="pause"):
+        to = RA.SshTimeouts(
+            connect_timeout_sec=FX_CONNECT,
+            command_timeouts=dict(FX_CMD))
+        return RA.SshTransport(timeouts=to, runner=R(code),
+                               armed=True).run(verb)
+
+    check("  exit 43 有具名常數", RA.GUARD_EXIT_MISSING == 43)
+    check("  exit 44 有具名常數", RA.GUARD_EXIT_AMBIGUOUS == 44)
+    check("  exit 45 有具名常數", RA.GUARD_EXIT_IDENTITY == 45)
+
+    # ---- exit 43 ----
+    m = run(RA.GUARD_EXIT_MISSING)
+    check("★★ exit 43 → SSH_GUARD_MISSING（不再壓成 SSH_ERROR）",
+          m.outcome == RA.SSH_GUARD_MISSING)
+    check("★★ exit 43 屬於 DEFINITELY_NOT_EXECUTED",
+          RA.SSH_GUARD_MISSING in RA.SSH_DEFINITELY_NOT_EXECUTED)
+    check("★★ exit 43 → SEND_NOT_SENT",
+          RA.classify_send_outcome(m) == RA.SEND_NOT_SENT)
+    check("  exit 43 非 uncertain、非 timed_out",
+          RA.SSH_GUARD_MISSING not in RA.SSH_OUTCOME_UNCERTAIN
+          and not m.uncertain and not m.timed_out)
+    check("★★ exit 43 與 exit 42 未被合併（語意不同）",
+          m.outcome != run(RA.GUARD_EXIT_REFUSED).outcome
+          and RA.SSH_GUARD_MISSING != RA.SSH_REFUSED)
+    check("  exit 42 仍為 SSH_REFUSED / NOT_SENT",
+          run(RA.GUARD_EXIT_REFUSED).outcome == RA.SSH_REFUSED
+          and RA.classify_send_outcome(
+              run(RA.GUARD_EXIT_REFUSED)) == RA.SEND_NOT_SENT)
+
+    a = run(RA.GUARD_EXIT_AMBIGUOUS)
+    i = run(RA.GUARD_EXIT_IDENTITY)
+    check("★★ exit 44 → SSH_GUARD_AMBIGUOUS（不再壓成 SSH_ERROR）",
+          a.outcome == RA.SSH_GUARD_AMBIGUOUS)
+    check("★★ exit 45 → SSH_GUARD_IDENTITY（不再壓成 SSH_ERROR）",
+          i.outcome == RA.SSH_GUARD_IDENTITY)
+    check("★★ exit 44 屬於 DEFINITELY_NOT_EXECUTED",
+          RA.SSH_GUARD_AMBIGUOUS in RA.SSH_DEFINITELY_NOT_EXECUTED)
+    check("★★ exit 45 屬於 DEFINITELY_NOT_EXECUTED",
+          RA.SSH_GUARD_IDENTITY in RA.SSH_DEFINITELY_NOT_EXECUTED)
+    check("★★ 兩者都**不**屬於 uncertain",
+          RA.SSH_GUARD_AMBIGUOUS not in RA.SSH_OUTCOME_UNCERTAIN
+          and RA.SSH_GUARD_IDENTITY not in RA.SSH_OUTCOME_UNCERTAIN)
+    check("★★ exit 44 → SEND_NOT_SENT",
+          RA.classify_send_outcome(a) == RA.SEND_NOT_SENT)
+    check("★★ exit 45 → SEND_NOT_SENT",
+          RA.classify_send_outcome(i) == RA.SEND_NOT_SENT)
+    check("  兩者仍區分得開（診斷用途不被合併）",
+          RA.SSH_GUARD_AMBIGUOUS != RA.SSH_GUARD_IDENTITY
+          and a.detail != i.detail)
+    check("  兩者皆非 timed_out、非 uncertain",
+          not a.timed_out and not a.uncertain
+          and not i.timed_out and not i.uncertain)
+
+    # 🔴 真正結果不明的路徑一律不得被這次修正波及
+    t41 = run(RA.GUARD_EXIT_TIMEOUT)
+    check("★★ exit 41 仍為 SSH_COMMAND_TIMEOUT",
+          t41.outcome == RA.SSH_COMMAND_TIMEOUT)
+    check("★★ exit 41 仍為 SEND_UNKNOWN（未被改成 NOT_SENT）",
+          RA.classify_send_outcome(t41) == RA.SEND_UNKNOWN)
+    check("★★ client command timeout 仍為 SEND_UNKNOWN",
+          RA.classify_send_outcome(
+              transport(Runner({"pause": "command_timeout"}),
+                        armed=True).run("pause")) == RA.SEND_UNKNOWN)
+    check("★★ 未知 exit code 仍保守判 UNKNOWN",
+          RA.classify_send_outcome(run(99)) == RA.SEND_UNKNOWN
+          and run(99).outcome == RA.SSH_ERROR)
+    check("  SSH_COMMAND_TIMEOUT 仍是唯一的 uncertain outcome",
+          RA.SSH_OUTCOME_UNCERTAIN == (RA.SSH_COMMAND_TIMEOUT,))
+    check("  兩個集合仍互斥",
+          not (set(RA.SSH_DEFINITELY_NOT_EXECUTED)
+               & set(RA.SSH_OUTCOME_UNCERTAIN)))
+
+    # ---- orchestrator：pause exit 45 不得建立 restore responsibility ----
+    d = tmpdir()
+    j = HO.Journal(path=os.path.join(d, "j.jsonl"))
+    to = RA.SshTimeouts(connect_timeout_sec=FX_CONNECT,
+                        command_timeouts=dict(FX_CMD))
+    sd = RA.RemoteSenders(
+        transport=RA.SshTransport(timeouts=to,
+                                  runner=R(RA.GUARD_EXIT_IDENTITY),
+                                  armed=True), armed=True)
+    o = HO.HandoffOrchestrator(
+        remote=HO.RemoteController(pause_sender=sd.pause,
+                                   restore_sender=sd.restore),
+        observe=(lambda: smp()), gates=(lambda x: (True, {})), journal=j,
+        mode=HO.MODE_ARMED, idle_baseline_kw=-3.0, power_tolerance_kw=0.0)
+    o._to(HO.S_PREFLIGHT)
+    o._to(HO.S_PAUSE_REQUESTED)
+    sent, why = o.request_pause()
+    check("★★ pause 遇 exit 45 → 不是 SEND_OUTCOME_UNKNOWN_MUST_PROBE",
+          sent is False and why != "SEND_OUTCOME_UNKNOWN_MUST_PROBE")
+    outs = [x for x in j.read_all()
+            if x.get("kind") == "OUTCOME" and x.get("step") == "PAUSE"]
+    check("★★ journal 記為 ok=False（明確未送出），**不是** None",
+          len(outs) == 1 and outs[0].get("ok") is False)
+    check("★★ send_outcome 記為 NOT_SENT",
+          outs[0].get("send_outcome") == RA.SEND_NOT_SENT)
+
+    # runner 層：不得進入 PAUSE_OUTCOME_UNKNOWN、不得背責任
+    d2 = tmpdir()
+    j2 = HO.Journal(path=os.path.join(d2, "j.jsonl"))
+    sd2 = RA.RemoteSenders(
+        transport=RA.SshTransport(timeouts=to,
+                                  runner=R(RA.GUARD_EXIT_IDENTITY),
+                                  armed=True), armed=True)
+    o2 = HO.HandoffOrchestrator(
+        remote=HO.RemoteController(pause_sender=sd2.pause,
+                                   restore_sender=sd2.restore),
+        observe=(lambda: smp()), gates=(lambda x: (True, {})), journal=j2,
+        mode=HO.MODE_ARMED, idle_baseline_kw=-3.0, power_tolerance_kw=0.0)
+    r2 = HO.HandoffRunner(o2, (lambda: smp()), (lambda: probe_dict()),
+                          loop_mark_source=(lambda: "2026-09-07 10:00:00"),
+                          config=HO.HandoffConfig, soc_max_pct=85.0,
+                          sleeper=(lambda x: None))
+    res = r2.run()
+    check(f"★★ handoff 結果 = {res['outcome']}（非 PAUSE_OUTCOME_UNKNOWN）",
+          res["outcome"] != "PAUSE_OUTCOME_UNKNOWN")
+    check("★★ **不建立** restore responsibility",
+          res["restore_responsibility"] is False)
+    check("  狀態未進入 PAUSE_OUTCOME_UNKNOWN",
+          o2.state != HO.S_PAUSE_OUTCOME_UNKNOWN)
+
+    # ---- restore exit 45 不得宣稱已執行 ----
+    d3 = tmpdir()
+    j3 = HO.Journal(path=os.path.join(d3, "j.jsonl"))
+    sd3 = RA.RemoteSenders(
+        transport=RA.SshTransport(timeouts=to,
+                                  runner=R(RA.GUARD_EXIT_IDENTITY),
+                                  armed=True), armed=True)
+    o3 = HO.HandoffOrchestrator(
+        remote=HO.RemoteController(pause_sender=sd3.pause,
+                                   restore_sender=sd3.restore),
+        observe=(lambda: smp()), gates=(lambda x: (True, {})), journal=j3,
+        mode=HO.MODE_ARMED, idle_baseline_kw=-3.0, power_tolerance_kw=0.0)
+    o3._to(HO.S_PREFLIGHT)
+    o3._to(HO.S_PAUSE_REQUESTED)
+    o3._to(HO.S_RESTORE_REQUESTED)
+    rsent, rwhy = o3.request_restore()
+    check("★★ restore 遇 exit 45 → 未送出（不得宣稱已執行）", rsent is False)
+    check("★★ 且不是 UNKNOWN 路徑（明確未送出）",
+          rwhy != "SEND_OUTCOME_UNKNOWN_MUST_PROBE")
+    routs = [x for x in j3.read_all()
+             if x.get("kind") == "OUTCOME" and x.get("step") == "RESTORE"]
+    check("★★ restore OUTCOME 記為 ok=False，send_outcome=NOT_SENT",
+          len(routs) == 1 and routs[0].get("ok") is False
+          and routs[0].get("send_outcome") == RA.SEND_NOT_SENT)
+
+    # ---- pause / restore 遇 exit 43 ----
+    d5 = tmpdir()
+    j5 = HO.Journal(path=os.path.join(d5, "j.jsonl"))
+    sd5 = RA.RemoteSenders(
+        transport=RA.SshTransport(timeouts=to,
+                                  runner=R(RA.GUARD_EXIT_MISSING),
+                                  armed=True), armed=True)
+    o5 = HO.HandoffOrchestrator(
+        remote=HO.RemoteController(pause_sender=sd5.pause,
+                                   restore_sender=sd5.restore),
+        observe=(lambda: smp()), gates=(lambda x: (True, {})), journal=j5,
+        mode=HO.MODE_ARMED, idle_baseline_kw=-3.0, power_tolerance_kw=0.0)
+    r5 = HO.HandoffRunner(o5, (lambda: smp()), (lambda: probe_dict()),
+                          loop_mark_source=(lambda: "2026-09-07 10:00:00"),
+                          config=HO.HandoffConfig, soc_max_pct=85.0,
+                          sleeper=(lambda x: None))
+    res5 = r5.run()
+    check("★★ pause 遇 exit 43 → **不建立** restore responsibility",
+          res5["restore_responsibility"] is False)
+    check("★★ pause 遇 exit 43 → 不進 PAUSE_OUTCOME_UNKNOWN",
+          res5["outcome"] != "PAUSE_OUTCOME_UNKNOWN"
+          and o5.state != HO.S_PAUSE_OUTCOME_UNKNOWN)
+    p5 = [x for x in j5.read_all()
+          if x.get("kind") == "OUTCOME" and x.get("step") == "PAUSE"]
+    check("★★ pause exit 43 journal：ok=False / NOT_SENT",
+          len(p5) == 1 and p5[0].get("ok") is False
+          and p5[0].get("send_outcome") == RA.SEND_NOT_SENT)
+
+    d6 = tmpdir()
+    j6 = HO.Journal(path=os.path.join(d6, "j.jsonl"))
+    sd6 = RA.RemoteSenders(
+        transport=RA.SshTransport(timeouts=to,
+                                  runner=R(RA.GUARD_EXIT_MISSING),
+                                  armed=True), armed=True)
+    o6 = HO.HandoffOrchestrator(
+        remote=HO.RemoteController(pause_sender=sd6.pause,
+                                   restore_sender=sd6.restore),
+        observe=(lambda: smp()), gates=(lambda x: (True, {})), journal=j6,
+        mode=HO.MODE_ARMED, idle_baseline_kw=-3.0, power_tolerance_kw=0.0)
+    o6._to(HO.S_PREFLIGHT)
+    o6._to(HO.S_PAUSE_REQUESTED)
+    o6._to(HO.S_RESTORE_REQUESTED)
+    rs6, rw6 = o6.request_restore()
+    r6out = [x for x in j6.read_all()
+             if x.get("kind") == "OUTCOME" and x.get("step") == "RESTORE"]
+    check("★★ restore 遇 exit 43 → 未送出，且不宣稱已執行",
+          rs6 is False and rw6 != "SEND_OUTCOME_UNKNOWN_MUST_PROBE")
+    check("★★ restore exit 43 journal：ok=False / NOT_SENT",
+          len(r6out) == 1 and r6out[0].get("ok") is False
+          and r6out[0].get("send_outcome") == RA.SEND_NOT_SENT)
+
+    # ---- exit 41 對照組：仍必須背責任 ----
+    d4 = tmpdir()
+    j4 = HO.Journal(path=os.path.join(d4, "j.jsonl"))
+    sd4 = RA.RemoteSenders(
+        transport=RA.SshTransport(timeouts=to,
+                                  runner=R(RA.GUARD_EXIT_TIMEOUT),
+                                  armed=True), armed=True)
+    o4 = HO.HandoffOrchestrator(
+        remote=HO.RemoteController(pause_sender=sd4.pause,
+                                   restore_sender=sd4.restore),
+        observe=(lambda: smp()), gates=(lambda x: (True, {})), journal=j4,
+        mode=HO.MODE_ARMED, idle_baseline_kw=-3.0, power_tolerance_kw=0.0)
+    r4 = HO.HandoffRunner(o4, (lambda: smp()), (lambda: probe_dict()),
+                          loop_mark_source=(lambda: "2026-09-07 10:00:00"),
+                          config=HO.HandoffConfig, soc_max_pct=85.0,
+                          sleeper=(lambda x: None))
+    res4 = r4.run()
+    check("★★ 對照組：exit 41 仍走 PAUSE_OUTCOME_UNKNOWN",
+          res4["outcome"] == "PAUSE_OUTCOME_UNKNOWN")
+    check("★★ 對照組：exit 41 仍**建立** restore responsibility",
+          res4["restore_responsibility"] is True)
+
+
+# ======================================================================
 # 17. 值仍為 UNRESOLVED
 # ======================================================================
 def test_17_unresolved():
@@ -669,8 +919,9 @@ def test_17_unresolved():
     check("  C1 的兩項則已定案（對照組）",
           SVC.ServiceTiming().missing() == [])
     check("  DISPATCH_ENABLED 仍為 False", HO.DISPATCH_ENABLED is False)
-    check("  NETWORK_IDENTITY_STABILITY 仍為 NOT_VERIFIED",
-          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_NOT_VERIFIED)
+    check("  NETWORK_IDENTITY_STABILITY 為 ACCEPTED（非 PASS，非 field verified）",
+          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_ACCEPTED
+          and SVC.NETWORK_IDENTITY_STABILITY != SVC.NET_PASS)
 
 
 # ======================================================================
@@ -679,7 +930,8 @@ def main():
                test_4_5_readonly_timeout, test_6_loopcheck,
                test_7_8_pause_timeout, test_9_10_restore_timeout,
                test_11_12_13_dry_run, test_14_no_magic, test_15_no_real_ssh,
-               test_16_taxonomy, test_17_unresolved):
+               test_16_taxonomy, test_16b_guard_refusal_exit_codes,
+               test_17_unresolved):
         fn()
     import shutil
     for d in _TMP:

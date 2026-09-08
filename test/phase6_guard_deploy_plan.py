@@ -18,7 +18,9 @@ phase6_guard_deploy_plan.py — Phase 6.10-C4.6/C4.7/C4.8 部署與回滾套件
    先靠唯讀的 probe capability metadata 確認兩者「存在」；真正送出
    pause / restore 留給受控 handoff / FIRST LIVE。
 
-🔴 目前 `DEPLOYED_GUARD_VARIANT = B1`，本輪未部署、未修改 authorized_keys。
+🔴 2026-09-07：B2 已由使用者手動部署並通過唯讀驗證，
+   `DEPLOYED_GUARD_VARIANT = B2`。本模組仍只產生指令、不執行；
+   回滾件保留在 `phase6_guard_backup/`，`authorized_keys` 全程未修改。
 """
 import io
 import os

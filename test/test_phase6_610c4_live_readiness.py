@@ -234,10 +234,13 @@ def test_4_5_live_refused():
               cap.status == RA.CAP_REPORTED)
         ok, ch = RA.capability_gate(cap)
         check(f"★★ pause={pv} restore={rv} → capability gate FAIL", not ok)
-        check(f"  remote_pause_capable = {SVC.remote_pause_capable(cap)}",
-              SVC.remote_pause_capable(cap) is False)
-        check(f"  remote_restore_capable = {SVC.remote_restore_capable(cap)}",
-              SVC.remote_restore_capable(cap) is False)
+        # 本機已是 B2，因此每個動詞各自依 guard 的回報判定（不再一律 False）
+        check(f"  pause={pv} → remote_pause_capable = "
+              f"{SVC.remote_pause_capable(cap)}",
+              SVC.remote_pause_capable(cap) is (pv == "true"))
+        check(f"  restore={rv} → remote_restore_capable = "
+              f"{SVC.remote_restore_capable(cap)}",
+              SVC.remote_restore_capable(cap) is (rv == "true"))
         allowed, g = SVC.live_handoff_allowed(
             HO.MODE_ARMED, HO.R_CLEAN, True,
             {"screen_alive": True, "process_alive": True,
@@ -245,12 +248,18 @@ def test_4_5_live_refused():
             health=SVC.HEALTH_OK, capability=cap)
         check(f"★★ live_handoff_allowed = False", allowed is False)
 
-    # 🔴 即使 capability 全 true，本機仍記錄 B1 → 仍不放行
+    # 2026-09-07：現場已部署 B2，因此「本機紀錄 + guard 自報」兩個條件同時成立
     good = RA.parse_capability(base % ("true", "true"))
-    check("★★ capability 全 true 但本機部署紀錄仍是 B1 → 仍 False",
-          RA.DEPLOYED_GUARD_VARIANT == "B1"
-          and SVC.remote_pause_capable(good) is False
-          and SVC.remote_restore_capable(good) is False)
+    check("★★ 本機紀錄 B2 且 guard 自報 B2 全能力 → capability 條件成立",
+          RA.DEPLOYED_GUARD_VARIANT == "B2"
+          and SVC.remote_pause_capable(good) is True
+          and SVC.remote_restore_capable(good) is True)
+    check("★★ 但缺少 capability report 時仍 Fail Closed（雙重確認未被拿掉）",
+          SVC.remote_pause_capable(None) is False
+          and SVC.remote_restore_capable(None) is False)
+    check("★★ guard 自報 pause=false 時，本機是 B2 也不放行",
+          SVC.remote_pause_capable(
+              RA.parse_capability(base % ("false", "true"))) is False)
     check("★★ live gate 的 remote_guard_b2 不只看本機常數",
           SVC.live_handoff_allowed(HO.MODE_ARMED, HO.R_CLEAN, True,
                                    {"screen_alive": True,
@@ -456,14 +465,18 @@ def test_9_10_readiness():
     v, rows, blocked = SVC.live_readiness_report()
     check(f"★★ 目前 field checkpoint 下 LIVE_READINESS = {v}",
           v == SVC.BLOCKED)
-    check(f"  共列 {len(rows)} 項", len(rows) == len(SVC.READINESS_ITEMS) == 16)
+    # B1.7 裁示：network identity 拆成 狀態／佐證／DHCP／gate 四列（16 → 19）
+    check(f"  共列 {len(rows)} 項", len(rows) == len(SVC.READINESS_ITEMS) == 19)
     check("  項目與 READINESS_ITEMS 完全對應",
           [r["item"] for r in rows] == list(SVC.READINESS_ITEMS))
 
     got = {r["item"]: r["value"] for r in rows}
     expect = {
-        "NETWORK_IDENTITY_STABILITY": "NOT_VERIFIED",
-        "REMOTE_GUARD_VARIANT": "B1",
+        "NETWORK_IDENTITY_STABILITY": SVC.NET_ACCEPTED,
+        "NETWORK_IDENTITY_EVIDENCE": SVC.NET_EVIDENCE_USER_CONFIRMED,
+        "DHCP_RESERVATION": "NOT_VERIFIED",
+        "NETWORK_IDENTITY_GATE": "ALLOWED",
+        "REMOTE_GUARD_VARIANT": "B2",
         "REMOTE_CAPABILITY_REPORT": RA.CAP_NOT_REPORTED,
         "PAUSE_CAPABILITY": None,
         "RESTORE_CAPABILITY": None,
@@ -481,13 +494,22 @@ def test_9_10_readiness():
                                "STATUS_TIMEOUT", "LOOPCHECK_TIMEOUT")))
     check("  SERVICE_TIMING 已完成（C1 兩項已定案）",
           [r for r in rows if r["item"] == "SERVICE_TIMING"][0]["ok"] is True)
-    for k in ("NETWORK_IDENTITY_STABILITY", "REMOTE_GUARD_VARIANT",
-              "REMOTE_CAPABILITY_REPORT", "PAUSE_CAPABILITY",
+    for k in ("REMOTE_CAPABILITY_REPORT", "PAUSE_CAPABILITY",
               "RESTORE_CAPABILITY", "PAUSE_TIMEOUT_VERIFIED",
               "RESTORE_TIMEOUT_VERIFIED", "DISPATCH_ENABLED", "MODE",
               "FIRST_LIVE_PREREQUISITE"):
         check(f"  blocked 含 {k}", k in blocked)
-    check(f"★★ blocked 共 {len(blocked)} 項", len(blocked) == 11)
+    # B1.7 裁示：network identity 三列改為揭露用（non-blocking）
+    check("★★ network identity 三列**不再**列入 blocked",
+          not ({"NETWORK_IDENTITY_STABILITY", "NETWORK_IDENTITY_EVIDENCE",
+                "DHCP_RESERVATION"} & set(blocked)))
+    check("★★ 但仍如實列於 not-field-verified（未被隱藏）",
+          SVC.readiness_unverified(rows)
+          == ["NETWORK_IDENTITY_STABILITY", "NETWORK_IDENTITY_EVIDENCE",
+              "DHCP_RESERVATION"])
+    check("  REMOTE_GUARD_VARIANT 已通過（2026-09-07 B2 已部署）",
+          "REMOTE_GUARD_VARIANT" not in blocked)
+    check(f"★★ blocked 共 {len(blocked)} 項", len(blocked) == 9)
     txt = SVC.format_readiness(v, rows, blocked)
     check("  格式化輸出可讀且含 BLOCKED",
           "LIVE_READINESS = BLOCKED" in txt and "blocked reasons" in txt)
@@ -585,19 +607,29 @@ def test_12_13_dry_run():
         res = s.run(max_ticks=8)
         check(f"★★ {mode}: capability 全 true 也全部 NO_HANDOFF",
               all(r["decision"] == "NO_HANDOFF" for r in res))
-        check(f"  {mode}: capability gate 已放行（證明不是靠它擋的）",
-              res[0]["gates"]["pause_capable"] is False
-              and res[0]["gates"]["remote_guard_b2"] is False)
+        # B2 已部署且 probe 回報全能力 → 這三個 gate 現在會放行；
+        # 仍然 NO_HANDOFF，證明擋下來的是 mode / dispatch / first_live。
+        check(f"  {mode}: capability 三個 gate 已放行（不是靠它們擋的）",
+              res[0]["gates"]["remote_guard_b2"] is True
+              and res[0]["gates"]["pause_capable"] is True
+              and res[0]["gates"]["restore_capable"] is True)
+        check(f"★★ {mode}: 真正擋下的是 mode / dispatch / first_live",
+              res[0]["gates"]["mode_armed"] is False
+              and res[0]["gates"]["dispatch_enabled"] is False
+              and res[0]["gates"]["first_live_prerequisite"] is False)
+        check(f"  {mode}: network identity gate 已放行（也不是靠它擋的）",
+              res[0]["gates"]["network_identity_acceptable"] is True)
         check(f"★★ {mode}: pause / restore sender = 0",
               sd.pause_calls == 0 and sd.restore_calls == 0)
         check(f"★★ {mode}: dispatcher = 0", hits == [])
         check(f"  {mode}: shutdown CLEAN", s.shutdown()[0] == SVC.SHUTDOWN_CLEAN)
 
     check("★★ RemoteSenders 預設 armed = False", RA.RemoteSenders().armed is False)
-    check("  DEPLOYED_GUARD_VARIANT 仍為 B1（本輪未部署）",
-          RA.DEPLOYED_GUARD_VARIANT == "B1")
-    check("  NETWORK_IDENTITY_STABILITY 仍 NOT_VERIFIED",
-          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_NOT_VERIFIED)
+    check("  DEPLOYED_GUARD_VARIANT = B2（2026-09-07 已部署）",
+          RA.DEPLOYED_GUARD_VARIANT == "B2")
+    check("  NETWORK_IDENTITY_STABILITY = ACCEPTED（不是 PASS）",
+          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_ACCEPTED
+          and SVC.NETWORK_IDENTITY_STABILITY != SVC.NET_PASS)
 
 
 # ======================================================================

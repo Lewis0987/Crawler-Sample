@@ -253,10 +253,13 @@ def test_5_named():
     check("  未來 guard capability 欄位已記錄（6 項）",
           len(RA.FUTURE_GUARD_CAPABILITY_FIELDS) == 6
           and "capability_pause" in RA.FUTURE_GUARD_CAPABILITY_FIELDS)
-    check("★★ 但 deployed guard 未變更，仍是 B1",
-          RA.DEPLOYED_GUARD_VARIANT == "B1")
-    check("  B1 腳本內未出現 capability 回報欄位（確實沒改 guard）",
+    check("★★ deployed guard 已是 B2（C4 記錄的改善方向已落地）",
+          RA.DEPLOYED_GUARD_VARIANT == "B2")
+    check("  B1 腳本內仍無 capability 回報欄位（回滾後即回到未回報）",
           "capability_pause" not in RA.REMOTE_GUARD_B1_SH)
+    check("  B2 腳本以迴圈產生 capability 欄位（非逐項硬寫）",
+          "capability_$v=true" in RA.REMOTE_GUARD_B2_SH
+          and "capability_pause" not in RA.REMOTE_GUARD_B2_SH)
 
 
 # ======================================================================
@@ -302,10 +305,13 @@ def test_6_evidence():
 # ======================================================================
 def test_7_unchanged():
     print("\n[7] C3 不改變其他任何狀態")
-    check("★★ B1.7 相關：NETWORK_IDENTITY_STABILITY 仍 NOT_VERIFIED",
-          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_NOT_VERIFIED)
-    check("★★ DEPLOYED_GUARD_VARIANT 仍為 B1",
-          RA.DEPLOYED_GUARD_VARIANT == "B1")
+    check("★★ B1.7 相關：NETWORK_IDENTITY_STABILITY = ACCEPTED（不是 PASS）",
+          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_ACCEPTED
+          and SVC.NETWORK_IDENTITY_STABILITY != SVC.NET_PASS)
+    check("  DHCP Reservation 仍未驗證（C3 未改變此事實）",
+          SVC.DHCP_RESERVATION_VERIFIED is False)
+    check("★★ DEPLOYED_GUARD_VARIANT = B2",
+          RA.DEPLOYED_GUARD_VARIANT == "B2")
     check("★★ DISPATCH_ENABLED 仍為 False", HO.DISPATCH_ENABLED is False)
     check("★★ RemoteSenders 預設 armed = False",
           RA.RemoteSenders().armed is False)
@@ -317,10 +323,13 @@ def test_7_unchanged():
     check("  C1 兩項仍為 5.0 / 300.0",
           SVC.ServiceTiming().retry_backoff_sec == 5.0
           and SVC.ServiceTiming().service_health_timeout_sec == 300.0)
-    check("★★ C2 taxonomy 未被 C3 修改（7 種，COMMAND_TIMEOUT 仍 uncertain）",
-          len(RA.SSH_OUTCOMES) == 7
+    # 2026-09-07：taxonomy 擴充為 9 種（新增 exit 44 / 45），
+    # 但 COMMAND_TIMEOUT 的 uncertain 語意未被更動 —— 那才是這條斷言的重點。
+    check("★★ COMMAND_TIMEOUT 的 uncertain 語意未被更動（詞彙擴充為 10 種）",
+          len(RA.SSH_OUTCOMES) == 10
           and RA.SSH_COMMAND_TIMEOUT in RA.SSH_OUTCOME_UNCERTAIN
-          and RA.SSH_COMMAND_TIMEOUT not in RA.SSH_DEFINITELY_NOT_EXECUTED)
+          and RA.SSH_COMMAND_TIMEOUT not in RA.SSH_DEFINITELY_NOT_EXECUTED
+          and RA.SSH_OUTCOME_UNCERTAIN == (RA.SSH_COMMAND_TIMEOUT,))
     check("★★ 兩個 timeout 不確定狀態仍在 PENDING_RESTORE_STATES",
           HO.S_PAUSE_OUTCOME_UNKNOWN in HO.PENDING_RESTORE_STATES
           and HO.S_RESTORE_OUTCOME_UNKNOWN in HO.PENDING_RESTORE_STATES)

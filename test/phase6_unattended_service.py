@@ -36,11 +36,95 @@ import phase6_remote_adapter as RA
 # ======================================================================
 # 現場能力／驗證狀態（**事實登記**，不是可調旗標）
 # ======================================================================
+# ---- Network identity 三態（Phase 6.10-B1.7 裁示，2026-09-04）----
+# 🔴 **三個值意義完全不同，不得互相 alias。**
 NET_PASS = "PASS"
-NET_NOT_VERIFIED = "NOT_VERIFIED"
+"""Field verified —— 必須有完整實機 verification evidence（受控 reconnect /
+DHCP renew 後 IP、DHCP server、route/source、guard 三動詞全部重新成立）。
+**目前無人達到這個狀態。**"""
 
-# 🔴 B1.7 = DEFERRED / NOT VERIFIED。這裡如實記錄，**不得**寫成 PASS。
-NETWORK_IDENTITY_STABILITY = NET_NOT_VERIFIED
+NET_ACCEPTED = "ACCEPTED"
+"""User confirmed / deployment assumption accepted ——
+使用者接受目前的 source identity 作為此次 deployment 的前提。
+🔴 **不代表 DHCP Reservation 已驗證**，也不代表做過 reconnect 驗證。"""
+
+NET_NOT_VERIFIED = "NOT_VERIFIED"
+"""尚未驗證，也未被使用者接受。"""
+
+NETWORK_IDENTITY_STATES = (NET_PASS, NET_ACCEPTED, NET_NOT_VERIFIED)
+# 可放行 live handoff 的狀態。ACCEPTED 放行，但**不會**因此被印成 PASS。
+NETWORK_IDENTITY_ACCEPTABLE = frozenset({NET_PASS, NET_ACCEPTED})
+
+# 佐證來源 —— 與狀態分開記錄，避免「可部署」被讀成「已驗證」。
+NET_EVIDENCE_FIELD_VERIFIED = "FIELD_VERIFIED"
+NET_EVIDENCE_USER_CONFIRMED = "USER_CONFIRMED"
+NET_EVIDENCE_NONE = "NONE"
+
+# 🔴 2026-09-04 使用者裁示：接受 192.168.128.234 為目前 deployment 的
+#    固定 source identity。**這是使用者決策，不是量測結論。**
+NETWORK_IDENTITY_STABILITY = NET_ACCEPTED
+NETWORK_IDENTITY_EVIDENCE = NET_EVIDENCE_USER_CONFIRMED
+
+# 🔴 server-side reservation 證據**始終未取得**（本機無 RSAT DhcpServer 模組，
+#    亦無 IT 書面確認）。因此這一項獨立記錄為未驗證，
+#    **不得**寫成 PASS / FIELD VERIFIED，也不得被上面的 ACCEPTED 蓋掉。
+DHCP_RESERVATION_VERIFIED = False
+DHCP_RESERVATION_STATUS = "NOT_VERIFIED"
+DHCP_RESERVATION_NOTE = "NON_BLOCKING_BY_USER_DECISION"
+
+# ---- 重新驗證觸發條件 ----
+# 🔴 任一成立 → NETWORK_IDENTITY_STABILITY 必須退回 NET_NOT_VERIFIED，
+#    **不得**維持 ACCEPTED。ACCEPTED 是對「當下這組事實」的接受，
+#    事實一變，接受就失效。
+NETWORK_IDENTITY_REGRESSION_TRIGGERS = (
+    "ipv4_changed",          # Wi-Fi IPv4 不再是 192.168.128.234
+    "nic_changed",           # 出口網卡改變（例如改走有線）
+    "route_changed",         # 到 remote host 的 route / source IP 改變
+    "dhcp_policy_changed",   # DHCP server 或其配發策略改變
+    "wifi_source_changed",   # Wi-Fi SSID / MAC / 連線來源改變
+    "ssh_from_mismatch",     # authorized_keys 的 from= 不再符合實際 source
+)
+
+# B1.7 precheck 當時記錄的基準值，供未來比對（唯讀事實，不是可調參數）
+NETWORK_IDENTITY_BASELINE = {
+    "mac": "04-EC-D8-6A-46-4A",
+    "ipv4": "192.168.128.234",
+    "dhcp_server": "192.168.128.16",
+    "ssh_from": "192.168.128.234",
+    "interface": "Wi-Fi",
+}
+
+
+def network_identity_after_triggers(triggers):
+    """
+    給定已發生的觸發條件，回傳應有的 network identity 狀態。
+
+    🔴 任一觸發成立即 NET_NOT_VERIFIED —— 不接受「只變一點點所以還算數」。
+    🔴 未知的觸發名稱一律拒絕（不靜默忽略），否則打錯字會變成沒檢查。
+    """
+    fired = []
+    for t in (triggers or ()):
+        if t not in NETWORK_IDENTITY_REGRESSION_TRIGGERS:
+            raise ValueError("未知的觸發條件：%r" % (t,))
+        fired.append(t)
+    if fired:
+        return NET_NOT_VERIFIED, fired
+    return NETWORK_IDENTITY_STABILITY, []
+
+
+_USE_CURRENT = object()
+
+
+def network_identity_acceptable(state=_USE_CURRENT):
+    """
+    該狀態是否足以放行 live handoff。**ACCEPTED 放行，但不等於 PASS。**
+
+    🔴 不帶參數 = 用目前的模組常數；**明確傳入任何值**（包含 None）
+       一律照該值判定 —— 未知值即 Fail Closed。用 None 當「取預設」會讓
+       「拿不到狀態」被誤讀成「用目前狀態」，那正是最危險的一種放行。
+    """
+    st = NETWORK_IDENTITY_STABILITY if state is _USE_CURRENT else state
+    return st in NETWORK_IDENTITY_ACCEPTABLE
 
 # 🔴 FIRST LIVE 尚未完成
 FIRST_LIVE_PREREQUISITE_SATISFIED = False
@@ -183,7 +267,10 @@ class SingleInstanceGuard(object):
 # ======================================================================
 # C3/C4/C5. Live gates
 # ======================================================================
-LIVE_GATE_ITEMS = ("mode_armed", "dispatch_enabled", "network_identity_pass",
+LIVE_GATE_ITEMS = ("mode_armed", "dispatch_enabled",
+                   # 🔴 刻意**不叫** network_identity_pass —— ACCEPTED 也放行，
+                   #    用 "pass" 命名會讓讀者以為它代表 field verified。
+                   "network_identity_acceptable",
                    "remote_guard_b2", "pause_capable", "restore_capable",
                    "recovery_clean", "local_data_fresh", "remote_probe_fresh",
                    "first_live_prerequisite", "service_health_healthy")
@@ -194,13 +281,14 @@ def live_handoff_allowed(mode, recovery_verdict, local_fresh, remote_probe,
     """
     回傳 (allowed, checks)。**任一不成立即 False。**
 
-    🔴 `network_identity_pass` 直接讀模組常數 —— 目前為 NOT_VERIFIED，
-       因此無論其他條件如何，live handoff 一律 REFUSED。
+    🔴 `network_identity_acceptable` 直接讀模組常數。目前為 ACCEPTED
+       （使用者裁示），因此**這一項不再是 blocker**；但 live handoff 仍受
+       其餘十項限制，目前一律 REFUSED。
     """
     checks = {
         "mode_armed": mode == HO.MODE_ARMED,
         "dispatch_enabled": HO.DISPATCH_ENABLED is True,
-        "network_identity_pass": NETWORK_IDENTITY_STABILITY == NET_PASS,
+        "network_identity_acceptable": network_identity_acceptable(),
         # 🔴 不只看本機常數 —— 還要 guard 自己回報 variant=B2。
         "remote_guard_b2": (RA.DEPLOYED_GUARD_VARIANT == "B2"
                             and RA.capability_gate(capability)[1]
@@ -481,7 +569,10 @@ READY = "READY"
 BLOCKED = "BLOCKED"
 
 READINESS_ITEMS = (
-    "NETWORK_IDENTITY_STABILITY", "REMOTE_GUARD_VARIANT",
+    # 🔴 狀態 / 佐證 / DHCP / 放行 分成四列 —— 這樣「目前可部署」與
+    #    「DHCP Reservation 已 field verified」在報告上永遠分得開。
+    "NETWORK_IDENTITY_STABILITY", "NETWORK_IDENTITY_EVIDENCE",
+    "DHCP_RESERVATION", "NETWORK_IDENTITY_GATE", "REMOTE_GUARD_VARIANT",
     "REMOTE_CAPABILITY_REPORT", "PAUSE_CAPABILITY", "RESTORE_CAPABILITY",
     "SSH_CONNECT_TIMEOUT", "PROBE_TIMEOUT", "STATUS_TIMEOUT",
     "LOOPCHECK_TIMEOUT", "PAUSE_TIMEOUT_VERIFIED", "RESTORE_TIMEOUT_VERIFIED",
@@ -504,13 +595,39 @@ def live_readiness_report(capability=None, recovery_verdict=None,
     cg_ok, cg = RA.capability_gate(capability)
     cap = capability
 
-    def row(name, value, ok, note=None):
-        return {"item": name, "value": value, "ok": bool(ok), "note": note}
+    def row(name, value, ok, note=None, gating=True):
+        """
+        `ok`     這一列自己的判定（例如「是否 field verified」）
+        `gating` 這一列是否參與 live 阻塞判定
+
+        🔴 兩者刻意分開。network identity 的證據列 `ok=False`（確實還沒實機
+           驗證），但 `gating=False` —— 因為使用者已裁示接受，放行與否改由
+           `NETWORK_IDENTITY_GATE` 那一列決定。這樣「目前可部署」與
+           「DHCP Reservation 已 field verified」不會互相污染。
+        """
+        return {"item": name, "value": value, "ok": bool(ok),
+                "gating": bool(gating), "note": note}
 
     rows = [
+        # 🔴 這一列的 ok 代表「是否 field verified」，**不是**「是否放行」。
+        #    放行與否看下面的 NETWORK_IDENTITY_GATE。ACCEPTED 在這裡是 NO，
+        #    因為它確實還沒被實機驗證過 —— 不得印成 PASS。
         row("NETWORK_IDENTITY_STABILITY", NETWORK_IDENTITY_STABILITY,
             NETWORK_IDENTITY_STABILITY == NET_PASS,
-            "B1.7 受控 reconnect / DHCP renew 驗證"),
+            "field verified 需 B1.7 受控 reconnect / DHCP renew 實機驗證",
+            gating=False),
+        row("NETWORK_IDENTITY_EVIDENCE", NETWORK_IDENTITY_EVIDENCE,
+            NETWORK_IDENTITY_EVIDENCE == NET_EVIDENCE_FIELD_VERIFIED,
+            "USER_CONFIRMED = 使用者決策，非量測結論",
+            gating=False),
+        row("DHCP_RESERVATION", DHCP_RESERVATION_STATUS,
+            DHCP_RESERVATION_VERIFIED is True,
+            DHCP_RESERVATION_NOTE,
+            gating=False),
+        row("NETWORK_IDENTITY_GATE",
+            ("ALLOWED" if network_identity_acceptable() else "BLOCKED"),
+            network_identity_acceptable(),
+            "ACCEPTED 或 PASS 皆放行"),
         row("REMOTE_GUARD_VARIANT", RA.DEPLOYED_GUARD_VARIANT,
             RA.DEPLOYED_GUARD_VARIANT == "B2", "本機部署紀錄"),
         row("REMOTE_CAPABILITY_REPORT",
@@ -554,16 +671,31 @@ def live_readiness_report(capability=None, recovery_verdict=None,
         row("FIRST_LIVE_PREREQUISITE", FIRST_LIVE_PREREQUISITE_SATISFIED,
             FIRST_LIVE_PREREQUISITE_SATISFIED is True),
     ]
-    blocked = [r["item"] for r in rows if not r["ok"]]
+    blocked = [r["item"] for r in rows if r["gating"] and not r["ok"]]
     return (READY if not blocked else BLOCKED), rows, blocked
+
+
+def readiness_unverified(rows):
+    """尚未 field verified、但目前不阻塞的項目（供如實揭露，不可略去）。"""
+    return [r["item"] for r in rows if not r["gating"] and not r["ok"]]
 
 
 def format_readiness(verdict, rows, blocked):
     out = ["LIVE_READINESS = %s" % verdict, ""]
     for r in rows:
+        if not r["gating"]:
+            mark = "INFO"        # 揭露用，不參與阻塞判定
+        else:
+            mark = "OK" if r["ok"] else "NO"
         out.append("  %-4s %-28s %s%s"
-                   % ("OK" if r["ok"] else "NO", r["item"], r["value"],
+                   % (mark, r["item"], r["value"],
                       ("   # " + r["note"]) if r["note"] else ""))
+    unver = readiness_unverified(rows)
+    if unver:
+        out.append("")
+        out.append("  not field verified (non-blocking, %d):" % len(unver))
+        for u in unver:
+            out.append("    - %s" % u)
     if blocked:
         out.append("")
         out.append("  blocked reasons (%d):" % len(blocked))

@@ -1172,8 +1172,22 @@ def readonly_diagnosis_allowed(cap):
     return cap.status in (CAP_REPORTED, CAP_NOT_REPORTED)
 
 
-# 目前實際部署在遠端的版本（B1）。改動此常數不會改變遠端；部署需另行授權。
-DEPLOYED_GUARD_VARIANT = "B1"
+# 現場實際部署的版本。改動此常數**不會**改變遠端 —— 它只是本機紀錄，
+# 必須與現場一致才有意義。
+#
+# 2026-09-07 更新為 B2：使用者手動完成部署（backup
+# phase6_remote_guard.B1.20260904_130658.sh，sha256 4f7217cc…a8cb），
+# production guard sha256 = c68a39f5…4d78 / bash -n PASS /
+# etica:etica 700 5187，並由 Windows 端 STEP 8 四項唯讀驗證全部通過：
+#   probe      guard_variant=B2 + 五項 capability=true + identity 相符
+#   loopcheck  mark2 > mark1（external loop 仍在推進）
+#   status     status_injected
+#   xyzzy      REFUSED / exit 42（default deny 仍成立）
+#
+# 🔴 **B2 已部署 ≠ pause / restore 已 field tested。** 兩者實機執行次數
+#    仍為 0，`pause` / `restore` 的 command timeout 仍是 STRUCTURAL
+#    CANDIDATE、production 預設仍為 None。
+DEPLOYED_GUARD_VARIANT = "B2"
 
 
 def guard_b2_would_accept(verb):
@@ -1190,7 +1204,9 @@ GUARD_ALLOWED_VERBS = ("probe", "loopcheck", "status", "pause", "restore")
 GUARD_EXIT_OK = 0
 GUARD_EXIT_TIMEOUT = 41
 GUARD_EXIT_REFUSED = 42
-GUARD_EXIT_MISSING = 43
+GUARD_EXIT_MISSING = 43        # 未提供 verb（malformed invocation）
+GUARD_EXIT_AMBIGUOUS = 44      # require_single_screen 失敗（screen 數 != 1）
+GUARD_EXIT_IDENTITY = 45       # require_identity 失敗（pid/cwd/cmd 不符）
 
 
 def guard_would_accept(verb):
@@ -1267,13 +1283,35 @@ SSH_REFUSED = "SSH_REFUSED"                      # guard allowlist 拒絕 → �
 SSH_ERROR = "SSH_ERROR"                          # 其他非零 exit
 SSH_NOT_CONFIGURED = "SSH_NOT_CONFIGURED"        # timeout / runner 未提供
 
+# ---- 2026-09-07 field-discovered correctness gap ----
+# guard 的 `require_single_screen`（exit 44）與 `require_identity`（exit 45）
+# 都在任何 `screen -X stuff` **之前**就 exit，因此遠端**確定沒有執行**。
+# 舊版把它們併進 SSH_ERROR → SEND_UNKNOWN，會讓「明確沒送出」被當成
+# 「可能已送出」→ 無謂地背上 restore responsibility 且禁止重送。
+# 這是 correctness gap，不是放寬安全 —— 修正後仍然不會把任何
+# 真正結果不明的路徑改成「確定沒執行」。
+# field evidence：2026-09-07 15:25~15:30 共 30 次 status/loopcheck 取得 exit 45
+#（`IDENTITY: auto_control.py not running`），guard 一個字元都沒有注入。
+# 🔴 四種 guard 端拒絕**刻意不合併**，因為現場處置不同：
+#      42 SSH_REFUSED           verb 存在，但不在 allowlist
+#      43 SSH_GUARD_MISSING     verb 缺失 / malformed invocation
+#      44 SSH_GUARD_AMBIGUOUS   single-screen requirement failed
+#      45 SSH_GUARD_IDENTITY    controller identity requirement failed
+#    四者都在任何 `screen -X stuff` 之前 exit，因此**同屬確定未執行**。
+SSH_GUARD_MISSING = "SSH_GUARD_MISSING"          # exit 43：未提供 verb
+SSH_GUARD_AMBIGUOUS = "SSH_GUARD_AMBIGUOUS"      # exit 44：screen 數 != 1
+SSH_GUARD_IDENTITY = "SSH_GUARD_IDENTITY"        # exit 45：身分不符
+
 SSH_OUTCOMES = (SSH_OK, SSH_CONNECT_TIMEOUT, SSH_AUTH_FAILED,
                 SSH_COMMAND_TIMEOUT, SSH_REFUSED, SSH_ERROR,
-                SSH_NOT_CONFIGURED)
+                SSH_NOT_CONFIGURED, SSH_GUARD_MISSING,
+                SSH_GUARD_AMBIGUOUS, SSH_GUARD_IDENTITY)
 
 # 「可以斷定遠端沒有執行」的 outcome。SSH_COMMAND_TIMEOUT **不在其中**。
 SSH_DEFINITELY_NOT_EXECUTED = (SSH_CONNECT_TIMEOUT, SSH_AUTH_FAILED,
-                               SSH_REFUSED, SSH_NOT_CONFIGURED)
+                               SSH_REFUSED, SSH_NOT_CONFIGURED,
+                               SSH_GUARD_MISSING, SSH_GUARD_AMBIGUOUS,
+                               SSH_GUARD_IDENTITY)
 # 「遠端可能已經執行，但我們收不到結果」的 outcome。
 SSH_OUTCOME_UNCERTAIN = (SSH_COMMAND_TIMEOUT,)
 
@@ -1552,10 +1590,33 @@ class SshTransport(object):
         if code == GUARD_EXIT_TIMEOUT:
             # guard 自己的 $TIMEOUT 觸發 —— server 端明確回報動作沒完成，
             # 但注入式指令是否已被 screen 收下仍不可知 → 一樣視為不確定。
+            # 🔴 **不得**因為 44 / 45 改成「確定沒執行」就順手把 41 也改掉：
+            #    41 是在 `screen -X stuff` 執行**當中**逾時，語意完全不同。
             return self._record(SshResult(verb, SSH_COMMAND_TIMEOUT,
                                           exit_code=code,
                                           stdout=out.get("stdout", ""),
                                           detail="guard ACT_TIMEOUT",
+                                          elapsed_sec=elapsed))
+        if code == GUARD_EXIT_MISSING:
+            # 未提供 verb —— guard 在 case 之前就 exit，確定沒有注入
+            return self._record(SshResult(verb, SSH_GUARD_MISSING,
+                                          exit_code=code,
+                                          stdout=out.get("stdout", ""),
+                                          detail="guard no verb supplied",
+                                          elapsed_sec=elapsed))
+        if code == GUARD_EXIT_AMBIGUOUS:
+            # require_single_screen 失敗 —— 在任何注入之前就 exit
+            return self._record(SshResult(verb, SSH_GUARD_AMBIGUOUS,
+                                          exit_code=code,
+                                          stdout=out.get("stdout", ""),
+                                          detail="guard require_single_screen",
+                                          elapsed_sec=elapsed))
+        if code == GUARD_EXIT_IDENTITY:
+            # require_identity 失敗 —— 同樣在任何注入之前就 exit
+            return self._record(SshResult(verb, SSH_GUARD_IDENTITY,
+                                          exit_code=code,
+                                          stdout=out.get("stdout", ""),
+                                          detail="guard require_identity",
                                           elapsed_sec=elapsed))
         return self._record(SshResult(verb, SSH_ERROR, exit_code=code,
                                       stdout=out.get("stdout", ""),

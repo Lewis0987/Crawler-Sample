@@ -136,8 +136,15 @@ def test_3_4_5():
     check("★★ 即使 MODE=ARMED 且其餘寬鬆，live handoff 仍 REFUSED", not allowed)
     check("★★ dispatch_enabled 未過（DISPATCH_ENABLED=False）",
           ch["dispatch_enabled"] is False)
-    check("★★ network_identity_pass 未過（NOT_VERIFIED）",
-          ch["network_identity_pass"] is False)
+    # B1.7 裁示：ACCEPTED 也放行，因此 gate 更名並改為三態判定
+    check("★★ network_identity_acceptable 已放行（ACCEPTED）",
+          ch["network_identity_acceptable"] is True)
+    check("★★ 但 NETWORK_IDENTITY_STABILITY **不是** PASS",
+          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_ACCEPTED
+          and SVC.NETWORK_IDENTITY_STABILITY != SVC.NET_PASS)
+    check("★★ 舊的 network_identity_pass 名稱已不存在（避免語意誤讀）",
+          "network_identity_pass" not in ch
+          and "network_identity_pass" not in SVC.LIVE_GATE_ITEMS)
     check("★★ remote_guard_b2 未過（現場部署為 B1）",
           ch["remote_guard_b2"] is False)
     check("★★ pause_capable / restore_capable 皆 False（依實際部署判定）",
@@ -152,10 +159,16 @@ def test_3_4_5():
     check("★★ service_health_healthy 未帶 health → FAIL（Fail Closed）",
           ch["service_health_healthy"] is False)
     # 事實登記不得被誤寫
-    check("★★ NETWORK_IDENTITY_STABILITY 常數為 NOT_VERIFIED（不是 PASS）",
-          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_NOT_VERIFIED)
-    check("★★ DEPLOYED_GUARD_VARIANT 為 B1",
-          RA.DEPLOYED_GUARD_VARIANT == "B1")
+    check("★★ NETWORK_IDENTITY_STABILITY 常數為 ACCEPTED（不是 PASS）",
+          SVC.NETWORK_IDENTITY_STABILITY == SVC.NET_ACCEPTED
+          and SVC.NETWORK_IDENTITY_STABILITY != SVC.NET_PASS)
+    check("★★ DHCP Reservation 仍為 NOT_VERIFIED（未被 ACCEPTED 蓋掉）",
+          SVC.DHCP_RESERVATION_VERIFIED is False
+          and SVC.DHCP_RESERVATION_STATUS == "NOT_VERIFIED")
+    check("★★ DEPLOYED_GUARD_VARIANT 為 B2（現場已部署並唯讀驗證）",
+          RA.DEPLOYED_GUARD_VARIANT == "B2")
+    check("★★ 但 FIRST LIVE 仍 HOLD：first_live_prerequisite 未過",
+          SVC.FIRST_LIVE_PREREQUISITE_SATISFIED is False)
     src = io.open(os.path.join(HERE, "phase6_unattended_service.py"),
                   encoding="utf-8").read()
     check("★★ 原始碼中不存在把 network identity 寫成 PASS 的指派",

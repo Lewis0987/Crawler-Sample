@@ -285,8 +285,11 @@ def test_7():
     check("★★ B1（實際部署中）仍拒絕 pause / restore",
           not RA.guard_b1_would_accept("pause")
           and not RA.guard_b1_would_accept("restore"))
-    check("★★ DEPLOYED_GUARD_VARIANT 標示為 B1（不是 B2）",
-          RA.DEPLOYED_GUARD_VARIANT == "B1")
+    check("★★ DEPLOYED_GUARD_VARIANT = B2（現場已部署）",
+          RA.DEPLOYED_GUARD_VARIANT == "B2")
+    check("★★ 但 pause / restore 仍未 field tested"
+          "（timeout 仍是 STRUCTURAL CANDIDATE）",
+          RA.SshTimeouts().not_field_verified() == ["pause", "restore"])
     sh = RA.REMOTE_GUARD_B2_SH
     code = "\n".join(ln for ln in sh.splitlines()
                      if not ln.lstrip().startswith("#"))

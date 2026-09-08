@@ -236,9 +236,9 @@ Phase 6.10 OFFLINE DEVELOPMENT = COMPLETE / FROZEN
 | 6.10-B1 | Read-only Guard | COMPLETE |
 | 6.10-B1.5 | Production Preconditions | COMPLETE |
 | 6.10-B1.6 | Network Identity Blocker | COMPLETE / BLOCKER CONFIRMED |
-| 6.10-B1.7 | Network Identity Verification | DEFERRED / NOT VERIFIED |
+| 6.10-B1.7 | Network Identity Verification | ACCEPTED FOR CURRENT DEPLOYMENT |
 | 6.10-B2 | Offline Handoff | COMPLETE |
-| 6.10-B2 LIVE | Live Handoff Deployment | NOT STARTED / BLOCKED |
+| 6.10-B2 LIVE | Live Handoff Deployment | DEPLOYED / READ-ONLY VERIFIED |
 | 6.10-C | Offline Unattended Service | COMPLETE |
 | 6.10-C1 | Service Timing | COMPLETE |
 | 6.10-C2 | SSH Architecture | COMPLETE |
@@ -251,19 +251,33 @@ Phase 6.10 OFFLINE DEVELOPMENT = COMPLETE / FROZEN
 - Phase 1 ~ Phase 5：COMPLETE
 - Phase 6：OFFLINE COMPLETE / LIVE HOLD
 - Phase 6.10：OFFLINE COMPLETE / FROZEN
-- Phase 6.10-B1.7：DEFERRED / NOT VERIFIED
-- Phase 6.10-B2 LIVE：NOT STARTED / BLOCKED
+- Phase 6.10-B1.7：ACCEPTED FOR CURRENT DEPLOYMENT
+- Phase 6.10-B2 LIVE：DEPLOYED / READ-ONLY VERIFIED
 - Phase 6.10-C LIVE：NOT STARTED / BLOCKED
 - FIRST LIVE：HOLD
 - LIVE_READINESS：BLOCKED
+
+> 🔴 **`ACCEPTED` 不是 `PASS`。** B1.7 的實機驗證（受控 reconnect / DHCP renew
+> 後重新確認 IP、DHCP server、route/source 與 guard 三動詞）**從未執行**；
+> server-side DHCP reservation 證據也**未取得**。目前是使用者裁示接受
+> `192.168.128.234` 作為此次 deployment 的固定 source identity。
+> 只要 IPv4 / NIC / route / DHCP policy / Wi-Fi source / SSH `from=`
+> 任一改變，狀態必須退回 `NOT_VERIFIED` 並重跑 B1.7。
+>
+> 🔴 **B2 已部署 ≠ pause / restore 已驗證。** guard 回報
+> `capability_pause=true` / `capability_restore=true` 只代表**具備能力**；
+> 兩者實機執行次數仍為 0，command timeout 仍是 STRUCTURAL CANDIDATE
+> （production 預設 `None`），`PAUSE_TIMEOUT_VERIFIED` /
+> `RESTORE_TIMEOUT_VERIFIED` 皆為 False。
 
 ### Current Safety State
 
 - DISPATCH_ENABLED = False
 - MODE = DRY_RUN
-- DEPLOYED_GUARD_VARIANT = B1
+- DEPLOYED_GUARD_VARIANT = B2
 - RemoteSenders armed = False
-- NETWORK_IDENTITY_STABILITY = NOT VERIFIED
+- NETWORK_IDENTITY_STABILITY = ACCEPTED / USER CONFIRMED
+- DHCP Reservation = NOT VERIFIED / NON-BLOCKING BY USER DECISION
 
 Field command count：
 
@@ -272,21 +286,17 @@ Field command count：
 
 ### Live Blockers
 
-- DHCP Reservation = NOT CONFIRMED
-- B2 guard deployment = NOT AUTHORIZED
-- Remote Guard（field）：`probe` / `loopcheck` / `status` = AVAILABLE；
-  `pause` / `restore` = REFUSED（historical B1 evidence）
+- Remote Guard（field）：`probe` / `loopcheck` / `status` / `pause` /
+  `restore` 皆在 B2 allowlist 內；`pause` / `restore` **實機執行次數 = 0**
 - `pause` / `restore` command timeout = STRUCTURAL CANDIDATE，尚無實測
+- FIRST_LIVE_PREREQUISITE = False；`DISPATCH_ENABLED = False`
 
 ### Next Field Sequence
 
-1. B1.7 Network Identity Verification
-2. B2 Guard Deployment
-3. B2 read-only post-deploy verification
-4. Controlled FIRST LIVE
-5. pause / restore timing evidence
-6. 評估 pause / restore timeout FINAL
-7. Phase 6.10-C Live Service Deployment
+1. Controlled FIRST LIVE
+2. pause / restore timing evidence
+3. 評估 pause / restore timeout FINAL
+4. Phase 6.10-C Live Service Deployment
 
 > **上述任何 Field 階段均需要新的明確授權。**
 

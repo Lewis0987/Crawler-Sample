@@ -82,6 +82,12 @@ def _classify(rc, stdout, tcp_at, auth_at, timed_out):
         return RA.SSH_REFUSED
     if rc == RA.GUARD_EXIT_TIMEOUT:
         return RA.SSH_COMMAND_TIMEOUT
+    if rc == RA.GUARD_EXIT_MISSING:
+        return RA.SSH_GUARD_MISSING
+    if rc == RA.GUARD_EXIT_AMBIGUOUS:
+        return RA.SSH_GUARD_AMBIGUOUS
+    if rc == RA.GUARD_EXIT_IDENTITY:
+        return RA.SSH_GUARD_IDENTITY
     if auth_at is None:
         # 沒走到認證完成
         if "Permission denied" in stdout or rc == 255:
