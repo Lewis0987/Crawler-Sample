@@ -181,12 +181,20 @@ class DecisionObserver:
     holiday_provider
         未注入時 tou_calendar 使用 UnknownHolidayProvider → TOU 一律 UNKNOWN。
         🔴 這是刻意的 Fail Closed：正式離峰日來源確認前，不假裝今天不是假日。
+    tariff_provider
+        正式時段提供者（tariff_provider.TariffProvider，duck typing：只需 observe(now)）。
+        🔴 **注入後即成為唯一的時段來源** —— 它負責時區感知與 naive datetime 的
+           明確拒絕（TP_NAIVE_DATETIME → UNKNOWN → Fail Closed）。
+        🔴 它**不是**第二套時段規則：TariffProvider 內部同樣呼叫
+           tou_calendar.classify_tou，規則只有一份。
+        🔴 未注入時沿用既有 tou_calendar 路徑（library 預設 holiday_provider=None
+           → UNKNOWN），維持與 Phase D.3-C 完全相同的保守行為。
     """
 
     def __init__(self, ess_adapter=None, meter_adapter=None, classifier=None,
                  engine=None, policy=None, tou_config=None, holiday_provider=None,
                  clock=None, local_now=None, ess_config=None,
-                 meter_stale_after_sec=None):
+                 meter_stale_after_sec=None, tariff_provider=None):
         self.ess_adapter = ess_adapter
         self.meter_adapter = meter_adapter
         self.classifier = classifier if classifier is not None else PC.PowerClassifier()
@@ -194,6 +202,9 @@ class DecisionObserver:
         self.engine = engine if engine is not None else DE.DecisionEngine(policy=self.policy)
         self.tou_config = tou_config if tou_config is not None else TC.G_CONFIG
         self.holiday_provider = holiday_provider
+        # 🔴 GAP-3：production 由組裝層注入正式 TariffProvider；
+        #    library 預設維持 None（保守，不自行 new 第二個 provider）。
+        self.tariff_provider = tariff_provider
         self._clock = clock if clock is not None else time.monotonic
         self._local_now = local_now if local_now is not None else datetime.now
         # ⚠️ 沿用既有且已裁示的新鮮度門檻，本階段不新增、不放寬任何 production 數值。
@@ -296,8 +307,16 @@ class DecisionObserver:
                        f"（Adapter 當時為 {base['meter_age_at_adapter_sec']}s）")
 
         # ---- TOU（尖峰／離峰一律由正式 library 判定）----
-        tou = TC.classify_tou(self._local_now(), config=self.tou_config,
-                              holiday_provider=self.holiday_provider)
+        # 🔴 GAP-3：注入正式 TariffProvider 時，時段一律由它判定 ——
+        #    它負責時區感知與 naive datetime 的明確拒絕；規則仍是同一份
+        #    tou_calendar，**沒有**第二套時段規則。
+        # 🔴 provider 的例外**不吞** —— 交給 Runtime 的 FAULT_BLOCKED 邊界，
+        #    absolutely 不得沿用上一輪的 TOU。
+        if self.tariff_provider is not None:
+            tou = self.tariff_provider.observe(self._local_now())
+        else:
+            tou = TC.classify_tou(self._local_now(), config=self.tou_config,
+                                  holiday_provider=self.holiday_provider)
         base.update(tou_state=tou.state, tou_reason=tou.reason,
                     tou_season=tou.season, tou_day_type=tou.day_type)
 

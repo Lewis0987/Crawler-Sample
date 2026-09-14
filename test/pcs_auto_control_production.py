@@ -29,6 +29,7 @@ pcs_auto_control_production.py — Production 相依注入（Phase D.5-B）
 import os
 import time
 import argparse
+from datetime import datetime
 
 import annual_off_peak_calendar as AC
 import tariff_provider as TP
@@ -150,6 +151,21 @@ def build_tariff_provider(holiday_provider=None):
     """時段判定來源（Asia/Taipei；naive datetime 一律拒絕）。"""
     hp = holiday_provider if holiday_provider is not None else build_holiday_provider()
     return TP.TariffProvider(holiday_provider=hp)
+
+
+def build_local_now():
+    """production 的本地時間來源：**Asia/Taipei aware datetime**。
+
+    🔴 不建立第二套 timezone helper —— 時區解析一律沿用 tariff_provider
+       既有的 `resolve_timezone()` 與 `PRODUCTION_TIMEZONE_NAME`。
+    🔴 時區無法解析時刻意回傳 naive 的 `datetime.now`：
+       TariffProvider 會明確拒絕（TP_NAIVE_DATETIME）→ TOU UNKNOWN → Fail Closed。
+       **不得**以主機本機時間冒充時區契約。
+    """
+    tz, _why = TP.resolve_timezone(TP.PRODUCTION_TIMEZONE_NAME)
+    if tz is None:
+        return datetime.now
+    return lambda: datetime.now(tz)
 
 
 def build_policy(config=None):
@@ -475,7 +491,7 @@ def _state(obj):
 
 def wiring_report(reader=None, meter_source=None, last_control_provider=None,
                   executor=None, verifier=None, holiday_provider=None,
-                  config=None, mode=MODE_OBSERVE_ONLY):
+                  config=None, mode=MODE_OBSERVE_ONLY, tariff_provider=None):
     """盤點目前實際接上了什麼。"""
     c = config if config is not None else CFG.DEFAULT_CONTROL_CONFIG
     return WiringReport(
@@ -483,6 +499,7 @@ def wiring_report(reader=None, meter_source=None, last_control_provider=None,
         sources={"ess_reader": _state(reader),
                  "meter_source": _state(meter_source),
                  "holiday_provider": _state(holiday_provider),
+                 "tariff_provider": _state(tariff_provider),
                  "last_control": _state(last_control_provider),
                  "executor": _state(executor),
                  "verifier": _state(verifier)},

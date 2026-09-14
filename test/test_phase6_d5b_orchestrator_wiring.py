@@ -40,6 +40,7 @@ import production_execution_chain as PEC                 # noqa: E402
 import production_arbiter as ARB                        # noqa: E402
 import annual_off_peak_calendar as AC                    # noqa: E402
 import last_control_store as LCS                         # noqa: E402
+import tariff_provider as TP                              # noqa: E402
 import test_phase6_d3d_arbitration as D3D                # noqa: E402
 
 RESULTS = []
@@ -87,8 +88,12 @@ FULL_CFG = CFG.AutoControlConfig(
     decision_interval_sec=30.0, authorization_ttl_sec=30.0,
     readback_timeout_sec=75.0, readback_poll_interval_sec=5.0)
 
-DT_OFF_PEAK = datetime(2026, 7, 15, 3, 0)     # 平日離峰（已 provision 的年度）
-DT_PEAK = datetime(2026, 7, 15, 14, 0)        # 平日尖峰
+# 🔴 GAP-3：production TOU 一律經正式 TariffProvider，naive datetime 明確拒絕。
+#    因此 fixture 必須是 Asia/Taipei aware datetime，否則整條鏈會（正確地）
+#    Fail Closed 成 TOU UNKNOWN，測不到原本要測的 orchestrator 行為。
+TZ = TP.resolve_timezone(TP.PRODUCTION_TIMEZONE_NAME)[0]
+DT_OFF_PEAK = datetime(2026, 7, 15, 3, 0, tzinfo=TZ)   # 平日離峰（已 provision）
+DT_PEAK = datetime(2026, 7, 15, 14, 0, tzinfo=TZ)      # 平日尖峰
 
 
 class Spy(object):

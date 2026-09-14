@@ -27,7 +27,7 @@ S8  shutdown（≠ PCS STOP）
 S9  production wiring report（不執行 CLI）
 S10 每 cycle 重新 evaluate authority
 S11 不得由上一輪意圖推導 PCS 實際狀態
-G3  GAP-3 evidence：production TOU path 取得 naive 還是 aware datetime
+G3  production TOU 時間基準：正式 TariffProvider / Asia/Taipei aware
 G4  GAP-4 evidence：200 筆 audit ring 的長跑行為
 
 用法
@@ -710,33 +710,37 @@ def test_S11_no_plant_state_inference():
 # G3 —— GAP-3 evidence：production TOU path 的 datetime 基準
 # ======================================================================
 def test_G3_tou_time_base_evidence():
-    print("\n[G3] GAP-3 evidence：production TOU path 取得 naive 還是 aware")
-    src, _r, _w = SVC.build_production_stack(client=None, meter_client=None)
+    print("\n[G3] production TOU 時間基準（GAP-3 修正後的契約）")
+    # ── OLD（GAP-3 修正前，已量測到的缺陷）───────────────────────────
+    #   local_now 預設 = datetime.now → tzinfo=None（naive）
+    #   observer 沒有 tariff_provider → TOU 走 TC.classify_tou(naive wall clock)
+    #   後果：timeline 時間戳被忽略，TOU 取自執行當下的真實時間
+    # ── NEW（本輪修正後的契約，以下逐條鎖住）──────────────────────────
+    src, _r, w = SVC.build_production_stack(client=None, meter_client=None)
     observer = src.__self__.arbiter.observer
-    now_fn = observer._local_now
-    sample = now_fn()
-    check(f"  production stack 的 local_now = "
-          f"{getattr(now_fn, '__qualname__', now_fn)}",
-          getattr(now_fn, "__self__", None) is datetime.datetime
-          and now_fn() is not None)
-    check(f"★★ EVIDENCE：production TOU path 取得的是 **naive** datetime"
+    sample = observer._local_now()
+
+    check(f"★★ production stack 已注入正式 TariffProvider"
+          f"（{type(observer.tariff_provider).__name__}）",
+          isinstance(observer.tariff_provider, TP.TariffProvider))
+    check(f"★★ 時區 = {observer.tariff_provider.timezone_name}",
+          observer.tariff_provider.timezone_name
+          == TP.PRODUCTION_TIMEZONE_NAME == "Asia/Taipei")
+    check(f"★★ production 預設 local_now 為 **aware** datetime"
           f"（tzinfo={sample.tzinfo}）",
-          sample.tzinfo is None)
-    check("★★ EVIDENCE：service path 未使用 TariffProvider",
-          not isinstance(getattr(observer, "tariff_provider", None),
-                         TP.TariffProvider)
-          and "tariff_provider" not in dir(observer))
-    tp = PRD.build_tariff_provider()
-    naive = tp.observe(datetime.datetime(2026, 7, 15, 14))
-    aware = tp.observe(at(2026, 7, 15, 14))
-    check(f"★★ EVIDENCE：PRD.build_tariff_provider() 已存在且會拒絕 naive"
-          f"（{naive.reason}）",
-          isinstance(tp, TP.TariffProvider) and naive.reason == TP.TP_NAIVE_DATETIME)
-    check(f"  同一時刻 aware → {aware.state}/{aware.reason}（可正常解析）",
+          sample.tzinfo is not None and sample.utcoffset() is not None)
+    check(f"  wiring report 顯示 tariff_provider = "
+          f"{w.sources.get('tariff_provider')}",
+          w.sources.get("tariff_provider") == PRD.SRC_WIRED)
+    naive = observer.tariff_provider.observe(datetime.datetime(2026, 7, 15, 14))
+    aware = observer.tariff_provider.observe(at(2026, 7, 15, 14))
+    check(f"★★ naive datetime 仍被明確拒絕（{naive.reason}）",
+          naive.reason == TP.TP_NAIVE_DATETIME
+          and naive.valid is False and naive.state == TP.TARIFF_UNKNOWN)
+    check(f"  同一時刻 aware → {aware.state}/{aware.reason}",
           aware.reason == TP.TP_OK and aware.valid is True)
-    check("★★ 兩條路徑共用同一套規則（tou_calendar），**沒有**第二套 TOU 規則",
+    check("★★ 仍然只有一套時段規則（TariffProvider 內部呼叫 tou_calendar）",
           "classify_tou" in dir(TP.TC) and TP.TC.__name__ == "tou_calendar")
-    check("  本輪只蒐證，未修改任何 production module", True)
 
 
 # ======================================================================

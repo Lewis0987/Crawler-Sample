@@ -336,13 +336,17 @@ def build_meter_adapter(source=None, clock=None):
 
 
 def build_decision_observer(reader=None, meter_source=None, policy=None,
-                            holiday_provider=None, clock=None, local_now=None):
+                            holiday_provider=None, clock=None, local_now=None,
+                            tariff_provider=None):
     """
     建立 OBSERVE-ONLY 決策觀測器。
 
     🔴 policy 預設使用 decision_policy 的預設值 —— 充放電功率為 None，
        Decision 會 Fail Closed 成 no_action。**不得**在此填入任何測試值。
     🔴 holiday_provider 預設 None → TOU 一律 UNKNOWN（正式離峰日來源未確認）。
+    🔴 tariff_provider 預設 None → 沿用 tou_calendar 路徑（同樣 Fail Closed）。
+       production 由 build_production_stack / build_live_chain_bundle 注入
+       正式 TariffProvider，時段才具備 Asia/Taipei 時區感知與 naive 拒絕。
     🔴 本函式不建立任何 executor / authorization / LastControl。
     """
     # ⚠️ clock 一路貫穿 ESS / Meter / Observer —— 三者必須是同一個時間基準，
@@ -352,12 +356,13 @@ def build_decision_observer(reader=None, meter_source=None, policy=None,
                                                                    clock),
                                  policy=policy,
                                  holiday_provider=holiday_provider,
+                                 tariff_provider=tariff_provider,
                                  clock=clock, local_now=local_now)
 
 
 def build_arbiter(reader=None, meter_source=None, config=None, policy=None,
                   holiday_provider=None, last_control_provider=None,
-                  clock=None, local_now=None):
+                  clock=None, local_now=None, tariff_provider=None):
     """
     建立仲裁／授權層。
 
@@ -368,7 +373,8 @@ def build_arbiter(reader=None, meter_source=None, config=None, policy=None,
     """
     return ARB.ProductionArbiter(
         observer=build_decision_observer(reader, meter_source, policy,
-                                         holiday_provider, clock, local_now),
+                                         holiday_provider, clock, local_now,
+                                         tariff_provider=tariff_provider),
         config=config if config is not None else CFG.DEFAULT_CONTROL_CONFIG,
         last_control_provider=last_control_provider, clock=clock)
 
@@ -376,7 +382,8 @@ def build_arbiter(reader=None, meter_source=None, config=None, policy=None,
 def build_execution_chain(reader=None, meter_source=None, config=None,
                           policy=None, holiday_provider=None,
                           last_control_provider=None, executor=None,
-                          verifier=None, store=None, clock=None, local_now=None):
+                          verifier=None, store=None, clock=None, local_now=None,
+                          tariff_provider=None):
     """
     建立完整執行鏈。
 
@@ -387,7 +394,7 @@ def build_execution_chain(reader=None, meter_source=None, config=None,
     return PEC.ProductionExecutionChain(
         arbiter=build_arbiter(reader, meter_source, config, policy,
                               holiday_provider, last_control_provider,
-                              clock, local_now),
+                              clock, local_now, tariff_provider=tariff_provider),
         executor=executor, verifier=verifier, store=store)
 
 
@@ -403,7 +410,9 @@ def build_production_stack(client=None, meter_client=None, config=None,
     接上的東西
         ESS reader          ← charge_discharge_report.read_all（唯讀 GET）
         Meter source        ← MeterClient.get_snapshot（唯讀訂閱）
-        Tariff / TOU        ← 已人工驗收並 provision 的年度離峰日清單
+        Tariff / TOU        ← 正式 TariffProvider（Asia/Taipei aware；
+                              naive datetime 明確拒絕）＋ 已人工驗收並
+                              provision 的年度離峰日清單
         Decision policy     ← production config 的充放電功率（目前 None → no_action）
         Safety Gate         ← 由 arbiter 內部沿用既有實作
         Control Authority   ← 由 arbiter 內部沿用既有實作
@@ -424,6 +433,11 @@ def build_production_stack(client=None, meter_client=None, config=None,
     meter_source = (meter_source if meter_source is not None
                     else PRD.build_meter_source(meter_client))
     holiday = PRD.build_holiday_provider()
+    # 🔴 GAP-3：時段一律走正式 TariffProvider —— 時區感知 + naive 明確拒絕。
+    #    未注入 local_now 時，production 預設取 Asia/Taipei aware datetime，
+    #    **不再**使用 naive 的 datetime.now()。
+    tariff = PRD.build_tariff_provider(holiday)
+    local_now = local_now if local_now is not None else PRD.build_local_now()
     policy = PRD.build_policy(cfg)
     store = PRD.build_last_control_store(store_path)
     lc_provider = (last_control_provider if last_control_provider is not None
@@ -435,13 +449,14 @@ def build_production_stack(client=None, meter_client=None, config=None,
         reader=reader, meter_source=meter_source, config=cfg, policy=policy,
         holiday_provider=holiday, last_control_provider=lc_provider,
         executor=executor, verifier=verifier, store=None,
-        clock=clock, local_now=local_now)
+        clock=clock, local_now=local_now, tariff_provider=tariff)
     recovery = build_recovery_source(reader=reader, store=store, config=cfg,
                                      clock=clock)
     report = PRD.wiring_report(
         reader=reader, meter_source=meter_source,
         last_control_provider=lc_provider, executor=executor,
-        verifier=verifier, holiday_provider=holiday, config=cfg, mode=mode)
+        verifier=verifier, holiday_provider=holiday, config=cfg, mode=mode,
+        tariff_provider=tariff)
     return chain.run, recovery, report
 
 
@@ -824,6 +839,10 @@ def build_live_chain_bundle(client=None, meter_client=None, config=None,
     meter_source = (meter_source if meter_source is not None
                     else PRD.build_meter_source(meter_client))
     holiday = PRD.build_holiday_provider()
+    # 🔴 GAP-3：LIVE 路徑與 OBSERVE_ONLY 使用**同一個**時段來源，
+    #    不允許兩條路徑的 TOU 時間基準不一致。
+    tariff = PRD.build_tariff_provider(holiday)
+    local_now = local_now if local_now is not None else PRD.build_local_now()
     policy = PRD.build_policy(cfg)
     store = PRD.build_last_control_store(store_path)
     lc_provider = (last_control_provider if last_control_provider is not None
@@ -839,7 +858,8 @@ def build_live_chain_bundle(client=None, meter_client=None, config=None,
     #    build_production_stack 本來就是「建一次鏈、重複呼叫 chain.run」，
     #    這裡必須維持同樣語意，只在需要時換上 executor / verifier。
     arbiter = build_arbiter(reader, meter_source, cfg, policy,
-                            holiday, lc_provider, clock, local_now)
+                            holiday, lc_provider, clock, local_now,
+                            tariff_provider=tariff)
 
     def factory(executor=None, verifier=None):
         return PEC.ProductionExecutionChain(
