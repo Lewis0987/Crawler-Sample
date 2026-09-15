@@ -605,9 +605,14 @@ def main():
     # ---------------- 服務層迴圈（不需設備）----------------
     print("\n服務層：迴圈與關閉（完全離線）")
     rt_s = RT.AutoControlRuntime(config=full)
-    n = SVC.run(rt_s, interval=0, max_ticks=3, owner=True)
+    # 🔴 使用**正式 cadence**（config 的 decision_interval_sec）並注入假 waiter，
+    #    達成零等待。不得以 interval=0 規避等待 —— 0 已非合法 production cadence。
+    _waits = []
+    n = SVC.run(rt_s, max_ticks=3, owner=True, waiter=_waits.append)
     check("★★ 服務迴圈跑 3 輪 → 零 dispatch，狀態仍為 OBSERVE_ONLY",
           n == 3 and rt_s.dispatch_count == 0 and rt_s.state == RT.ST_OBSERVE_ONLY)
+    check(f"  迴圈節奏取自 production config（waiter 收到 {set(_waits)}）",
+          set(_waits) == {full.decision_interval_sec} and len(_waits) == 2)
     check("  非 Owner 時迴圈只會產生 DISABLED",
           RT.AutoControlRuntime(config=full).tick(
               RT.CycleInputs(is_owner=False)).state == RT.ST_DISABLED)

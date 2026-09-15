@@ -32,6 +32,7 @@ import argparse
 from datetime import datetime
 
 import annual_off_peak_calendar as AC
+import phase6_decision_audit as AUD
 import tariff_provider as TP
 import decision_policy as DP
 import last_control_store as LCS
@@ -166,6 +167,20 @@ def build_local_now():
     if tz is None:
         return datetime.now
     return lambda: datetime.now(tz)
+
+
+def build_audit_sink(path=None, run_id=None, boot_id=None):
+    """Durable Decision Audit sink。
+
+    🔴 evidence sink，**不是**控制前提：寫入失敗一律 NON_GATING_CONTINUE，
+       不得改變 Runtime / Authority / Safety / dispatch 任何狀態。
+    🔴 boot_id 沿用既有 `last_control_store.windows_boot_id()`，
+       不另造一套開機識別。
+    🔴 rotation / retention 尚未裁示（DEFERRED）→ 本版不刪不搬。
+    """
+    bid = boot_id if boot_id is not None else LCS.windows_boot_id()
+    return AUD.AuditSink(path=path or AUD.DEFAULT_AUDIT_PATH,
+                         run_id=run_id, boot_id=bid)
 
 
 def build_policy(config=None):
@@ -491,7 +506,8 @@ def _state(obj):
 
 def wiring_report(reader=None, meter_source=None, last_control_provider=None,
                   executor=None, verifier=None, holiday_provider=None,
-                  config=None, mode=MODE_OBSERVE_ONLY, tariff_provider=None):
+                  config=None, mode=MODE_OBSERVE_ONLY, tariff_provider=None,
+                  audit_sink=None):
     """盤點目前實際接上了什麼。"""
     c = config if config is not None else CFG.DEFAULT_CONTROL_CONFIG
     return WiringReport(
@@ -500,6 +516,7 @@ def wiring_report(reader=None, meter_source=None, last_control_provider=None,
                  "meter_source": _state(meter_source),
                  "holiday_provider": _state(holiday_provider),
                  "tariff_provider": _state(tariff_provider),
+                 "audit_sink": _state(audit_sink),
                  "last_control": _state(last_control_provider),
                  "executor": _state(executor),
                  "verifier": _state(verifier)},

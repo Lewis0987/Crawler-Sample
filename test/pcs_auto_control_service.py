@@ -75,6 +75,7 @@ D.3-B：Adapter 邊界已建立
 
 import os
 import sys
+import math
 import time
 import signal
 import hashlib
@@ -90,13 +91,19 @@ import production_arbiter as ARB
 import production_execution_chain as PEC
 import execution_reconciler as REC
 import pcs_auto_control_production as PRD
+import phase6_decision_audit as AUD
 import control_authority as CA              # 只用其狀態常數（純邏輯、零 I/O）
 import pcs_control_integration as PCI       # 只用方向互鎖的 BLOCK 理由集合
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVICE_NAME = CFG.SERVICE_NAME
 DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(HERE), "output")
-DEFAULT_INTERVAL_SEC = 10          # ⚠️ 僅為 skeleton 的迴圈節奏，**不是** decision_interval_sec
+# 🔴 GAP-1：正式 decision cadence **唯一來源**為 production config，
+#    本模組刻意不保留第二份數值（原本的 skeleton 常數 10 已移除）。
+_UNSET = object()
+
+# cadence 無法確定時的 Fail Closed 理由（不得自行 fallback 成任何秒數）
+INTERVAL_NOT_CONFIGURED = "DECISION_INTERVAL_NOT_CONFIGURED"
 
 # ======================================================================
 # Named Mutex（技術沿用 Phase 4.4/4.6，鎖本身完全獨立）
@@ -362,7 +369,8 @@ def build_decision_observer(reader=None, meter_source=None, policy=None,
 
 def build_arbiter(reader=None, meter_source=None, config=None, policy=None,
                   holiday_provider=None, last_control_provider=None,
-                  clock=None, local_now=None, tariff_provider=None):
+                  clock=None, local_now=None, tariff_provider=None,
+                  observer=None):
     """
     建立仲裁／授權層。
 
@@ -372,9 +380,11 @@ def build_arbiter(reader=None, meter_source=None, config=None, policy=None,
     🔴 本函式不建立任何 executor。
     """
     return ARB.ProductionArbiter(
-        observer=build_decision_observer(reader, meter_source, policy,
-                                         holiday_provider, clock, local_now,
-                                         tariff_provider=tariff_provider),
+        observer=(observer if observer is not None
+                  else build_decision_observer(reader, meter_source, policy,
+                                               holiday_provider, clock,
+                                               local_now,
+                                               tariff_provider=tariff_provider)),
         config=config if config is not None else CFG.DEFAULT_CONTROL_CONFIG,
         last_control_provider=last_control_provider, clock=clock)
 
@@ -383,7 +393,7 @@ def build_execution_chain(reader=None, meter_source=None, config=None,
                           policy=None, holiday_provider=None,
                           last_control_provider=None, executor=None,
                           verifier=None, store=None, clock=None, local_now=None,
-                          tariff_provider=None):
+                          tariff_provider=None, observer=None):
     """
     建立完整執行鏈。
 
@@ -394,7 +404,8 @@ def build_execution_chain(reader=None, meter_source=None, config=None,
     return PEC.ProductionExecutionChain(
         arbiter=build_arbiter(reader, meter_source, config, policy,
                               holiday_provider, last_control_provider,
-                              clock, local_now, tariff_provider=tariff_provider),
+                              clock, local_now, tariff_provider=tariff_provider,
+                              observer=observer),
         executor=executor, verifier=verifier, store=store)
 
 
@@ -402,7 +413,7 @@ def build_production_stack(client=None, meter_client=None, config=None,
                            mode=PRD.MODE_OBSERVE_ONLY, store_path=None,
                            reader=None, meter_source=None,
                            last_control_provider=None,
-                           clock=None, local_now=None):
+                           clock=None, local_now=None, audit_sink=None):
     """
     Phase D.5-B：把**全部** production 相依明確接起來，回傳
     (observation_source, recovery_source, wiring_report)。
@@ -445,19 +456,28 @@ def build_production_stack(client=None, meter_client=None, config=None,
     executor = PRD.build_executor(mode)          # OBSERVE_ONLY → None
     verifier = PRD.build_verifier(mode)          # OBSERVE_ONLY → None
 
+    # 🔴 GAP-4：把觀測層包成 ObservationCapture —— 只保留參考、原樣回傳，
+    #    **不改判定、不新增任何讀取**。Audit 因此能拿到該 cycle 的
+    #    fresh observation，而不必再讀一次 ESS / 電表。
+    observer = AUD.ObservationCapture(
+        build_decision_observer(reader, meter_source, policy, holiday,
+                                clock, local_now, tariff_provider=tariff))
     chain = build_execution_chain(
         reader=reader, meter_source=meter_source, config=cfg, policy=policy,
         holiday_provider=holiday, last_control_provider=lc_provider,
         executor=executor, verifier=verifier, store=None,
-        clock=clock, local_now=local_now, tariff_provider=tariff)
+        clock=clock, local_now=local_now, tariff_provider=tariff,
+        observer=observer)
     recovery = build_recovery_source(reader=reader, store=store, config=cfg,
                                      clock=clock)
     report = PRD.wiring_report(
         reader=reader, meter_source=meter_source,
         last_control_provider=lc_provider, executor=executor,
         verifier=verifier, holiday_provider=holiday, config=cfg, mode=mode,
-        tariff_provider=tariff)
-    return chain.run, recovery, report
+        tariff_provider=tariff, audit_sink=audit_sink)
+    # 🔴 ResultCapture 同樣只留參考、原樣回傳；`__self__` 仍指向 chain，
+    #    既有呼叫端（obs_source.__self__）不受影響。
+    return AUD.ResultCapture(chain.run), recovery, report
 
 
 def build_recovery_source(reader=None, store=None, config=None, clock=None):
@@ -1020,12 +1040,56 @@ def run_live_leg_cli(action, bundle, config=None, prompt=None,
                           detail=runner.abort_reason or "")
 
 
-def run(runtime=None, interval=DEFAULT_INTERVAL_SEC, stop_event=None,
-        max_ticks=None, owner=None):
-    """
-    Skeleton 主迴圈（跑在呼叫端執行緒，**不另開 thread**）。回傳實際輪數。
+def production_interval_sec(config=None):
+    """正式 decision cadence。**唯一來源**為 production config。
 
-    owner : 覆寫 ownership 判定（測試用）。None = 使用真實 is_owner()。
+    🔴 本函式不提供任何預設秒數 —— 未配置即回 None，由呼叫端 Fail Closed。
+       不得在 service 層留第二份 30.0（那會讓兩處數值有機會分歧）。
+    """
+    cfg = config if config is not None else CFG.DEFAULT_CONTROL_CONFIG
+    return getattr(cfg, "decision_interval_sec", None)
+
+
+def _usable_interval(v):
+    """cadence 必須是**有限且大於 0** 的數。bool 是 int 的子類，必須排除。
+
+    🔴 `0` 不算合法 cadence：常駐服務若以 0 秒節奏運轉會變成 tight loop，
+       而一個正常 cycle 至少會產生 ESS ×2 + 電表 ×2 次讀取 ——
+       那等同對設備無節制輪詢。離線測試要零等待請注入 `waiter`，
+       **不要**把 cadence 設成 0。
+    """
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v) and v > 0)
+
+
+def run(runtime=None, interval=_UNSET, stop_event=None,
+        max_ticks=None, owner=None, waiter=None, audit_sink=None,
+        audit_evidence=None):
+    """
+    主迴圈（跑在呼叫端執行緒，**不另開 thread**）。回傳實際輪數。
+
+    interval
+        每輪之間的等待秒數。
+        🔴 GAP-1：未指定（_UNSET）時取 **runtime 自己的 production config** 的
+           `decision_interval_sec`（目前已裁示 30.0 FINAL）。
+           明確傳值則以傳入值為準（CLI `--interval` 與離線測試都靠它）。
+        🔴 `_UNSET` 與 `None` 意義**不同**：_UNSET = 用 config；
+           None / 0 / 負數 / 非有限值 = cadence 不可用 → Fail Closed，
+           **不進迴圈**，絕不自行 fallback 成任何秒數。
+        🔴 要零等待長跑請注入 `waiter`，不要把 cadence 設成 0。
+    audit_sink / audit_evidence
+        🔴 GAP-4：Durable Decision Audit。每個 cycle 寫**一筆** immutable 紀錄。
+           寫入失敗一律 **NON_GATING_CONTINUE** —— 印 WARNING、標記 sink 不健康，
+           但**不**改變 Runtime / Authority / Safety / dispatch 任何狀態，
+           也**不**假裝寫成功。未注入 sink 時完全不寫檔。
+           Audit 一律使用該 cycle 已取得的 observation，**不新增任何 device I/O**。
+    waiter
+        🔴 GAP-2：可注入的等待機制，簽章為 `waiter(interval)`。
+           未注入時使用 production 預設 `stop_event.wait` —— 也就是說
+           production 行為完全不變；離線測試注入假 waiter 即可零等待長跑。
+           **不新增** Scheduler / Timer / 背景執行緒 / asyncio。
+    owner
+        覆寫 ownership 判定（測試用）。None = 使用真實 is_owner()。
 
     ⚠️ 本迴圈**不吞例外**：Runtime.tick() 自己就是 Fail Closed 邊界，
        它保證不拋出，並在未知錯誤時把狀態壓成 FAULT_BLOCKED。
@@ -1033,20 +1097,72 @@ def run(runtime=None, interval=DEFAULT_INTERVAL_SEC, stop_event=None,
     """
     rt = runtime if runtime is not None else RT.AutoControlRuntime()
     stop_event = stop_event or threading.Event()
+    if interval is _UNSET:
+        interval = production_interval_sec(rt.config)
+    if not _usable_interval(interval):
+        # 🔴 cadence 不可確定時，**不核發任何判定** —— 這與 config 既有的
+        #    「參數未齊備就不可 dispatch」同一個 Fail Closed 立場。
+        #    也絕不能用 wait(None) 那種無限等待來假裝服務還活著。
+        log(f"{INTERVAL_NOT_CONFIGURED}：decision_interval_sec={interval!r}"
+            f" → 不進入主迴圈（fail closed，未核發任何判定）")
+        return 0
+    wait = waiter if waiter is not None else stop_event.wait
     ticks = 0
     try:
         while not stop_event.is_set():
             own = is_owner() if owner is None else bool(owner)
+            if audit_evidence is not None:
+                audit_evidence.begin_cycle()
             res = rt.tick(RT.CycleInputs(is_owner=own))
             log(str(res))
+            write_audit(audit_sink, res, audit_evidence, config=rt.config)
             ticks += 1
             if max_ticks is not None and ticks >= max_ticks:
                 break
-            stop_event.wait(interval)
+            wait(interval)
     except KeyboardInterrupt:
         log("收到 Ctrl+C，準備關閉…")
         stop_event.set()
     return ticks
+
+
+def write_audit(sink, cycle_result, evidence=None, config=None,
+                local_now=None):
+    """寫一筆 durable audit。**永遠不影響控制流程**（NON_GATING_CONTINUE）。
+
+    回傳 (outcome, seq)。未注入 sink → 完全不寫檔。
+
+    🔴 `at_wall` 一律為 **Asia/Taipei aware ISO-8601**（僅供人讀的鑑識時間戳）；
+       所有 elapsed / freshness / TTL 計算仍只使用 `at_monotonic`。
+       時區不可解析時 `at_wall` 為 null —— 不猜、不 fallback UTC。
+    """
+    if sink is None:
+        return AUD.W_DISABLED, None
+    ev = evidence if evidence is not None else AUD.CycleEvidence(None)
+    exec_result = ev.execution_result
+    why = None
+    if exec_result is not None:
+        # 沿用既有的 no_action 分類，不另造一套字彙
+        why = PRD.observe_record(exec_result, config=config).no_action_reason
+    # 🔴 GAP-A1：at_wall 必須是 Asia/Taipei aware ISO-8601。
+    #    一律 reuse 該鏈已經在用的 aware local_now（production 由
+    #    PRD.build_local_now() 注入），**不新造第二套 timezone helper**、
+    #    不使用 naive 的 time.strftime()/datetime.now()、不 fallback UTC。
+    now_fn = ev.local_now or (local_now if local_now is not None
+                              else PRD.build_local_now())
+    rec = AUD.build_record(
+        cycle_result=cycle_result, execution_result=exec_result,
+        observation=ev.observation,
+        run_id=sink.run_id, boot_id=sink.boot_id,
+        at_wall=AUD.format_wall(now_fn()),
+        no_action_reason=why, sink_healthy=sink.healthy)
+    outcome, seq = sink.append(rec)
+    if outcome != AUD.W_OK:
+        # 🔴 不吞、不假裝成功 —— 明確可見，但不阻擋控制
+        log(f"[WARNING] durable audit 寫入失敗（{sink.last_error}）；"
+            f"控制服務繼續運轉（{AUD.AUDIT_WRITE_FAILURE_POLICY}）。"
+            f"累計失敗 {sink.write_failure_count} 筆")
+    return outcome, seq
 
 
 def shutdown(runtime):
@@ -1075,6 +1191,13 @@ def print_startup(rt, installed, why, root=None, wiring=None):
           f"   ← False：結構上不可能送出任何 PCS 指令")
     print(f"  config 就緒     : {c.dispatch_ready}")
     print(f"  缺少的參數      : {list(c.missing_required())}")
+    print(f"  audit sink      : "
+          f"{(wiring.sources.get('audit_sink') if wiring else 'n/a')}"
+          f"（fsync={AUD.AUDIT_FSYNC_POLICY} "
+          f"failure={AUD.AUDIT_WRITE_FAILURE_POLICY} "
+          f"rotation={AUD.ROTATION_POLICY}）")
+    print(f"  decision cadence: {production_interval_sec(c)}s"
+          f"（來源：DEFAULT_CONTROL_CONFIG.decision_interval_sec）")
     print(f"  Runtime 狀態    : {rt.state}")
     print(f"  觀測來源        : {'已注入' if rt.snapshot()['has_observation_source'] else '無'}")
     print(f"  dispatch_enabled: {rt.snapshot()['dispatch_enabled_instance']}")
@@ -1154,8 +1277,11 @@ def live_leg_main(action, root=None, prompt=None, operator_run=None,
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="PCS 自動控制服務（D.3-A Runtime Skeleton）")
-    ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SEC,
-                    help="skeleton 迴圈間隔秒數（不是 decision_interval_sec）")
+    # 🔴 GAP-1：預設 None = 不覆寫 → 由 production config 決定 cadence。
+    #    明確指定時才覆寫（既有 CLI override 契約保留）。
+    ap.add_argument("--interval", type=float, default=None,
+                    help="覆寫迴圈間隔秒數；未指定時使用 production config 的 "
+                         "decision_interval_sec")
     ap.add_argument("--max-ticks", type=int, default=None, help="達到輪數即結束（測試用）")
     ap.add_argument("--status", action="store_true", help="只顯示狀態後結束")
     ap.add_argument("--root", default=None, help="覆寫 output root（測試用）")
@@ -1185,8 +1311,10 @@ def main(argv=None):
     # Runtime core 只拿到一個可呼叫物件，不知道資料從哪來。
     # D.5-B：production path 明確接線。client / meter_client 未提供時
     # 對應來源 Fail Closed —— 連線是明確操作，不是預設行為。
+    audit_sink = PRD.build_audit_sink()
     obs_source, recovery, wiring = build_production_stack(
-        client=None, meter_client=None)
+        client=None, meter_client=None, audit_sink=audit_sink)
+    audit_evidence = AUD.CycleEvidence(obs_source)
     rt = RT.AutoControlRuntime(observation_source=obs_source,
                                recovery_source=recovery)
 
@@ -1226,10 +1354,13 @@ def main(argv=None):
 
     print_startup(rt, installed, why, args.root, wiring=wiring)
     try:
-        n = run(rt, interval=args.interval, stop_event=stop_event,
-                max_ticks=args.max_ticks)
+        n = run(rt,
+                interval=(_UNSET if args.interval is None else args.interval),
+                stop_event=stop_event, max_ticks=args.max_ticks,
+                audit_sink=audit_sink, audit_evidence=audit_evidence)
     finally:
         shutdown(rt)
+    log(str(audit_sink))
     log(f"已停止（共執行 {n} 輪）。")
     return 0
 

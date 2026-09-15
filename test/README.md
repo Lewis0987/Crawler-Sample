@@ -79,7 +79,16 @@ External Controller
 | `phase6_remote_adapter.py` | 遠端 guard 契約、SSH timeout、capability 解析 |
 | `phase6_unattended_service.py` | 無人值守服務 lifecycle 與 live readiness |
 | `phase6_guard_deploy_plan.py` | Guard 部署／回滾套件（只產生指令，不執行） |
-| `run_all.py` | 一鍵執行全部擷取腳本 |
+| `pcs_auto_control_runtime.py` | Phase 6 控制 Runtime 狀態機（純邏輯、零 I/O） |
+| `pcs_auto_control_service.py` | Phase 6 服務外殼：Ownership、迴圈節奏、關閉流程 |
+| `pcs_auto_control_production.py` | Production 相依組裝（reader／meter／tariff／policy） |
+| `decision_observer.py` | 觀測層：meter + ESS → 分類 → TOU → 決策（OBSERVE-ONLY） |
+| `production_arbiter.py` | 仲裁／授權：freshness 複驗、Safety、Authority、互鎖 |
+| `production_execution_chain.py` | 執行鏈（唯一可能呼叫 executor 之處；目前未注入） |
+| `phase6_decision_simulator.py` | 離線決策模擬器（零 I/O、可重播） |
+| `phase6_decision_replay_runner.py` | 長時間虛擬時鐘 replay runner（不 sleep） |
+| `phase6_decision_audit.py` | Durable Decision Audit（append-only JSONL；零控制能力） |
+| `run_all.py` | 一鍵執行全部**擷取腳本**（⚠️ **不是** Phase 6 regression 入口） |
 | `run_phase3_regression.py` | Phase 2~5 Regression 總表 |
 
 ## 5. 快速使用
@@ -149,6 +158,154 @@ Windows SCM → NSSM → auto_monitor_service.py → report_monitor.py
 > 三種 kW 語意（Grid Meter `+=IMPORT`、Battery `+=CHARGE`、
 > PCS Command `CHARGE→負 setpoint`）**嚴禁混用**。
 > 逐階段開發歷史見 [Appendix](#appendix--historical-development-notes)。
+
+### 7.1 Offline Application Layer
+
+決策鏈本身（6.0~6.5）早已完成；後續補的是**應用層工具與 orchestration 驗證**，
+全部 OFFLINE / ZERO-I/O / 虛擬時鐘，**沒有第二套決策實作**：
+
+| 元件 | 內容 | 狀態 |
+|---|---|---|
+| Offline Decision Simulator | A–P 決策矩陣端到端組裝、`_UNSET` vs `None` 語意 | COMPLETE |
+| Long-Running Decision Loop | L1–L16 時間軸重播、24h synthetic day、13 條不變量 | COMPLETE |
+| Runtime / Arbiter Integration | 直接驅動正式 Runtime + Arbiter + Execution Chain | COMPLETE |
+| Service Scheduling | cadence 接線與可注入等待 | COMPLETE |
+| Durable Decision Audit | 一 cycle 一筆、跨 process 可追溯 | COMPLETE |
+
+驗證要點：
+
+- **冷啟動**：分類器第一個 debounce 窗內 `grid = UNKNOWN` → `no_action`，
+  這是**預期的 Fail Closed**，不得以灌假樣本繞過。
+- **方向反轉**：PCS 實際為 `CHARGING`／`DISCHARGING` 時要求反向 →
+  `DIRECTION_REVERSAL_REQUIRES_STOP`；Arbiter 層會另外形成獨立 STOP leg。
+  PCS 實際狀態一律來自 observation，**不得**由上一輪意圖推導。
+- **Authority**：每個 cycle 重新佐證；上一輪 `OWNED_BY_PHASE6` 不得沿用。
+- **稽核**：兩層並存（見 §7.4）——
+  `AUDIT_LIMIT = 200` 記憶體 ring（即時 diagnostics）
+  ＋ durable JSONL sink（歷史 trace）。
+
+### 7.2 Production TOU（時段）接線
+
+```
+build_production_stack() / build_live_chain_bundle()
+  → PRD.build_tariff_provider(AC.PRODUCTION_PROVIDER)
+  → PRD.build_local_now()            # Asia/Taipei aware datetime
+  → DecisionObserver(tariff_provider=..., local_now=...)
+  → TariffProvider.observe(aware_dt)
+  → tou_calendar.classify_tou(...)   # 規則仍只有這一套
+```
+
+- 時區 **Asia/Taipei**，時間一律 **aware datetime**。
+- **naive datetime 明確拒絕** → `NAIVE_DATETIME_REJECTED` → TOU `UNKNOWN`
+  → `INVALID_TOU_STATE` → `no_action`（**UNKNOWN 絕不等同 OFF_PEAK**）。
+- 年度離峰日沿用已人工驗收的 **2026 / 2027** 清單（`AC.PRODUCTION_PROVIDER`）。
+- 時區無法解析時**不 fallback UTC、不用系統本機時間** —— 回 naive 讓
+  TariffProvider 拒絕，維持 Fail Closed。
+- `local_now` 仍可注入，供離線測試／虛擬時鐘／確定性重播使用。
+
+### 7.4 Durable Decision Audit
+
+兩層稽核**互不取代**：
+
+| 層 | 內容 | 保存 |
+|---|---|---|
+| `AutoControlRuntime.audit` | 最近 `AUDIT_LIMIT = 200` 筆 `CycleResult` | 記憶體，重啟即失 |
+| `phase6_decision_audit.AuditSink` | 每個 cycle **一筆** immutable 紀錄 | `output/phase6_audit/decision_audit.jsonl` |
+
+已裁示的 policy：
+
+| 項目 | 值 |
+|---|---|
+| `AUDIT_GRANULARITY` | `ONE_CYCLE_ONE_RECORD` |
+| `AUDIT_FORMAT` | `APPEND_ONLY_JSONL` |
+| `AUDIT_FSYNC_POLICY` | `EVERY_CYCLE`（append → flush → fsync） |
+| `AUDIT_WRITE_FAILURE_POLICY` | `NON_GATING_CONTINUE` |
+| `ROTATION_POLICY` | **DEFERRED** |
+| `RETENTION_POLICY` | **DEFERRED** |
+
+Schema：`SCHEMA_VERSION = 1`，**46 個 required key**
+（Identity / Time / Runtime / Meter / Tariff / ESS / PCS / Decision /
+Authority / Safety / Direction / Authorization / Execution / Recovery /
+detail / `audit_sink_healthy`）。
+
+欄位語意：
+
+- `seq` 跨 process 單調遞增（開檔時由**檔尾**回復，不整檔掃描）；
+  `cycle` 是 runtime 內序號，restart 後歸零；
+  `run_id` 區分每次執行；`boot_id` 區分每次開機。
+- `at_wall` = **Asia/Taipei aware ISO-8601**（例：`2026-09-15T10:12:34+08:00`）
+  —— **僅供人閱讀的鑑識時間戳**，不參與任何判定。
+  時間來源沿用該鏈已在使用的 aware `local_now`（production 由
+  `PRD.build_local_now()` 注入），**不新造第二套 timezone helper**、
+  不使用 naive 的 `time.strftime()` / `datetime.now()`、**不 fallback UTC**。
+  時區不可解析時 `at_wall` 為 `null`（同一筆的 `tou_reason` 會說明原因）。
+- `at_monotonic` 是 **唯一** 用於 elapsed / freshness / TTL 計算的時間基準
+  （跨 boot 不可比）。
+- **REQUIRED KEY 契約**：每個 key 必定存在，**值可為 null** ——
+  觀測不到就是 null，並由對應的 `*_reason` 說明原因。
+  「能回答問題」的標準是「有值 **或** 有明確 reason」。
+
+硬性邊界：
+
+- 🔴 Audit 是 **evidence**，**不是控制狀態恢復來源** ——
+  不得用來恢復 pending authorization / previous decision / `COMMAND_PENDING`。
+  正式 recovery 仍走 fresh observation + `LastControlStore` + `ExecutionReconciler`。
+- 🔴 **不得增加任何 device I/O**：一律使用該 cycle 已取得的 fresh observation，
+  絕不為了寫稽核而再讀一次 ESS 或電表（已由測試鎖住 with/without audit
+  的讀取次數必須完全相同）。
+- 🔴 寫入失敗 = `NON_GATING_CONTINUE`：控制服務照常運轉，但**絕不假裝成功** ——
+  `healthy` 轉 False、`write_failure_count` 累加（成功後**不清零**）、
+  `last_error` 保留，並印出明確 WARNING。它不得改變 Runtime / Authority /
+  Safety / dispatch 任何狀態。
+- 🔴 **不得寫入**密碼 / token / Bearer / cookie / session secret / SSH 私鑰 /
+  SM2 私鑰材料，也不得把原始 HTTP response 或 `alarm_rows` 原封 dump 進去。
+- 🔴 與 **Phase 6.10 ownership journal 是不同的東西**：本層沒有 intent→outcome
+  狀態機、沒有 handoff state，只共用「append-only + fsync」的寫入模式。
+
+**已知限制（不是缺陷，是目前設計的明確邊界）：**
+
+1. **Rotation** — `ROTATION_POLICY = DEFERRED`，本版不做任何刪除或搬移。
+2. **Retention** — `RETENTION_POLICY = DEFERRED`。
+3. **檔案成長** — cadence 30 s、每筆約 1.3 KB → **約 4 MB/天**。
+   rotation / retention 另行裁示前，**請自行留意磁碟使用量**。
+4. **crash 前最後一次寫入失敗** —— `seq` 由 JSONL 中最後一筆成功紀錄回復。
+   若「最後一次 audit write 失敗後隨即 process crash」，單靠同一份 JSONL
+   **無法**得知那個失敗的 seq 曾經存在，restart 後可能從最後成功 seq + 1
+   重新使用該號碼。這是 **single-file non-gating audit 的既有限制** ——
+   目前 **沒有 sidecar watermark、沒有 manifest**。
+   因此**不得宣稱**「每一次 write failure 跨 restart 都能由 seq gap 偵測」。
+   （同一個 process 內的失敗仍會留下 seq 空洞，已由測試佐證。）
+5. **`ObserveRecord.meter_state` 恆為 `None`** —— 來源／schema 不一致
+   （`ProductionArbiter` 的 `ArbitrationResult` 並無該欄位）。
+   影響範圍**僅限** `--status` 的 observation 顯示；
+   對 Decision / Authority / Safety / Direction Interlock / Runtime /
+   Durable Audit / Fail Closed **完全無影響** ——
+   Durable Audit 並未使用該欄位，而是直接取
+   `DecisionObservation` 的 `grid_power_kw` / `meter_valid` /
+   `meter_reason` / `meter_age`。待日後獨立的 status/schema cleanup 處理。
+6. **LIVE dispatch atomicity** —— 目前 `ONE_CYCLE_ONE_RECORD` 適用於
+   `DISPATCH_ENABLED = False` / `executor = None` 的現況。未來若 LIVE policy
+   要求「audit durable success 是 dispatch 的前提」，需另行設計
+   **PRE-DISPATCH INTENT + POST-DISPATCH OUTCOME** 的兩段式 durability protocol。
+   目前 **NOT IMPLEMENTED / NOT REQUIRED FOR CURRENT OFFLINE SCOPE**。
+
+### 7.3 Service Cadence
+
+- 正式節奏 `decision_interval_sec = 30.0 FINAL`，
+  **唯一來源**為 `pcs_auto_control_config.DEFAULT_CONTROL_CONFIG`；
+  service 內**不再**保留第二份數值。
+- CLI `--interval` override 保留；未指定時走 production config。
+- cadence 必須 **finite 且 > 0**。`0` / 負數 / `None` / `NaN` / `inf` /
+  非數字一律 **不進入主迴圈**（Fail Closed），不自行 fallback 成任何秒數。
+  （`0` 會讓常駐服務變成 tight loop，而一個正常 cycle 至少會產生
+  ESS ×2 + 電表 ×2 次讀取。）
+- `run(waiter=...)` 可注入等待機制；production 預設仍為 `stop_event.wait`。
+  離線測試一律以「正式 cadence + fake waiter」達成零等待，
+  **不得**把 cadence 設成 0 來規避等待。
+- cadence 屬 service shell 的 I/O 排程，**不得**塞進 `AutoControlRuntime`
+  —— Runtime 必須維持「可被任意／虛擬節奏驅動的純 cycle」。
+- `authorization_ttl_sec = 10.0` < cadence 30.0 **不構成衝突**：
+  授權票的生命週期在單一 cycle 內，不跨輪（已由測試佐證）。
 
 ## 8. Phase 6.10 — Unattended Ownership Handoff
 
@@ -229,6 +386,13 @@ Phase 6.10 OFFLINE DEVELOPMENT = COMPLETE / FROZEN
 | 6.8 | Regression & Closure | COMPLETE |
 | 6.9 | Controlled FIRST LIVE | ATTEMPTED / BLOCKED |
 | 6.9-A | CLI Entry Wiring | OFFLINE VERIFIED |
+| Phase 6 (offline app layer) | Offline Decision Simulator | COMPLETE |
+| Phase 6 (offline app layer) | Long-Running Decision Replay | COMPLETE |
+| Phase 6 (offline app layer) | Runtime / Arbiter Integration | COMPLETE |
+| Phase 6 (offline app layer) | TariffProvider Production Wiring | COMPLETE / VERIFIED |
+| Phase 6 (offline app layer) | Service Scheduling / Wait Injection | COMPLETE |
+| Phase 6 (offline app layer) | Durable Decision Audit | COMPLETE |
+| Phase 6 (offline app layer) | Process Lifecycle Enum | NOT CURRENTLY REQUIRED |
 | Phase 6.10 | Unattended Ownership Handoff | OFFLINE COMPLETE / FROZEN |
 | 6.10 Core | Ownership Handoff Core | COMPLETE |
 | 6.10-A | Remote Adapter | COMPLETE |
@@ -250,6 +414,17 @@ Phase 6.10 OFFLINE DEVELOPMENT = COMPLETE / FROZEN
 
 - Phase 1 ~ Phase 5：COMPLETE
 - Phase 6：OFFLINE COMPLETE / LIVE HOLD
+- Phase 6 offline application layer：Offline Decision Simulator /
+  Long-Running Decision Replay / Runtime·Arbiter Integration /
+  TariffProvider Production Wiring / Service Scheduling 皆 COMPLETE
+- Durable Decision Audit：COMPLETE
+  （RAM ring 200 筆 ＋ append-only JSONL；rotation / retention 仍 DEFERRED）
+- Process Lifecycle Enum：NOT CURRENTLY REQUIRED
+  （目前沒有 evidence 需要新增，非永久禁止）
+- REAL_REPLAY_FIXTURE：DEFERRED（未讀取任何現場 CSV / JSON / JSONL）
+- 未裁示的 production 參數（一律維持 `None`，**不得**自行填值）：
+  `min_switch_interval_sec` = None / DEFERRED（Layer 2 時間互鎖，見 §7）、
+  `meter_stale_grace_sec` = None / DEFERRED（電表 stale 寬限，採最保守解釋＝不等待）
 - Phase 6.10：OFFLINE COMPLETE / FROZEN
 - Phase 6.10-B1.7：ACCEPTED FOR CURRENT DEPLOYMENT
 - Phase 6.10-B2 LIVE：DEPLOYED / READ-ONLY VERIFIED
@@ -305,10 +480,26 @@ Field command count：
 | 範圍 | 基準 | 執行方式 |
 |---|---|---|
 | Phase 2~5 | **1802 / 1802 PASS**，0 FAIL / 0 SKIP | `python run_phase3_regression.py` |
-| Phase 6 | **4172 / 4172 PASS**，43 檔，0 FAIL | 逐檔執行 `test_phase6*.py` |
+| Phase 6 | **4925 / 4925 PASS**，50 檔，0 FAIL | 逐檔執行 `test_phase6*.py` |
+
+主要 dedicated 基準：
+
+| 測試 | 基準 |
+|---|---|
+| `test_phase6_decision_matrix_e2e.py` | 174 / 174 |
+| `test_phase6_decision_longrun.py` | 146 / 146 |
+| `test_phase6_runtime_arbiter_longrun.py` | 100 / 100 |
+| `test_phase6_gap3_tariff_wiring.py` | 50 / 50 |
+| `test_phase6_gap12_service_scheduling.py` | 63 / 63 |
+| `test_phase6_gap4_durable_audit.py` | 90 / 90 |
 
 > `run_phase3_regression.py` 只涵蓋 Phase 2~5，**不含 Phase 6**；
 > Phase 6 目前**沒有**專屬的 runner 入口，以逐檔執行為準。
+>
+> ⚠️ **`run_all.py` 不是 regression 入口** —— 它是 dashboard scraper 總入口，
+> 會對 HMI 發出唯讀 GET 並寫入 `output/`。任何名稱不明的
+> `run_all.py` / `main.py` / `service.py` / `runner.py`，
+> 執行前必須先確認其 I/O side effects。
 
 ## 11. 文件
 
@@ -334,6 +525,9 @@ Field command count：
 - **不要同時啟動第二個 Monitor writer** —— Ownership 會擋下，但應避免。
 - **Phase 6 預設不允許實機控制**：`DISPATCH_ENABLED = False`、`MODE = DRY_RUN`。
 - 任一條件無法確認一律 **Fail Closed**；不確定不等於安全。
+- **Durable Decision Audit 目前無 rotation / retention**（皆 DEFERRED）：
+  `output/phase6_audit/decision_audit.jsonl` 會持續成長（約 4 MB/天），
+  需自行留意磁碟；它是稽核證據，**不是**控制狀態恢復來源。
 - 詳細歷史、實機證據與量測紀錄請看 `docs/`、`test/`、`output/`。
 
 ---

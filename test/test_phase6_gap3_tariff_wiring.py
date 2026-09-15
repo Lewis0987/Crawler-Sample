@@ -375,13 +375,19 @@ def test_X_timeline_timebase():
 def test_N_scope():
     print("\n[N] scope：只處理 GAP-3")
     cfg = __import__("pcs_auto_control_config").DEFAULT_CONTROL_CONFIG
-    check("★★ N1. GAP-1 未動：decision_interval_sec 仍為 30.0 FINAL，"
-          "service skeleton interval 仍為 10",
+    # OLD（GAP-1/2 修正前）：service 另有 DEFAULT_INTERVAL_SEC = 10，
+    #                        run() 無 waiter 注入點。
+    # NEW（GAP-1/2 修正後）：cadence 唯一來源為 production config；
+    #                        run() 可注入 waiter。GAP-3 本身不受影響。
+    # WHY：這兩條原本是「GAP-1/2 尚未處理」的哨兵，現已處理，
+    #      必須改成鎖住新契約，否則會把已修好的缺陷鎖回去。
+    check("★★ N1. decision_interval_sec 仍為 30.0 FINAL，且為 service 的唯一來源",
           cfg.decision_interval_sec == 30.0
-          and SVC.DEFAULT_INTERVAL_SEC == 10)
-    check("★★ N2. GAP-2 未動：run() 仍無 sleeper/waiter 抽象",
-          not any(n in dir(SVC) for n in ("Sleeper", "Waiter", "Scheduler",
-                                          "build_sleeper", "build_waiter")))
+          and SVC.production_interval_sec() == 30.0
+          and not hasattr(SVC, "DEFAULT_INTERVAL_SEC"))
+    check("★★ N2. cadence 仍留在 service shell，未塞進 Runtime",
+          "decision_interval_sec" not in
+          __import__("io").open(RT.__file__, encoding="utf-8").read())
     check("★★ N3. GAP-4 未動：audit ring 仍為 200，未新增 journal",
           RT.AUDIT_LIMIT == 200
           and not hasattr(RT.AutoControlRuntime(), "journal"))
