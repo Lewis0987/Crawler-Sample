@@ -147,7 +147,16 @@ def main():
     check("★★ provider 預設為 None", RM._control_session_provider is None)
     check("★★ 既有路徑（智慧模式＋排程開）仍可通過",
           gate("charge", "smart", True)[:3] == (True, "scheduler", "scheduler"))
-    for tag, mode, sched, want in (("非智慧模式", "manual", True, "control_mode=manual"),
+    # OLD : ("非智慧模式", "manual", True, "control_mode=manual")
+    # NEW : want 改為 "manual_schedule_on_invalid"
+    # WHY : C-0 之後 manual 不再一律被擋；這一筆是 sched=True 的異常組合
+    #        -> Fail Closed。**仍然不建立**，只有 reason 更精確。
+    #        另補一筆 unknown：確認「無法確認模式」仍 Fail Closed（方案 b）。
+    # EVIDENCE : 2026-10-22 手動放電全程 state=IDLE/session=None，charge_discharge_reports 最新檔停在 2026-08-18；使用者同日裁示 C-0（方案 b）＋ 第 2/3 項補充。
+    for tag, mode, sched, want in (("manual＋排程開（異常組合）", "manual", True,
+                                    "manual_schedule_on_invalid"),
+                                   ("模式未知（unknown）", "unknown", False,
+                                    "control_mode=unknown"),
                                    ("排程未開", "smart", False, "schedule_off")):
         ok, reason, origin, sp = gate("charge", mode, sched)
         check(f"★★ {tag} → 仍不建立（{want}）",
@@ -201,8 +210,22 @@ def main():
     BR.install(tl)
     check("  D. 重啟前：Phase 6 擁有 → 允許", gate("charge")[0] is True)
     BR.uninstall()                      # 模擬行程結束
-    check("★★ D. 重啟瞬間（橋接未安裝）→ 退回既有條件，不誤建",
-          gate("charge", "manual", False)[0] is False)
+    # OLD : gate("charge", "manual", False)[0] is False
+    #        （舊規則：橋接未安裝 -> manual 一律不建立）
+    # NEW : 橋接未安裝 ＋ manual ＋ 排程關 -> C-0 observed 路徑**會**建立；
+    #        改以 unknown 驗證「無法確認模式時不誤建」，並明確斷言
+    #        C-0 的新行為與 origin。
+    # WHY : 這正是 C-0 要解決的問題（手動充放電必須留下報告）。
+    #        原測試用 manual 當「什麼都不該發生」的探針，該前提已失效；
+    #        改用 unknown 才能繼續檢驗「不誤建」的原意。
+    # EVIDENCE : 2026-10-22 手動放電全程 state=IDLE/session=None，charge_discharge_reports 最新檔停在 2026-08-18；使用者同日裁示 C-0（方案 b）＋ 第 2/3 項補充。
+    check("★★ D. 重啟瞬間（橋接未安裝）＋模式未知 → 不誤建",
+          gate("charge", "unknown", False)[0] is False)
+    check("★★ D. 重啟瞬間（橋接未安裝）＋manual＋排程關 → C-0 observed",
+          gate("charge", "manual", False)[:3]
+          == (True, "manual_observed", "observed"))
+    check("★★ D. 重啟瞬間（橋接未安裝）＋manual＋排程開 → Fail Closed",
+          gate("charge", "manual", True)[1] == "manual_schedule_on_invalid")
     BR.install(Timeline([CHARGING]))    # 模擬重啟後重新安裝
     check("★★ D. 重啟後重新安裝 → 依 durable 擁有權恢復判定",
           gate("charge")[0] is True)
@@ -237,8 +260,16 @@ def main():
 
     RM.set_control_session_provider(_boom)
     ok, reason, origin, sp = gate("charge", "manual", False)
-    check("★★ F. provider 例外 → 退回既有條件，不中斷判斷",
-          ok is False and reason == "control_mode=manual")
+    # OLD : reason == "control_mode=manual"
+    # NEW : reason == "phase6_context_not_owned"
+    # WHY : provider 已安裝代表 Phase 6 control context 存在；例外時無法確認
+    #        擁有權 -> 依裁示第 3 項「R1 Fail Closed 就必須真的 Fail Closed」，
+    #        **不得**因 mode=manual 退回 C-0。
+    #        **行為未變**（ok 仍為 False），只有 reason 更精確；
+    #        smart 路徑仍照舊退回既有條件（見本區塊 G 的 Orchestrator 例外案）。
+    # EVIDENCE : 2026-10-22 手動放電全程 state=IDLE/session=None，charge_discharge_reports 最新檔停在 2026-08-18；使用者同日裁示 C-0（方案 b）＋ 第 2/3 項補充。
+    check("★★ F. provider 例外 → manual 側 Fail Closed（不退回 C-0）",
+          ok is False and reason == "phase6_context_not_owned")
     check("★★ F. 例外不外洩（報告層問題不得影響控制層）",
           RM._control_session_state() is None)
     check("★★ F. 控制側參數未被報告失敗改寫",

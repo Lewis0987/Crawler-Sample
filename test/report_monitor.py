@@ -675,6 +675,12 @@ _control_session_provider = None
 
 # 由 R1 觸發時的來源標記（與既有 origin=manual/scheduler 並列）
 ORIGIN_PHASE6 = "phase6"
+# C-0（2026-10-22）：手動模式下由 Monitor Owner 依「設備實際方向」建立的報告。
+#   origin 只寫入事件供稽核，**不影響**任何流程或守門。
+ORIGIN_OBSERVED = "observed"
+#   canonical manual 模式代碼（語言無關，來源 pcs_control_mode_code）。
+#   🔴 "unknown" 刻意**不**納入 —— 無法確認模式時不得推論為 manual。
+ORIGIN_MANUAL_MODE_CODE = "manual"
 
 
 def set_control_session_provider(fn):
@@ -715,12 +721,54 @@ def _start_gate(mode_code, sched_on, direction):
     """
     是否允許自動建立報告。回傳 (ok, reason, origin, setpoint)。
 
-    兩條互斥的路徑，**任一成立即可**：
+    三條互斥的路徑，**任一成立即可**：
       既有路徑：智慧模式 ＋ 排程主開關開            → origin=scheduler
       R1 路徑 ：Phase 6 擁有該作業且方向一致        → origin=phase6
+      C-0 路徑：手動模式 ＋ 排程主開關關 ＋ 無 Phase 6 context → origin=observed
 
     🔴 R1 路徑額外要求「Phase 6 宣稱的方向」與「設備實際方向」一致 ——
        兩者不符代表擁有權有疑義，此時**不建立報告**（Fail Closed）。
+
+    🔴 OLD / NEW / WHY / EVIDENCE（2026-10-22 C-0，方案 b）
+      OLD : `if mode_code != "smart": return False` ——
+            只有智慧模式會自動建報告，手動充/放電一份報告都不會產生。
+      NEW : 新增第三條路徑：`mode_code == "manual"` 且設備實際在充/放電
+            -> `origin=observed`。
+      WHY : 報告記錄的是「設備實際發生的有效充／放電」，不是「誰按了按鈕」。
+            Monitor Owner 每輪已從 `_read_device_state()` 取得
+            charging_flag / discharging_flag / control_mode_code，
+            本來就看得到手動充放電，只是被本函式擋住。
+      EVIDENCE : 2026-10-22 手動放電（14:27:03 ~ 14:31:25）全程
+            `state=IDLE session=None`，log 逐行記著
+            「[AUTO] 控制模式非智慧模式（manual）→ 不自動建立報告」，
+            `charge_discharge_reports` 最新檔案仍停在 2026-08-18。
+
+      🔴 **unknown 不得視為 manual**（使用者 2026-10-22 裁示，方案 b）：
+         `unknown` 代表「目前無法確認模式」，不得用「非 smart 即 manual」推論。
+         401 造成的 mode=unknown 列為獨立 BUG，本次不處理。
+
+      🔴 本函式**只放寬 A/B**。其餘守門一項都沒有放寬，且全部在本函式**之後**
+         由呼叫端執行：C 方向、G debounce（AUTO_HOLD_START_SEC=15）、
+         D session_exists、E pcs_fault、F pending、cooldown、
+         AUTO_SCHEDULE_REPORT_ENABLED、is_owner、Authoritative Writer Gate。
+
+      🔴 **R1 優先權不得被 C-0 繞過**（2026-10-22 裁示第 3 項）：
+         `_control_session_state()` 會把四種情況都塌縮成 `None` ——
+           ① provider 未安裝（根本沒有 Phase 6 context）
+           ② provider 例外
+           ③ context 存在但 `owned is not True`（Authority UNKNOWN / EXTERNAL）
+           ④ context 存在但 action 非 charge/discharge
+         C-0 之前 `None` 無害（下游 `mode != "smart"` 會擋）；
+         C-0 之後若直接走 manual 路徑，③④ 就會繞過 R1 的 Fail Closed。
+         因此 manual 路徑**之前**先確認「是否存在 Phase 6 context」：
+         provider 已安裝即代表 Phase 6 正在驅動 -> R1 說了算 -> Fail Closed。
+         🔴 這個檢查**只擋 manual 路徑**，smart 路徑完全不受影響 ——
+            否則「未取得擁有權時 scheduler 舊路徑不得退化」會變成真實退化。
+
+      🔴 **manual ＋ schedule_enabled 為異常狀態組合 -> Fail Closed**
+         （2026-10-22 裁示第 2 項）：手動模式下排程主開關卻是開的，
+         代表控制來源無法確認，不得建立報告。reason 為
+         `manual_schedule_on_invalid`（可測試）。
     """
     st = _control_session_state()
     if st is not None:
@@ -729,7 +777,28 @@ def _start_gate(mode_code, sched_on, direction):
                        f"但設備實際方向為 {direction} → 不建立報告")
             return False, "phase6_direction_mismatch", None, None
         return True, "phase6_owned", ORIGIN_PHASE6, st.get("target_power_kw")
+    if mode_code == ORIGIN_MANUAL_MODE_CODE:
+        # 🔴 R1 優先：Phase 6 context 存在卻未取得擁有權（Authority
+        #    UNKNOWN / EXTERNAL / 方向不符 / provider 例外）-> 真的 Fail Closed，
+        #    **不得**因為 mode=manual 就退回 C-0 observed 路徑。
+        #    只擋 manual；smart 路徑不受影響（見 docstring）。
+        if _control_session_provider is not None:
+            _auto_note("[AUTO] Phase 6 control context 存在但未取得擁有權 "
+                       "→ 依 R1 Fail Closed，不建立 observed 報告")
+            return False, "phase6_context_not_owned", None, None
+        # 🔴 異常狀態組合：手動模式卻開著排程主開關 -> 控制來源無法確認。
+        if sched_on:
+            _auto_note("[AUTO] 手動模式但排程主開關為開（狀態組合異常）"
+                       "→ Fail Closed，不建立報告")
+            return False, "manual_schedule_on_invalid", None, None
+        # C-0：手動模式。方向與 debounce 由呼叫端的 C / G 判定，本處不重複。
+        # 🔴 不帶 key：`_auto_note` 的 key 必須是 `_auto` dict 既有欄位，
+        #    傳入未宣告的 key 會 KeyError。本函式內既有兩處 note 也都不帶 key。
+        _auto_note(f"[AUTO] 手動模式偵測到設備實際方向 {direction}"
+                   f" → 依 C-0 由 Monitor Owner 建立報告")
+        return True, "manual_observed", ORIGIN_OBSERVED, None
     if mode_code != "smart":
+        # unknown / 其他：無法確認模式 -> 一律不建立（Fail Closed）
         _auto_note(f"[AUTO] 控制模式非智慧模式（{mode_code}）→ 不自動建立報告")
         return False, f"control_mode={mode_code}", None, None
     if not sched_on:

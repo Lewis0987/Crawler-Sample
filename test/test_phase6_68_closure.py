@@ -295,11 +295,21 @@ def main():
           RM._start_gate("manual", False, "discharge")[1]
           == "phase6_direction_mismatch")
     RM.clear_control_session_provider()
+    # OLD : ... and RM._start_gate("manual", False, "charge")[0] is False
+    #        （舊規則：未安裝橋接時 manual 一律不建立）
+    # NEW : manual ＋ 排程關 -> C-0 observed；改以 unknown 驗證 Fail Closed。
+    # WHY : 本斷言的原意是「scheduler 舊路徑不得退化」，該部分完全保留
+    #        （smart+sched_on 仍為 scheduler）。manual 只是順帶當探針，
+    #        在 C-0 之後該探針前提已失效 -> 換成 unknown。
+    # EVIDENCE : 2026-10-22 手動放電全程 state=IDLE/session=None，charge_discharge_reports 最新檔停在 2026-08-18；使用者同日裁示 C-0（方案 b）＋ 第 2/3 項補充。
     check("★★ R. 未安裝橋接時，scheduler 舊路徑完全不退化",
           RM._control_session_provider is None
           and RM._start_gate("smart", True, "charge")[:3]
           == (True, "scheduler", "scheduler")
-          and RM._start_gate("manual", False, "charge")[0] is False)
+          and RM._start_gate("unknown", False, "charge")[0] is False)
+    check("★★ R. 未安裝橋接時，manual＋排程關 → C-0 observed（新行為）",
+          RM._start_gate("manual", False, "charge")[:3]
+          == (True, "manual_observed", "observed"))
 
     # ---------------- S. restart / recovery ----------------
     print("\nS. restart / recovery 不繞過 OBSERVE_ONLY")

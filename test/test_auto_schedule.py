@@ -170,7 +170,16 @@ print("[情境 1] 手動模式＋實際充電 → 不建立")
 reset_monitor()
 act, why, calls = run_check(reading(direction="charge", mode_code="manual"))
 check(f"action=skipped（{act} / {why}）", act == "skipped" and not calls)
-check("原因為控制模式非智慧模式", why == "control_mode=manual")
+# OLD : why == "control_mode=manual"
+#        （舊規則：manual 一律不建立，reason 一律 control_mode=manual）
+# NEW : why == "manual_schedule_on_invalid"
+#        本 fixture 的 reading() 預設 schedule=True，屬「manual ＋ 排程主開關開」
+#        的異常狀態組合 -> Fail Closed，reason 改為可測試的專用字串。
+# WHY : C-0 之後 manual 不再一律被擋；真正擋住這一筆的是異常狀態組合。
+#        **行為完全未變**（仍 skipped、仍 0 calls），只有 reason 更精確。
+# EVIDENCE : 2026-10-22 手動放電全程 state=IDLE/session=None，charge_discharge_reports 最新檔停在 2026-08-18；使用者同日裁示 C-0（方案 b）＋ 第 2/3 項補充。
+check("原因為 manual＋排程主開關開的異常組合（Fail Closed）",
+      why == "manual_schedule_on_invalid")
 
 print("\n[情境 2] 智慧模式＋排程關閉＋實際充電 → 不建立")
 reset_monitor()
@@ -1291,7 +1300,14 @@ check("→ Debounce 依 monotonic 實際時間，不依呼叫/刷新次數", Tru
 print("\n[Phase 3.4] START_HOLD 期間任一守門條件失效 → 回 IDLE")
 for _label, _kw, _expect in (
         ("方向消失（idle）", dict(direction="idle"), "direction=idle"),
-        ("智慧模式關閉", dict(mode_code="manual"), "control_mode=manual"),
+        # OLD : ("智慧模式關閉", dict(mode_code="manual"), "control_mode=manual")
+        # NEW : expect 改為 "manual_schedule_on_invalid"
+        #        （reading() 預設 schedule=True -> manual＋排程開 = 異常組合）
+        # WHY : C-0 之後 manual 本身不再是「不建立」的理由；本案仍不建立、
+        #        狀態仍回 IDLE，只有 reason 字串改變。
+        # EVIDENCE : 2026-10-22 手動放電全程 state=IDLE/session=None，charge_discharge_reports 最新檔停在 2026-08-18；使用者同日裁示 C-0（方案 b）＋ 第 2/3 項補充。
+        ("智慧模式關閉（manual＋排程開＝異常組合）",
+         dict(mode_code="manual"), "manual_schedule_on_invalid"),
         ("排程主開關關閉", dict(schedule=False), "schedule_off"),
         ("PCS 故障", dict(fault=True), "pcs_fault")):
     reset_monitor(auto_report=True)
