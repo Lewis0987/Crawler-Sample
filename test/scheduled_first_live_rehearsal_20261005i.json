@@ -1,0 +1,15 @@
+{
+  "_purpose": "TASK SCHEDULER REHEARSAL — VALIDATION ONLY. NOT a field authorization.",
+  "_why": "Attempt #9 建立前的 PRE-FIELD 八步之第 2 步（2026-10-05，外部控制器恢復後重跑）。",
+  "_warning": "target_date 刻意設為過去日期：即使誤以非 --validate-only 呼叫，也只會得到 WRONG_TARGET_DATE 且 0 command。",
+  "_scope_note": "validate-only = static / structural rehearsal；與 construction smoke（第 3 步）／entry-point smoke（第 4 步）／deadline smoke（第 5 步）責任不同，不得混稱。",
+  "enabled": true,
+  "attempt_id": "VALIDATE-ONLY-REHEARSAL-20261005I",
+  "target_date": "2026-09-28",
+  "window_start": "00:00",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/VALIDATE-ONLY-REHEARSAL-20261005I.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live"
+}

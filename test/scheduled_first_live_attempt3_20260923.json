@@ -1,0 +1,15 @@
+{
+  "_authorization": "使用者 2026-09-22 正式授權：2026-09-23 唯一一次 Scheduled FIRST LIVE Attempt #3（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task、Attempt #4。",
+  "_baseline": "Attempt #2 terminal=ABORTED_CURRENT_CONDITIONS / root cause=PROVIDER_WIRING_DEFECT（已 FIXED+VERIFIED）/ safety=SAFE FAIL-CLOSED。成功 5 kW live leg 尚未完成。",
+  "_trigger_note": "維持 00:05。Postmortem 已證明 00:05 時 SOC 仍在 eligible range，Attempt #2 中止原因是 provider wiring defect，不是 trigger 太晚。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT3-20260923",
+  "target_date": "2026-09-23",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT3-20260923.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live/attempt3_20260923"
+}

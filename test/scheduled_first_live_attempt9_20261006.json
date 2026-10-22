@@ -1,0 +1,22 @@
+{
+  "_authorization": "使用者 2026-10-05 確認：FIELD AUTHORIZATION INTENT CONFIRMED，並指定 target_date=2026-10-06、window 00:05–00:30 Asia/Taipei，唯一一次 Scheduled FIRST LIVE Attempt #9（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task、Attempt #10。",
+  "_supersedes": "Attempt #8（FIRST-LIVE-ATTEMPT8-20261002）= COMPLETED / CONSUMED / CLOSED，RESULT = ABORTED_FIRST_LIVE，root cause = ENTRY-POINT / CONTROL-FLOW ORDERING GAP（step 7 前置閘要求完整 permit 含 authority，但 authority 只能在 dispatcher 內取得 -> control-flow cycle）。已以 TWO-STAGE AUTHORIZATION 修正。本次使用全新 Attempt ID / config / per-attempt handoff journal / ledger / artifact / wrapper / Task XML / baseline evidence，不沿用 Attempt #5 / #6 / #7 / #8 任何 execution state。",
+  "_two_stage_authorization": "STAGE A Dispatcher Entry Gate = 14 項，結構上不含 authority_acquire_attempted / authority_acquired。STAGE B FULL FirstLiveDispatchPermit = 16 項（含 authority 兩項，未降低 safety），在 lease.acquire() 之後、進入 first_live_dispatch_scope 之前重新評估。只有 authority acquired + Full Permit PASS + ScheduledLiveLegAuthorization valid 才允許 HO.DISPATCH_ENABLED 暫時為 True；finally 無條件關回 False。RT.DISPATCH_ENABLED 全程 False。",
+  "_execution_deadline": "window_end = NO-NEW-RISK-ACTION DEADLINE，不是 process termination deadline。到期後禁止開始 PAUSE / authority acquire / CHARGE / DISCHARGE / 第二條 live leg；但 command resolution / cleanup STOP / authority release / RESTORE / RestoreVerifier 必須允許完成。canonical 判定由 phase6_execution_deadline.ExecutionDeadline 負責（9 個 checkpoint，wall clock 建立、monotonic 推進）。ExecutionTimeLimit=PT1H 僅為 LAST-RESORT OS PROCESS LIMIT，不是執行預算、不是 window_end、不是 safe cleanup 機制。",
+  "_handoff_journal": "ATTEMPT-SCOPED。路徑由 attempt_id 決定性導出 = ../output/phase6_scheduled_first_live/handoff_journal_FIRST-LIVE-ATTEMPT9-20261006.jsonl（建立 Task 當下尚未存在）。舊的共用 handoff_journal.jsonl 為 LEGACY SHARED JOURNAL，immutable，不再寫入。",
+  "_reporting": "attempt_result 與 live_leg_result 為兩個不同維度，不得互相覆蓋。successful real 5 kW leg 計數依 live_leg_result == SUCCESS（DISPATCH_SUCCEEDED + leg_reached_complete + readback VERIFY_SUCCESS），不看 attempt_result。",
+  "_pre_field_eight_step": "2026-10-05 全部 fresh PASS：1 Full Phase 6 7022/7022（65 files, 0 FAIL）；2 validate-only rehearsal I（LastTaskResult 0、CONFIG_OK、provider_validation 7-7、VALIDATE_ONLY_NOT_EXECUTED、field_side_effects 0、ledger/journal NOT CREATED、task 已刪除）；3 construction smoke 60/60 exit 0；4 entry-point smoke 92/92 exit 0（ordering canonical）；5 deadline smoke 133/133 exit 0；6 host verify PASS（AC STANDBYIDLE/HIBERNATEIDLE 皆 Never、無 pending reboot、Schedule Running）；7 external baseline BASELINE_READY / EXTERNAL_RUNNING（pid 3209，loop 遞增，SSH 僅 probe 1 + loopcheck 3 唯讀）；8 legacy Task scan PASS（9 個舊 Task 全 Disabled，future executable Task = 0）。",
+  "_host_prerequisite": "HOST_POWERED_ON_REQUIRED = True。建立 Task 當下的 host verify 不保證 trigger 時仍成立（Attempt #5 即因此 missed）；自建立 Task 起至 2026-10-06 00:05，主機必須保持開機且 Water 保持登入。注意：2026-10-05 08:57 曾發生一次重新登入（session ID 1->2），該時點無 armed Task 故無影響，但 Task 建立後不得再登出。Task 維持 StartWhenAvailable=False / WakeToRun=False，不補跑、不自行喚醒。",
+  "_external_prerequisite": "外部 auto_control.py 曾於 2026-10-02 10:39 之後停止，使用者已於 2026-10-05 恢復（新 pid 3209）。trigger 前必須保持 EXTERNAL_RUNNING；若再次停止，pre-pause preflight 會 Fail Closed 並中止，0 command。",
+  "_baseline": "TWO-STAGE AUTHORIZATION = IMPLEMENTED；EXECUTION DEADLINE / SAFE CLEANUP = IMPLEMENTED；PRODUCTION CONSTRUCTION = VERIFIED；ENTRY-POINT ORDERING = VERIFIED；FIRST LIVE FULL MOCK = PASS。Attempt #1~#8 皆未完成 5 kW live leg，successful real 5 kW leg 仍為 0 次。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT9-20261006",
+  "target_date": "2026-10-06",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT9-20261006.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live/attempt9_20261006"
+}

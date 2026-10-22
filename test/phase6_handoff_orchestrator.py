@@ -352,6 +352,31 @@ class RemoteController(object):
 # ======================================================================
 # G. Audit Log（append-only JSONL）
 # ======================================================================
+# 🔴 ATTEMPT-SCOPED JOURNAL（2026-10-01 Attempt #7 postmortem）
+#    OnceGuard 的 one-shot 語意是「**同一 Attempt / 同一 handoff session**
+#    內 pause / restore 各最多一次」，**不是**「整個 Phase 6 歷史期間只能一次」。
+#    Attempt #7 因共用單一 `handoff_journal.jsonl`，讀到 Attempt #4 的
+#    PAUSE INTENT 而永久拒送 -> `ALREADY_ATTEMPTED_MUST_VERIFY_NOT_RESEND`。
+LEGACY_SHARED_JOURNAL_NAME = "handoff_journal.jsonl"
+ATTEMPT_JOURNAL_PREFIX = "handoff_journal_"
+
+
+def attempt_journal_path(base_dir, attempt_id):
+    """
+    由 `attempt_id` **決定性地**導出 journal 路徑。
+
+    🔴 deterministic：同一 attempt_id -> 同一路徑（crash recovery 必須能
+       在新 process 重新打開**同一個** journal）。
+    🔴 attempt_id 缺失 / 空白 -> `ValueError`（Fail Closed）；
+       **不得** fallback 回 legacy 共用 journal。
+    """
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise ValueError("attempt_id 必填且不得為空 —— 不得 fallback 回共用 journal")
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_"
+                   for c in attempt_id.strip())
+    return os.path.join(base_dir, "%s%s.jsonl" % (ATTEMPT_JOURNAL_PREFIX, safe))
+
+
 class Journal(object):
     """
     追加式稽核日誌 ＋ durable handoff state。
@@ -362,10 +387,17 @@ class Journal(object):
        因此**必須以觀測驗證**，而不是盲目重送。
 
     🔴 每筆都有單調遞增 seq；檔案只追加不改寫，crash 最多損失最後一行。
+
+    🔴 **ATTEMPT-SCOPED**：正式 Attempt 一律以
+       `attempt_journal_path(base_dir, attempt_id)` 取得專屬檔案，
+       並把 `attempt_id` 寫進每一筆記錄（defense-in-depth）。
+       舊的共用 `handoff_journal.jsonl` 保留為
+       **LEGACY SHARED JOURNAL（含 Attempt #4 證據）**，immutable，不再寫入。
     """
 
-    def __init__(self, path=DEFAULT_JOURNAL, clock=None):
+    def __init__(self, path=DEFAULT_JOURNAL, clock=None, attempt_id=None):
         self.path = path
+        self.attempt_id = attempt_id
         self._clock = clock or (lambda: datetime.datetime.now())
         self._seq = 0
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -383,6 +415,9 @@ class Journal(object):
                "at": self._clock().strftime("%Y-%m-%d %H:%M:%S"),
                "kind": kind, "state": state, "ownership": ownership,
                "detail": detail}
+        # 🔴 defense-in-depth：每筆都帶 attempt_id（主要隔離仍是 per-attempt 檔案）
+        if self.attempt_id is not None:
+            rec["attempt_id"] = self.attempt_id
         rec.update(extra)
         with io.open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
@@ -441,6 +476,118 @@ def _has_unresolved_pause(journal):
     return paused
 
 
+# 🔴 EXECUTION DEADLINE（2026-10-02 裁示）—— canonical 判定一律委派該模組，
+#    本檔**不**自行解析 target_date / window_end。
+import phase6_execution_deadline as _DL                        # noqa: E402
+
+
+def _deadline_blocks(deadline, checkpoint):
+    """
+    回傳 (blocked, detail)。`deadline is None` -> 永不阻擋（向後相容）。
+
+    🔴 SAFE CLEANUP 的 checkpoint（8 / 9）由 `_DL` 保證永遠放行，
+       本函式不另加判斷，避免形成第二套規則。
+    """
+    allowed, verdict, detail = _DL.deadline_check(deadline, checkpoint)
+    if allowed:
+        return False, None
+    return True, "%s @ %s：%s" % (verdict, checkpoint, detail)
+
+
+def _permit_authorizes(permit):
+    """
+    permit 是否**授權**本次 FIRST LIVE dispatch。
+
+    🔴 只問「有沒有授權」，不代表 dispatch 已被打開。
+    🔴 任何無法確認的情況一律 False（Fail Closed）：
+       None / 沒有 `authorizes()` / 呼叫拋例外 / 回傳非 True。
+    """
+    if permit is None:
+        return False
+    fn = getattr(permit, "authorizes", None)
+    if not callable(fn):
+        return False
+    try:
+        return fn() is True
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+# 🔴 必須與 `phase6_first_live_handoff.EV_ENTRY_GATE_PASS` 完全一致。
+#    本模組**不得** import phase6_first_live_handoff（會形成循環 import），
+#    因此以字面值宣告，並由 regression 斷言兩者相等。
+EV_ENTRY_GATE_PASS = "ENTRY_GATE_PASS"
+
+
+def _entry_gate_authorizes(permit):
+    """
+    STAGE A：permit 是否允許**進入** dispatcher。回傳 (ok, why)。
+
+    🔴 只呼叫 `permit.allows_dispatcher_entry()`（duck typing，避免循環 import）。
+    🔴 Fail Closed：None / 沒有該方法 / 呼叫拋例外 / 回傳非 True 一律 False。
+    🔴 **不得**改用 `authorizes()`（那是含 authority 的 STAGE B）。
+    """
+    if permit is None:
+        return False, "未提供 permit"
+    fn = getattr(permit, "allows_dispatcher_entry", None)
+    if not callable(fn):
+        return False, "permit 缺少 allows_dispatcher_entry()"
+    try:
+        ok = fn() is True
+    except Exception as e:                                     # noqa: BLE001
+        return False, "entry gate 評估例外：%s" % type(e).__name__
+    if ok:
+        return True, None
+    return False, (getattr(permit, "entry_denied_reason", None)
+                   or "entry 前置條件未全數成立")
+
+
+def _note_permit(permit, event):
+    """把 ordering 事件記到 permit（duck typing；permit 不支援時為 no-op）。"""
+    if permit is None:
+        return
+    fn = getattr(permit, "note", None)
+    if callable(fn):
+        try:
+            fn(event)
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def _resolve_external_running(remote_probe_result):
+    """把 recovery evidence 正規化成 True / False / None。
+
+    🔴 **不使用 `status`** —— 那是 QUERY_ONLY_WITH_STDIN_WRITE，
+       recovery 證據只准用 PASSIVE_READ_ONLY 的 `probe` 與 `loopcheck`。
+    🔴 兩種輸入皆接受，語意一致：
+         legacy : {"running": True/False/None}        —— 呼叫端已自行判定
+         新契約 : {"probe": RemoteProbe|dict,
+                   "loop_marks": [...], "min_loop_observations": N}
+       判定一律委派給 `phase6_remote_adapter.external_liveness`，
+       **不在本模組另立第二套規則。**
+    """
+    if not isinstance(remote_probe_result, dict):
+        return None
+    running = remote_probe_result.get("running")
+    if running is not None:
+        return bool(running)
+    if "probe" not in remote_probe_result:
+        return None
+    from phase6_remote_adapter import (external_liveness, EXT_RUNNING,
+                                       EXT_NOT_RUNNING)
+    verdict, _why = external_liveness(
+        remote_probe_result.get("probe"),
+        loop_active=remote_probe_result.get("loop_active"),
+        loop_marks=remote_probe_result.get("loop_marks"),
+        min_loop_observations=remote_probe_result.get(
+            "min_loop_observations"))
+    if verdict == EXT_RUNNING:
+        return True
+    if verdict == EXT_NOT_RUNNING:
+        return False
+    return None
+
+
 def recover(journal, remote_probe_result=None):
     """
     啟動時的責任重建。回傳 (verdict, last_state, action)。
@@ -449,7 +596,11 @@ def recover(journal, remote_probe_result=None):
        PENDING_RESTORE_STATES，就代表「我方暫停過 external 且未確認恢復」，
        必須先把 external 恢復，而不是直接開始新的交接。
     🔴 遠端實際狀態優先於 journal 推測 —— journal 說可能停了，
-       但遠端 probe 顯示 running=True，那就是已經恢復（或根本沒停成功）。
+       但遠端證據顯示 external 仍在主動 loop，那就是已經恢復（或根本沒停成功）。
+    🔴 `remote_probe_result` 的證據來源**只准** `probe` + `loopcheck`
+       （兩者皆 PASSIVE_READ_ONLY）。判定委派給
+       `phase6_remote_adapter.external_liveness`，語意與 RestoreVerifier 一致：
+       runtime 健康 + loop 前進 = RUNNING；連不上 / loop 證據不足 = UNKNOWN。
     """
     last = journal.last_state()
 
@@ -463,10 +614,10 @@ def recover(journal, remote_probe_result=None):
     if unresolved_pause and last not in (S_COMPLETE, S_RESTORED,
                                          S_ABORTED_PREFLIGHT,
                                          S_ABORTED_PAUSE_FAILED):
-        running = (remote_probe_result or {}).get("running")
+        running = _resolve_external_running(remote_probe_result)
         if running is True:
             return (R_CLEAN, last,
-                    "有未完成的 pause 意圖，但遠端 probe 顯示 external 仍在運行 "
+                    "有未完成的 pause 意圖，但遠端證據顯示 external 仍在主動 loop "
                     "→ 責任已解除，補記後可正常啟動")
         if running is False:
             return (R_PENDING_RESTORE, last,
@@ -481,10 +632,10 @@ def recover(journal, remote_probe_result=None):
     if last in CRITICAL_STATES:
         return R_CRITICAL, last, "上次以 CRITICAL 收場 → 需人工確認後才可再啟動"
     if last in PENDING_RESTORE_STATES:
-        running = (remote_probe_result or {}).get("running")
+        running = _resolve_external_running(remote_probe_result)
         if running is True:
             return (R_CLEAN, last,
-                    "journal 顯示交接未完成，但遠端 probe 顯示 external 仍在運行 "
+                    "journal 顯示交接未完成，但遠端證據顯示 external 仍在主動 loop "
                     "→ 責任已解除，補記後可正常啟動")
         if running is False:
             return (R_PENDING_RESTORE, last,
@@ -550,11 +701,22 @@ class OnceGuard(object):
     def __init__(self, journal=None):
         self.attempted = set()
         self.confirmed = set()
+        self.scope_attempt_id = getattr(journal, "attempt_id", None)
+        self.skipped_foreign = 0
         if journal is not None:
             for rec in journal.read_all():
                 step = rec.get("step")
                 if not step:
                     continue
+                # 🔴 ATTEMPT SCOPE（2026-10-01 Attempt #7 postmortem）
+                #    journal 已 per-attempt 分檔；此處再多一層防護：
+                #    若本 journal 有 attempt_id，則只採用同一 attempt 的紀錄。
+                #    **不得**把前次 Attempt 的 PAUSE/RESTORE 當成本次已嘗試。
+                if self.scope_attempt_id is not None:
+                    rid = rec.get("attempt_id")
+                    if rid is not None and rid != self.scope_attempt_id:
+                        self.skipped_foreign += 1
+                        continue
                 if rec.get("kind") == "INTENT":
                     self.attempted.add(step)
                 elif rec.get("kind") == "OUTCOME":
@@ -723,7 +885,17 @@ class HandoffOrchestrator(object):
 
     # ---- 步驟：restore ----
     def request_restore(self):
+        """
+        送出 external restore。**與 request_pause 對稱：ONE ATTEMPT ONLY。**
+
+        🔴 `OnceGuard.attempted` 由 journal 的 INTENT 重建，因此 crash / 重啟
+           之後也**不會盲目重送** —— 已嘗試過就只能以觀測驗證結果。
+        🔴 `SEND_SENT` 與 `SEND_UNKNOWN` 皆**不得**自動重送；
+           第二次呼叫一律擋下，由呼叫端走 RESTORE_FAILED_CRITICAL（責任保留）。
+        """
         step = "RESTORE"
+        if not self.guard.may_attempt(step):
+            return False, "ALREADY_ATTEMPTED_MUST_VERIFY_NOT_RESEND"
         if self.mode != MODE_ARMED:
             return False, f"MODE_{self.mode}_WILL_NOT_SEND"
         if self.journal is not None:
@@ -907,7 +1079,8 @@ class HandoffRunner(object):
 
     def __init__(self, orchestrator, sample_source, probe_source,
                  loop_mark_source=None, dispatcher=None, config=None,
-                 soc_max_pct=None, sleeper=None):
+                 soc_max_pct=None, sleeper=None, dispatch_permit=None,
+                 deadline=None):
         self.o = orchestrator
         self.sample_source = sample_source      # () -> dict（每次都要 fresh）
         self.probe_source = probe_source        # () -> dict
@@ -918,6 +1091,23 @@ class HandoffRunner(object):
         self._sleep = sleeper or (lambda s: None)
         self.steps = []
         self.restore_responsibility = False
+        # 🔴 Attempt #4 postmortem：FIRST LIVE dispatch 授權憑證。
+        #    None = 沒有任何已授權的 one-shot -> step 7 只看模組層
+        #    `DISPATCH_ENABLED`（rest state False）-> 結構上不可能 dispatch。
+        self.dispatch_permit = dispatch_permit
+        # 🔴 EXECUTION DEADLINE（2026-10-02 裁示）
+        #    `window_end` = NO-NEW-RISK-ACTION DEADLINE，不是 process kill。
+        #    None = 未注入 -> 行為與導入本契約之前完全相同（向後相容）。
+        self.deadline = deadline
+        self.deadline_blocked_at = None
+        # 🔴 EVIDENCE WIRING：verifier / ownership / post-check 的 canonical
+        #    結果必須外露給 artifact，不得讓它們停在區域變數而被記成 None。
+        self.pause_verifier_state = None
+        self.normal_loop_halted = None
+        self.pause_loop_marks = []
+        self.restore_verifier_state = None
+        self.release_before_restore = None
+        self.post_check = None
 
     def _log(self, step, ok, detail=None, **extra):
         rec = {"step": step, "ok": bool(ok), "detail": detail}
@@ -946,7 +1136,18 @@ class HandoffRunner(object):
                 "state": self.o.state, "ownership": self.o.ownership,
                 "restore_responsibility": self.restore_responsibility,
                 "steps": list(self.steps),
-                "mode": self.o.mode, "dispatch_enabled": DISPATCH_ENABLED}
+                "mode": self.o.mode, "dispatch_enabled": DISPATCH_ENABLED,
+                # 🔴 canonical execution evidence（不重新推算，只是外露）
+                "pause_verifier_state": self.pause_verifier_state,
+                "normal_loop_halted": self.normal_loop_halted,
+                "pause_loop_marks": list(self.pause_loop_marks),
+                "restore_verifier_state": self.restore_verifier_state,
+                "release_before_restore": self.release_before_restore,
+                "post_check": self.post_check,
+                # 🔴 EXECUTION DEADLINE evidence（只外露，不重新判定）
+                "deadline_blocked_at": self.deadline_blocked_at,
+                "deadline": (self.deadline.as_dict()
+                             if self.deadline is not None else None)}
 
     # ---- 主流程 ----
     def run(self):
@@ -960,6 +1161,15 @@ class HandoffRunner(object):
             bad = [k for k, v in checks.items() if not v]
             return self._bail("1_PRE_PAUSE_PREFLIGHT", f"未通過：{bad}")
         self._log("1_PRE_PAUSE_PREFLIGHT", True)
+
+        # 🔴 DEADLINE CHECKPOINT 1 —— before PAUSE
+        #    CASE A：external 尚未 pause。到期即直接結束，
+        #    PAUSE / authority / CHARGE / DISCHARGE 全部 0。
+        blocked, why_dl = _deadline_blocks(self.deadline,
+                                           _DL.CK_BEFORE_PAUSE)
+        if blocked:
+            self.deadline_blocked_at = _DL.CK_BEFORE_PAUSE
+            return self._bail("2_PAUSE", why_dl)
 
         # 2 PAUSE
         self.o._to(S_PAUSE_REQUESTED)
@@ -981,6 +1191,15 @@ class HandoffRunner(object):
         self.restore_responsibility = True          # 🔴 自此不可清除
         self._log("2_PAUSE", True, "已送出，恢復責任成立")
 
+        # 🔴 DEADLINE CHECKPOINT 2 —— pause responsibility 已成立
+        #    CASE B：不得再前進到 live leg；但**必須**走完
+        #    restore responsibility handling（`_bail` 會轉 `_restore_phase`）。
+        blocked, why_dl = _deadline_blocks(
+            self.deadline, _DL.CK_AFTER_PAUSE_RESPONSIBILITY)
+        if blocked:
+            self.deadline_blocked_at = _DL.CK_AFTER_PAUSE_RESPONSIBILITY
+            return self._bail("3_4_PAUSE_VERIFY", why_dl)
+
         # 3+4 SETTLING → STABLE_VERIFY
         self.o._to(S_PAUSE_VERIFYING)
         pv = PauseVerifier(self.cfg.idle_power_lower_kw,
@@ -991,11 +1210,23 @@ class HandoffRunner(object):
         while pv.state not in (PV_VERIFIED,) and n < 200:
             n += 1
             st = pv.feed(self.sample_source(), self.probe_source())
+            # 🔴 loop mark 與 PauseVerifier 取樣同步收集 —— halt 判定沿用
+            #    canonical `loop_active_from_marks`，**不新增規則**。
+            if self.loop_mark_source is not None:
+                self.pause_loop_marks.append(self.loop_mark_source())
+            self.pause_verifier_state = pv.state
             if st == PV_VERIFIED:
                 break
             if st not in ("SETTLING", "STABLE_VERIFY"):
                 return self._bail("3_4_PAUSE_VERIFY", f"{st}: {pv.reason}")
             self._sleep(self.cfg.stable_verify_interval_sec)
+        self.pause_verifier_state = pv.state
+        if self.loop_mark_source is not None:
+            from phase6_remote_adapter import loop_active_from_marks
+            act = loop_active_from_marks(
+                self.pause_loop_marks, self.cfg.restore_loop_min_observations)
+            # loop 仍在前進 -> 未 halt；未前進 -> halted；證據不足 -> None
+            self.normal_loop_halted = (None if act is None else (not act))
         if pv.state != PV_VERIFIED:
             return self._bail("3_4_PAUSE_VERIFY", "未於允許次數內完成驗證")
         self._log("3_4_PAUSE_VERIFY", True, f"external_quiescent（{n} 筆）")
@@ -1008,18 +1239,80 @@ class HandoffRunner(object):
             return self._bail("5_OWNERSHIP", f"ownership={own}")
         self._log("5_OWNERSHIP", True, own)
 
+        # 🔴 DEADLINE CHECKPOINT 3 —— before GATE B / post-pause continuation
+        blocked, why_dl = _deadline_blocks(self.deadline,
+                                           _DL.CK_BEFORE_GATE_B)
+        if blocked:
+            self.deadline_blocked_at = _DL.CK_BEFORE_GATE_B
+            return self._bail("6_POST_PAUSE_PRECHECK", why_dl)
+
         # 6 POST_PAUSE_FRESH_PRECHECK（不得沿用 Step 1）
         smp2, prb2 = self.sample_source(), self.probe_source()
         ok2, checks2 = post_pause_precheck(smp2, prb2)
+        self.post_check = dict(checks2)
         if not ok2:
             bad2 = [k for k, v in checks2.items() if not v]
             return self._bail("6_POST_PAUSE_PRECHECK", f"未通過：{bad2}")
         self._log("6_POST_PAUSE_PRECHECK", True)
 
         # 7 FIRST LIVE
-        if not DISPATCH_ENABLED:
+        # 🔴 OLD / NEW / WHY / EVIDENCE（2026-09-24 Attempt #4 postmortem）
+        #   OLD : `if not DISPATCH_ENABLED: bail` —— 模組層旗標恆為 False，
+        #         因此 5 kW live leg **結構上永遠不可能**被送出。
+        #   NEW : 另接受一張**已授權的 one-shot FIRST LIVE permit**。
+        #         permit 只代表「存在一個經使用者明確 field 授權的 attempt」，
+        #         它**不會**打開 dispatch；真正的 `DISPATCH_ENABLED = True`
+        #         只發生在 authority acquired 之後、緊貼 live leg 的
+        #         `first_live_dispatch_scope()` 內，且 finally 無條件關閉。
+        #   WHY : 使用者 2026-09-24 裁示 PART A —— DISPATCH_ENABLED 語意由
+        #         「永久 False」改為「AT REST = False，僅在已授權 one-shot 的
+        #         live-leg scope 內 temporarily True」。
+        #   EVIDENCE : Attempt #4 於 7_FIRST_LIVE 中止，detail =
+        #         "DISPATCH_ENABLED=False → 不得 dispatch"；其前的
+        #         PRE_PAUSE 11/11、pause SENT、PauseVerifier PASS、
+        #         ownership NEITHER、GATE B PASS 全部通過。
+        #   🔴 未提供 permit 時行為與舊版**完全相同**（Fail Closed）。
+        # 🔴 OLD / NEW / WHY / EVIDENCE（2026-10-02 Attempt #8 postmortem）
+        #   OLD : `if not DISPATCH_ENABLED and not _permit_authorizes(permit)`
+        #         -> 兩個問題：
+        #         (a) 要求**完整 16 項** permit（含 authority 兩項）才准進入
+        #             dispatcher，但 authority 只能在 dispatcher 內取得
+        #             -> CONTROL-FLOW CYCLE，production path 永遠過不了。
+        #         (b) 把 `DISPATCH_ENABLED == True` 當成「可以放行」，
+        #             但進入 dispatcher 前的正確狀態**本來就是 False**。
+        #   NEW : 兩段式。
+        #         ① REST INVARIANT：進入前 `DISPATCH_ENABLED` 必須是 False。
+        #            已經是 True -> 代表有人在 scope 外打開過 -> Fail Closed。
+        #         ② STAGE A ENTRY GATE：只問「是否允許進入 dispatcher」，
+        #            使用的 evidence **不含** authority 兩項。
+        #         完整 16 項 permit 仍在 dispatcher 內的
+        #         `first_live_dispatch_scope()` 重新評估（STAGE B，未放寬）。
+        #   WHY : 使用者 2026-10-02 裁示 —— STAGE A / STAGE B 必須分離，
+        #         且「進入 dispatcher 前 DISPATCH_ENABLED=False」是
+        #         **安全 invariant**，不是 failure condition。
+        #   EVIDENCE : Attempt #8 artifact ——
+        #         dispatch_permit.state = PERMIT_NOT_ENTERED，
+        #         denied_reason = ["authority_acquire_attempted",
+        #                          "authority_acquired"]，
+        #         其餘 15 項全 true，handoff_abort_step = 7_FIRST_LIVE，
+        #         authority_acquire_attempted = false，CHARGE = 0。
+        if DISPATCH_ENABLED:
+            return self._bail(
+                "7_FIRST_LIVE",
+                "進入 dispatcher 前 DISPATCH_ENABLED 已是 True "
+                "-> 非預期 rest state，Fail Closed")
+        entry_ok, entry_why = _entry_gate_authorizes(self.dispatch_permit)
+        if not entry_ok:
             return self._bail("7_FIRST_LIVE",
-                              "DISPATCH_ENABLED=False → 不得 dispatch")
+                              "DISPATCHER ENTRY GATE DENIED：%s" % (entry_why,))
+        _note_permit(self.dispatch_permit, EV_ENTRY_GATE_PASS)
+        # 🔴 DEADLINE CHECKPOINT 4 —— before authority acquire
+        #    CASE B / C：entry gate 即使 PASS，到期也不得 acquire authority。
+        blocked, why_dl = _deadline_blocks(
+            self.deadline, _DL.CK_BEFORE_AUTHORITY_ACQUIRE)
+        if blocked:
+            self.deadline_blocked_at = _DL.CK_BEFORE_AUTHORITY_ACQUIRE
+            return self._bail("7_FIRST_LIVE", why_dl)
         if self.dispatcher is None:
             return self._bail("7_FIRST_LIVE", "未注入 dispatcher")
         self.o._to(S_PHASE6_ACTIVE)
@@ -1039,6 +1332,8 @@ class HandoffRunner(object):
             return self._bail("9_RELEASE", "Phase 6 未收斂")
         self.o._to(S_PHASE6_RELEASED)
         self._log("9_RELEASE", True)
+        # 🔴 Phase 6 release 已完成，且尚未進入 restore -> 順序成立
+        self.release_before_restore = True
 
         # 10~12
         return self._restore_phase(reason="正常收尾")
@@ -1046,6 +1341,32 @@ class HandoffRunner(object):
     # ---- 10~12：歸還與驗證 ----
     def _restore_phase(self, reason):
         from phase6_remote_adapter import RestoreVerifier, RV_RESUMED, RV_UNKNOWN
+
+        # DEADLINE CHECKPOINT 9 - before final restore completion path.
+        # SAFE CLEANUP: must NEVER be blocked by the deadline. We only
+        # record the observation so the artifact can prove cleanup was
+        # allowed to finish even after window_end.
+        _DL.deadline_check(self.deadline, _DL.CK_BEFORE_RESTORE_COMPLETION)
+
+        # 🔴 OLD / NEW / WHY / EVIDENCE（2026-10-02 EXECUTION DEADLINE 裁示）
+        #   OLD : `release_before_restore` 只在**正常** step 9 被設為 True；
+        #         走 `_bail()` 的路徑恆為 None，即使 authority 確實已釋放。
+        #   NEW : 進入 restore 之前，若該欄位仍是 None 且 authority 曾被
+        #         嘗試取得，就以**當下可觀測的 lease 狀態**補記。
+        #   WHY : CASE C（authority 已取得、CHARGE 前到期）要求
+        #         「release authority -> RESTORE external」，
+        #         這個順序必須能從 artifact 證明，不能只靠推論。
+        #   EVIDENCE : D4 —— dispatcher 的 `finally` 已 release，
+        #         `_restore_phase` 此刻 `lease.held is False`，
+        #         但舊欄位仍是 None。
+        #   🔴 這是**補記觀測事實**，不是放寬：authority 從未被嘗試取得時
+        #      維持 None（沒有順序可言），仍不得偽稱 True。
+        if self.release_before_restore is None:
+            _lease = getattr(self.dispatcher, "lease", None)
+            if _lease is not None and getattr(
+                    _lease, "acquire_attempted", False) is True:
+                self.release_before_restore = (
+                    getattr(_lease, "held", True) is False)
 
         if self.o.state not in (S_PHASE6_RELEASED, S_RESTORE_REQUESTED):
             # 從任何持有責任的狀態都要能走到歸還
@@ -1083,9 +1404,11 @@ class HandoffRunner(object):
                 process_identity_ok=prb.get("process_identity_ok"))
             mark = self.loop_mark_source() if self.loop_mark_source else None
             st = rv.feed(p, mark)
+            self.restore_verifier_state = st
             if st in (RV_RESUMED, "FAILED", RV_UNKNOWN):
                 break
             self._sleep(self.cfg.restore_loop_interval_sec)
+        self.restore_verifier_state = st
         if st != RV_RESUMED:
             self._log("11_RESTORE_VERIFY", False, f"{st}: {rv.reason}")
             self.o._to(S_RESTORE_FAILED, detail=f"restore 驗證未通過：{st}")
@@ -1094,7 +1417,19 @@ class HandoffRunner(object):
         self.restore_responsibility = False
         self.o._to(S_RESTORED)
 
-        own, _ = self.o.check_ownership(external_running=None,
+        # 🔴 OLD / NEW / WHY / EVIDENCE（2026-09-24 Attempt #4 postmortem）
+        #   OLD : `external_running=None` -> ownership 恆為 UNKNOWN，
+        #         即使 RestoreVerifier 已判定 RV_RESUMED。
+        #   NEW : 走到這一行的**前提**就是 `st == RV_RESUMED`
+        #         （不是的話上面已 return），而 RV_RESUMED 的 canonical 語意
+        #         就是「external runtime 健康且 loop 已恢復前進」= running。
+        #   WHY : Attempt #4 restore 成功、現場實測已回到 EXTERNAL_RUNNING，
+        #         artifact 卻記成 final_ownership = UNKNOWN，證據與事實不符。
+        #   EVIDENCE : Attempt #4 artifact final_ownership='UNKNOWN' 對比
+        #         handoff journal 11_RESTORE_VERIFY OK / STATE RESTORED，
+        #         以及 2026-09-24 08:56 唯讀複驗 EXTERNAL_RUNNING。
+        #   🔴 這是**收緊證據精確度**，不是放寬任何閘門。
+        own, _ = self.o.check_ownership(external_running=True,
                                         phase6_holding=False)
         ok, checks = handoff_complete_ok(
             phase6_released=True, external_runtime_healthy=True,

@@ -312,8 +312,20 @@ def evaluate(request, policy=DEFAULT_AUTHORITY_POLICY, now=None):
         return _evaluate(request, policy, now)
     except Exception as e:                                      # noqa: BLE001
         # 🔴 絕不 except: allow
+        # 🔴 OLD / NEW / WHY / EVIDENCE（2026-10-06 Attempt #9 postmortem）
+        #   OLD : `detail=f"{type(e).__name__}: {e}"` —— 把例外**訊息**
+        #         寫進 detail，而 detail 會進入 durable artifact。
+        #   NEW : 只記例外**類別名稱**，不記訊息。
+        #   WHY : 例外訊息可能挾帶 password / token / credential
+        #         （例如 HTTP client 把 URL 或 header 放進訊息），
+        #         一旦落盤就是永久外洩。
+        #   EVIDENCE : A7c 測試 —— 以訊息含 "password=hunter2 token=abcdef"
+        #         的例外驅動，舊版會把它原樣寫進 detail。
+        #   🔴 診斷能力不變：`reason` 仍是 CA_EVALUATION_ERROR，
+        #      `detail` 仍指出例外類別，足以分類；但不再外洩內容。
         return AuthorityResult(AUTH_UNKNOWN, CA_EVALUATION_ERROR, False,
-                               detail=f"{type(e).__name__}: {e}")
+                               detail="評估例外（類別）：%s"
+                                      % type(e).__name__)
 
 
 def _evaluate(request, policy, now):

@@ -472,8 +472,34 @@ def test_j():
           orch().snapshot()["dispatch_enabled"] is False)
     src = io.open(os.path.join(HERE, "phase6_handoff_orchestrator.py"),
                   encoding="utf-8").read()
-    check("★★ 原始碼中不存在 DISPATCH_ENABLED = True",
-          "DISPATCH_ENABLED = True" not in src)
+    # 🔴 OLD / NEW / WHY / EVIDENCE（2026-09-24 Attempt #4 postmortem）
+    #   OLD : 以**純文字**搜尋原始碼中是否出現 "DISPATCH_ENABLED = True"。
+    #   NEW : 改用 **AST**：orchestrator 內不得存在任何對
+    #         `DISPATCH_ENABLED` 指派 True 的敘述（module 層或函式內皆然）。
+    #   WHY : 文字掃描會被**註解**誤觸 —— step 7 的 permit 說明必須提到
+    #         「真正的 DISPATCH_ENABLED = True 只發生在 scope 內」，
+    #         那是說明文字，不是指派。AST 只看真正的 Assign 節點，
+    #         比原斷言**更嚴格**（連字串拼接繞過也擋得住）。
+    #   EVIDENCE : Attempt #4 於 7_FIRST_LIVE 被 DISPATCH_ENABLED=False 擋下；
+    #         裁示 PART A 要求 scoped temporary enable，
+    #         且該 enable **只能**位於 phase6_first_live_handoff 的
+    #         `first_live_dispatch_scope()`，orchestrator 仍不得自行打開。
+    #   🔴 這是收緊，不是放寬。
+    _tree = ast.parse(src)
+    _assigns_true = [
+        n for n in ast.walk(_tree) if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "DISPATCH_ENABLED"
+                for t in n.targets)
+        and isinstance(n.value, ast.Constant) and n.value.value is True]
+    check("★★ orchestrator 內不存在任何 DISPATCH_ENABLED = True 指派（AST）",
+          not _assigns_true)
+    _module_level = [
+        n for n in _tree.body if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "DISPATCH_ENABLED"
+                for t in n.targets)]
+    check("★★ 模組層 DISPATCH_ENABLED rest state 為 False",
+          len(_module_level) == 1
+          and _module_level[0].value.value is False)
     # ⚠️ 不能整檔 grep —— 模組 docstring 的禁止敘述本身就含這兩個字串。
     #    改以 AST 取出「非 docstring」的字串常數，確認沒有 HH:MM 形式的時刻。
     import re as _re

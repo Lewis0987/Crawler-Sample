@@ -500,8 +500,11 @@ class RestoreVerifier(object):
         self.state = RV_SETTLING
         if loop_mark is not None:
             self.loop_marks.append(loop_mark)
-        if len(self.loop_marks) >= self.min_loop_observations:
-            if self.loop_marks[-1] > self.loop_marks[0]:
+        # 🔴 「marks 是否前進」只有一份實作 —— 與 recover() 共用。
+        advanced = loop_active_from_marks(self.loop_marks,
+                                          self.min_loop_observations)
+        if advanced is not None:
+            if advanced:
                 self.state = RV_RESUMED
             else:
                 self.state = RV_FAILED
@@ -542,6 +545,88 @@ def authorized_keys_ok(lines, pubkey_b64):
         if opt not in entry:
             problems.append("唯一條目缺少必要選項：%s" % opt)
     return (not problems), problems
+
+
+# ======================================================================
+# External liveness —— **唯一**的正規化來源
+# ======================================================================
+# 🔴 `auto_control.py` 的 `running` 是行程內部變數，外部讀不到，
+#    B2 guard 的 probe 也**刻意不輸出**它 —— 不得讓 probe 假裝證明它做不到的事。
+#    因此「external controller 是否正在主動 loop」一律由兩層外部可觀測事實推導：
+#        A 層 runtime health : ssh / screen / process / identity（RemoteProbe）
+#        B 層 loop activity  : loopcheck 時間戳確實前進
+#    這與 RestoreVerifier / verify_restore 使用**同一組證據**，不另立第二套判定。
+EXT_RUNNING = "EXTERNAL_RUNNING"          # 已證明仍在主動 loop
+EXT_NOT_RUNNING = "EXTERNAL_NOT_RUNNING"  # 已證明沒有在 loop
+EXT_UNKNOWN = "EXTERNAL_UNKNOWN"          # 無法判定 → Fail Closed
+
+EXTERNAL_LIVENESS_VERDICTS = (EXT_RUNNING, EXT_NOT_RUNNING, EXT_UNKNOWN)
+
+
+def loop_active_from_marks(marks, min_observations):
+    """loop 時間戳是否確實前進。回傳 True / False / None（不足以判定）。
+
+    🔴 `min_observations` 必須由呼叫端提供且 >= 2 —— 單點不可能證明前進。
+       未提供 → None（Fail Closed），不替呼叫端決定觀測長度。
+    🔴 None 的 mark 代表「這次取不到」，直接略過，**不當成沒前進**。
+    """
+    if min_observations is None or int(min_observations) < 2:
+        return None
+    seen = [m for m in (marks or []) if m is not None]
+    if len(seen) < int(min_observations):
+        return None
+    return seen[-1] > seen[0]
+
+
+def _as_remote_probe(probe):
+    """接受 RemoteProbe 或等價 dict；其他一律視為無法判定。"""
+    if probe is None:
+        return None
+    if isinstance(probe, RemoteProbe):
+        return probe
+    if isinstance(probe, dict):
+        return RemoteProbe(
+            ssh_ok=probe.get("ssh_ok"),
+            screen_alive=probe.get("screen_alive"),
+            # HandoffRunner 與既有 probe dict 兩種鍵名都接受
+            process_alive=probe.get("process_alive",
+                                    probe.get("pid_alive")),
+            process_identity_ok=probe.get("process_identity_ok"),
+            loop_active=probe.get("loop_active"),
+            pid=probe.get("pid"))
+    return None
+
+
+def external_liveness(probe, loop_active=None, loop_marks=None,
+                      min_loop_observations=None):
+    """把 probe + loop 證據正規化成三態。回傳 (verdict, detail)。**純函式。**
+
+    判定順序
+        1. 取不到必要事實（RemoteProbe.known 為 False）→ UNKNOWN
+           —— 連不上就是「不知道」，**不得**當成「已停止」而誤觸恢復動作。
+        2. 必要事實齊備但 runtime 不健康（screen/process/identity 任一為 False）
+           → NOT_RUNNING（這是實證的否定）
+        3. runtime 健康 + loop 前進 → RUNNING
+        4. runtime 健康 + loop 未前進 → NOT_RUNNING
+        5. runtime 健康但 loop 證據取不到／不足 → UNKNOWN
+    """
+    p = _as_remote_probe(probe)
+    if p is None:
+        return EXT_UNKNOWN, "未提供可解讀的 probe → 無法判定"
+    if not p.known:
+        missing = [k for k in RemoteProbe.REQUIRED if getattr(p, k) is None]
+        return EXT_UNKNOWN, "probe 必要事實不完整：%s" % (missing,)
+    if not p.healthy:
+        bad = [k for k in RemoteProbe.REQUIRED if getattr(p, k) is not True]
+        return EXT_NOT_RUNNING, "runtime 不健康：%s" % (bad,)
+
+    if loop_active is None:
+        loop_active = loop_active_from_marks(loop_marks, min_loop_observations)
+    if loop_active is True:
+        return EXT_RUNNING, "runtime 健康且 loop evidence 前進"
+    if loop_active is False:
+        return EXT_NOT_RUNNING, "runtime 健康但 loop evidence 未前進"
+    return EXT_UNKNOWN, "runtime 健康但無法取得足夠 loop evidence → Fail Closed"
 
 
 # ======================================================================

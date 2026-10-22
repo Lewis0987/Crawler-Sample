@@ -622,8 +622,44 @@ class ControlledLiveLeg(object):
        **不自動 STOP**。
     """
 
+    #: 🔴 AUTHORITY SNAPSHOT 時點（2026-10-06 Attempt #9 postmortem）
+    #   必須保留四個 key；取不到一律記 NOT_OBSERVED，**不得只省略**。
+    AUTHORITY_SNAPSHOT_POINTS = ("before_dispatch", "after_dispatch",
+                                 "after_readback", "at_abort")
+
+    #: 無法取樣時的佔位值（區別於「取樣到但 state 是 UNKNOWN」）
+    AUTHORITY_NOT_OBSERVED = "NOT_OBSERVED"
+
     def __init__(self, leg, chain_factory, observe_source):
         self.leg = leg
+        # 🔴 readback 證據保存點（additive，預設 None）
+        self.dispatch_result = None
+        self.stop_result = None
+        # 🔴 OLD / NEW / WHY / EVIDENCE（2026-10-06 Attempt #9 postmortem）
+        #   OLD : 只在 abort 訊息裡寫 "authority=UNKNOWN"。
+        #   NEW : 四個時點的 AuthorityResult 快照全部保存。
+        #   WHY : UNKNOWN 不足以做 production postmortem。
+        #   EVIDENCE : Attempt #9 無法判定是 CA_EXPIRED ／
+        #         CA_DATA_INSUFFICIENT ／CA_MODE_UNKNOWN ／規則 2 ／規則 3。
+        #   🔴 **零額外觀測**：只從「本來就會發生」的兩次觀測取樣 ——
+        #      `chain.run()` 的 arbitration（dispatch 前）與 LEG_OWNED 之後
+        #      的 `self._observe()`。
+        #      **不得**為了取樣而多呼叫 `_observe()`：arbiter 底下的
+        #      PowerClassifier 是**有狀態**的（time-based debounce），
+        #      多餘的 observation 會改變 production 判定。
+        #      因此 `after_dispatch` 必然是 NOT_OBSERVED，且
+        #      `after_readback` 與 `at_abort` 來自**同一次**觀測。
+        # 🔴 未觀測時 `authority_result` 本身即記 NOT_OBSERVED（而非 None）——
+        #    None 可能被誤讀成「有觀測但結果為空」。
+        #    **不得**省略欄位，也**不得**複製前一筆 authority result
+        #    假裝成新的 observation。
+        self.authority_snapshots = {
+            k: {"point": k, "state": self.AUTHORITY_NOT_OBSERVED,
+                "reason": self.AUTHORITY_NOT_OBSERVED,
+                "detail": self.AUTHORITY_NOT_OBSERVED,
+                "authority_result": self.AUTHORITY_NOT_OBSERVED,
+                "observed": False, "note": None}
+            for k in self.AUTHORITY_SNAPSHOT_POINTS}
         self._chain_factory = chain_factory      # (executor, verifier) -> chain
         self._observe = observe_source
         self.state = LEG_ARMED
@@ -640,6 +676,39 @@ class ControlledLiveLeg(object):
         if reason:
             self.abort_reason = reason
         return st
+
+    def _record_authority(self, point, arb, note=None):
+        """
+        從**既有**觀測物件取樣 authority 證據。純記錄，不判定、不觀測。
+
+        🔴 `arb` 為 None（取不到）時維持 NOT_OBSERVED，但仍寫入 note。
+        🔴 不記錄任何 password / token / credential。
+        """
+        slot = self.authority_snapshots.get(point)
+        if slot is None:
+            return None
+        slot["note"] = note
+        if arb is None:
+            return slot
+        slot["observed"] = True
+        slot["state"] = getattr(arb, "authority_state", None)
+        slot["reason"] = getattr(arb, "authority_reason", None)
+        slot["detail"] = getattr(arb, "authority_detail", None)
+        ar = getattr(arb, "authority_result", None)
+        slot["authority_result"] = dict(ar) if isinstance(ar, dict) else ar
+        # 判斷 authority 所需的可觀測 evidence（取不到一律 None，不省略）
+        slot["pcs_state"] = getattr(arb, "pcs_state", None)
+        slot["actual_active_power_kw"] = getattr(
+            arb, "actual_active_power_kw", None)
+        slot["schedule_switch"] = getattr(arb, "schedule_switch", None)
+        slot["manual_switch"] = getattr(arb, "manual_switch", None)
+        slot["ess_age_sec"] = getattr(arb, "fresh_ess_age_sec", None)
+        slot["observation_valid"] = getattr(arb, "valid", None)
+        # 🔴 判斷 authority 用的門檻本身也必須保存（裁示明列）
+        slot["authority_ttl_sec"] = getattr(arb, "authority_ttl_sec", None)
+        slot["authority_power_tolerance_kw"] = getattr(
+            arb, "authority_power_tolerance_kw", None)
+        return slot
 
     def _teardown(self):
         """銷毀控制出口 —— 回到「結構上送不出指令」的狀態。"""
@@ -662,13 +731,29 @@ class ControlledLiveLeg(object):
         return self._to(LEG_PRECHECKED)
 
     def run_leg(self):
-        """跑一次完整 leg，回傳最終狀態。"""
+        """跑一次完整 leg，回傳最終狀態。
+
+        🔴 2026-09-24 readback closure：本方法**額外保留**方向指令與 STOP 的
+           `ExecutionResult`（`self.dispatch_result` / `self.stop_result`），
+           供 6.10 artifact 記錄 readback 證據。
+           **純 additive** —— 不改變任何判定、順序或終態。
+        """
         if self.state != LEG_PRECHECKED:
             return self.abort(f"狀態不正確：{self.state}")
         chain = self._chain_factory(self.executor, self.verifier)
 
         # ---- 方向指令 ----
         res = chain.run()
+        self.dispatch_result = res
+        # 🔴 dispatch 用的 arbitration 就是「送出前」的 authority 事實
+        self._record_authority("before_dispatch",
+                               getattr(res, "arbitration", None),
+                               note="來自 dispatch chain 的 arbitration")
+        self._record_authority(
+            "after_dispatch", None,
+            note="為避免額外 observation 擾動 stateful classifier"
+                 "（PowerClassifier 使用 time-based debounce），"
+                 "此時點未額外觀測")
         act = getattr(res, "control_action", None)
         if act != self.leg.action:
             return self.abort(f"決策動作 {act!r} 與 leg 授權 "
@@ -699,6 +784,11 @@ class ControlledLiveLeg(object):
         # ---- STOP（同一 leg 的收尾）----
         obs = self._observe()
         arb = getattr(obs, "arbitration", None) or obs
+        # 🔴 這一次觀測同時是「readback 之後」與「abort 當下」的事實來源
+        self._record_authority("after_readback", arb,
+                               note="LEG_OWNED 之後的 fresh observation")
+        self._record_authority("at_abort", arb,
+                               note="與 after_readback 同一次觀測")
         auth = getattr(arb, "authority_state", None)
         if auth is None or auth in UNCERTAIN_AUTHORITY:
             return self.abort(f"dispatch 後擁有權不可信（authority={auth}）",
@@ -707,6 +797,7 @@ class ControlledLiveLeg(object):
             return self.abort(f"非 OWNED（{auth}）→ 不得送 STOP", uncertain=True)
         self._to(LEG_STOP_REQUESTED)
         stop_res = chain.run()
+        self.stop_result = stop_res
         if getattr(stop_res, "control_action", None) != "stop":
             return self.abort("未形成 STOP leg", uncertain=True)
         if not getattr(stop_res, "executed", False):
@@ -731,6 +822,8 @@ class ControlledLiveLeg(object):
                 "dispatch_count": self.dispatch_count,
                 "stop_count": self.stop_count,
                 "abort_reason": self.abort_reason,
+                "authority_snapshots": {k: dict(v) for k, v in
+                                        self.authority_snapshots.items()},
                 "leg": self.leg.as_dict(),
                 "executor_present": self.executor is not None,
                 "verifier_present": self.verifier is not None}
@@ -1222,6 +1315,15 @@ def print_startup(rt, installed, why, root=None, wiring=None):
     print("=" * 70)
 
 
+# ======================================================================
+# RULING 1（2026-09-18）：`--live-leg` CLI = FIRST LIVE field entry -> BLOCKED
+# ======================================================================
+LIVE_LEG_CLI_BLOCKED = True
+LIVE_LEG_CLI_REFUSAL = ("FIRST LIVE direct execution disabled. "
+                        "Use Phase 6.10 handoff entry point.")
+LIVE_LEG_CLI_EXIT_CODE = 2
+
+
 def live_leg_main(action, root=None, prompt=None, operator_run=None,
                   client=None, meter_client=None, meter_warmup_sec=8.0,
                   config=None):
@@ -1295,6 +1397,14 @@ def main(argv=None):
                     help="願意進入人工確認流程（**本身不代表確認完成**，"
                          "仍須輸入完整確認字串）")
     args = ap.parse_args(argv)
+    # 🔴 RULING 1（2026-09-18）：`--live-leg` 是 FIRST LIVE field entry ——
+    #    一律在**任何其他檢查之前**拒絕，不看 --confirm、不看任何旗標。
+    if args.live_leg:
+        print(LIVE_LEG_CLI_REFUSAL)
+        print("  ROLE = INTERNAL LIVE LEG / DISPATCHER")
+        print("  FIELD PATH = Phase 6.10 Handoff -> FIRST LIVE Dispatcher")
+        return LIVE_LEG_CLI_EXIT_CODE
+
     if args.live_leg and not args.confirm:
         print("[LIVE] --live-leg 必須搭配 --confirm 才會進入確認流程 → 中止。")
         return 2
@@ -1305,7 +1415,15 @@ def main(argv=None):
     # 🔴 沒有 --live-leg 時，下面完全走原本的 OBSERVE_ONLY 路徑，
     #    executor / verifier 一律不建立。
     if args.live_leg:
-        return live_leg_main(args.live_leg, root=args.root)
+        # 🔴 RULING 1（2026-09-18）：FIRST LIVE 的正式 field path 只有
+        #    Phase 6.10 Handoff -> FIRST LIVE Dispatcher -> 既有 live leg。
+        #    `--live-leg` 會繞過 external pause / normal-loop halt /
+        #    PauseVerifier / restore responsibility -> TOCTOU / ownership race。
+        #    因此 **CLI 入口**一律拒絕；`live_leg_main()` 與
+        #    `run_live_leg_cli()` 函式本體未變，仍可被整合層 / 離線測試呼叫。
+        #    刻意不提供任何 flag / 環境變數 / 隱藏 override。
+        print(LIVE_LEG_CLI_REFUSAL)
+        return LIVE_LEG_CLI_EXIT_CODE
 
     # Service 持有 reader / meter source dependency；
     # Runtime core 只拿到一個可呼叫物件，不知道資料從哪來。

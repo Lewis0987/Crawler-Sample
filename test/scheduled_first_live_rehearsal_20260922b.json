@@ -1,0 +1,14 @@
+{
+  "_purpose": "TASK SCHEDULER REHEARSAL — VALIDATION ONLY. NOT a field authorization.",
+  "_why": "Attempt #2 之後 provider / auth renewal 有正式 code change，建立 Attempt #3 field task 前重新驗證 launch chain。",
+  "_warning": "target_date 刻意設為過去日期：即使誤以非 --validate-only 呼叫，也只會得到 WRONG_TARGET_DATE 且 0 command。",
+  "enabled": true,
+  "attempt_id": "VALIDATE-ONLY-REHEARSAL-20260922B",
+  "target_date": "2026-09-20",
+  "window_start": "00:00",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/VALIDATE-ONLY-REHEARSAL-20260922B.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live"
+}

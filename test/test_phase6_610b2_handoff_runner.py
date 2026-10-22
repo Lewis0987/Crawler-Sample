@@ -14,6 +14,7 @@ test_phase6_610b2_handoff_runner.py — Phase 6.10-B2（離線）
 用法
     python test_phase6_610b2_handoff_runner.py        # exit 0 = PASS
 """
+import ast
 import io
 import os
 import re
@@ -190,10 +191,10 @@ def test_3():
 
 
 # ======================================================================
-# 4. ARMED：pause 送出後即背負責任；DISPATCH_ENABLED=False 仍不得 dispatch
+# 4. ARMED：pause 送出後即背負責任；未取得 entry 授權仍不得 dispatch
 # ======================================================================
 def test_4():
-    print("\n[4] ARMED —— 責任成立，但 DISPATCH_ENABLED=False 擋下 dispatch")
+    print("\n[4] ARMED —— 責任成立，但 STAGE A ENTRY GATE 擋下 dispatch")
     hits = []
     r, o, sd = runner(mode=HO.MODE_ARMED,
                       dispatcher=(lambda s: hits.append(s) or
@@ -201,16 +202,28 @@ def test_4():
                                    "released": True}))
     res = r.run()
     check("pause sender 被呼叫 1 次", sd.pause_calls == 1)
-    check("★★ dispatcher 仍未被呼叫（DISPATCH_ENABLED=False）", hits == [])
+    check("★★ dispatcher 仍未被呼叫（未提供 permit -> entry gate 拒絕）",
+          hits == [])
     steps = {s["step"]: s for s in res["steps"]}
     check("  Step 1 通過", steps["1_PRE_PAUSE_PREFLIGHT"]["ok"])
     check("  Step 2 通過", steps["2_PAUSE"]["ok"])
     check("  Step 3/4 通過", steps["3_4_PAUSE_VERIFY"]["ok"])
     check("  Step 5 通過", steps["5_OWNERSHIP"]["ok"])
     check("  Step 6 通過", steps["6_POST_PAUSE_PRECHECK"]["ok"])
-    check("★★ Step 7 被 DISPATCH_ENABLED 擋下",
+    # 🔴 OLD / NEW / WHY / EVIDENCE（2026-10-02 Attempt #8 postmortem）
+    #   OLD : 斷言 detail 含 "DISPATCH_ENABLED"（舊的單一閘訊息）。
+    #   NEW : 本 rig 未注入 permit -> 應被 **STAGE A ENTRY GATE** 擋下，
+    #         detail 必須同時含 "ENTRY GATE DENIED" 與 "未提供 permit"。
+    #   WHY : step 7 已拆成兩段；「沒有 permit」與「rest state 異常」
+    #         是不同的拒絕理由，不得混為一談。
+    #   EVIDENCE : `HO._entry_gate_authorizes(None)`
+    #         == (False, "未提供 permit")。
+    #   🔴 這是**收緊**：由比對 1 個子字串改為比對 2 個，
+    #      且 dispatcher 未被呼叫的斷言（上一行）完全不變。
+    check("★★ Step 7 被 STAGE A ENTRY GATE 擋下（未提供 permit）",
           not steps["7_FIRST_LIVE"]["ok"]
-          and "DISPATCH_ENABLED" in steps["7_FIRST_LIVE"]["detail"])
+          and "ENTRY GATE DENIED" in steps["7_FIRST_LIVE"]["detail"]
+          and "未提供 permit" in steps["7_FIRST_LIVE"]["detail"])
     check("★★ 但仍走到歸還（restore 已送出）", sd.restore_calls == 1)
     check("★★ 歸還驗證通過 → 責任解除",
           res["restore_responsibility"] is False)
@@ -350,8 +363,34 @@ def test_8():
           res["mode"] == HO.MODE_ARMED and res["dispatch_enabled"] is False)
     src = io.open(os.path.join(HERE, "phase6_handoff_orchestrator.py"),
                   encoding="utf-8").read()
-    check("★★ 原始碼中不存在 DISPATCH_ENABLED = True",
-          "DISPATCH_ENABLED = True" not in src)
+    # 🔴 OLD / NEW / WHY / EVIDENCE（2026-09-24 Attempt #4 postmortem）
+    #   OLD : 以**純文字**搜尋原始碼中是否出現 "DISPATCH_ENABLED = True"。
+    #   NEW : 改用 **AST**：orchestrator 內不得存在任何對
+    #         `DISPATCH_ENABLED` 指派 True 的敘述（module 層或函式內皆然）。
+    #   WHY : 文字掃描會被**註解**誤觸 —— step 7 的 permit 說明必須提到
+    #         「真正的 DISPATCH_ENABLED = True 只發生在 scope 內」，
+    #         那是說明文字，不是指派。AST 只看真正的 Assign 節點，
+    #         比原斷言**更嚴格**（連字串拼接繞過也擋得住）。
+    #   EVIDENCE : Attempt #4 於 7_FIRST_LIVE 被 DISPATCH_ENABLED=False 擋下；
+    #         裁示 PART A 要求 scoped temporary enable，
+    #         且該 enable **只能**位於 phase6_first_live_handoff 的
+    #         `first_live_dispatch_scope()`，orchestrator 仍不得自行打開。
+    #   🔴 這是收緊，不是放寬。
+    _tree = ast.parse(src)
+    _assigns_true = [
+        n for n in ast.walk(_tree) if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "DISPATCH_ENABLED"
+                for t in n.targets)
+        and isinstance(n.value, ast.Constant) and n.value.value is True]
+    check("★★ orchestrator 內不存在任何 DISPATCH_ENABLED = True 指派（AST）",
+          not _assigns_true)
+    _module_level = [
+        n for n in _tree.body if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "DISPATCH_ENABLED"
+                for t in n.targets)]
+    check("★★ 模組層 DISPATCH_ENABLED rest state 為 False",
+          len(_module_level) == 1
+          and _module_level[0].value.value is False)
 
 
 def main():

@@ -755,6 +755,23 @@ class UnattendedService(object):
         self.health = ServiceHealth(self.timing.service_health_timeout_sec,
                                     clock=self._clock)
 
+    def _collect_loop_marks(self):
+        """取得 loop liveness 樣本。**唯讀**：只呼叫既有的 loop_mark_source。
+
+        🔴 未注入來源即回空清單 → external_liveness 判 UNKNOWN（Fail Closed），
+           絕不臆測。取樣數沿用既有 `restore_loop_min_observations`。
+        """
+        if self.loop_mark_source is None:
+            return []
+        marks = []
+        for _ in range(int(self.cfg.restore_loop_min_observations)):
+            try:
+                marks.append(self.loop_mark_source())
+            except Exception:                             # noqa: BLE001
+                marks.append(None)
+            self._sleep(self.cfg.restore_loop_interval_sec)
+        return marks
+
     # ---- C2. 啟動 ----
     def boot(self):
         """回傳 (verdict, detail)。啟動第一件事一定是 recover()。"""
@@ -765,11 +782,17 @@ class UnattendedService(object):
         self.journal.append(EV_SERVICE_START, detail=f"mode={self.mode}")
 
         probe = self.probe_source()
-        running = None
-        if probe:
-            # 遠端 probe 只能回答「controller 是否仍在跑」，不猜 ownership
-            running = probe.get("controller_running")
-        verdict, last, action = HO.recover(self.journal, {"running": running})
+        # 🔴 recovery 證據只用 PASSIVE_READ_ONLY 的 probe + loopcheck。
+        #    **不得**使用 status（QUERY_ONLY_WITH_STDIN_WRITE），
+        #    也不得要求 probe 回報它無法證明的 `running`。
+        evidence = {"probe": probe,
+                    "loop_marks": self._collect_loop_marks(),
+                    "min_loop_observations":
+                        self.cfg.restore_loop_min_observations}
+        if isinstance(probe, dict) and probe.get("controller_running") is not None:
+            # 呼叫端已自行判定時沿用（向下相容，語意不變）
+            evidence["running"] = probe.get("controller_running")
+        verdict, last, action = HO.recover(self.journal, evidence)
         self.recovery = verdict
         self.journal.append(EV_RECOVERY, state=last,
                             detail=f"{verdict}: {action}")

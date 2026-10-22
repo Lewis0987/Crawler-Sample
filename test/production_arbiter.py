@@ -136,6 +136,23 @@ class ArbitrationResult:
     # ---- audit：各閘門 ----
     authority_state: str = None
     authority_reason: str = None
+    # 🔴 OLD / NEW / WHY / EVIDENCE（2026-10-06 Attempt #9 postmortem）
+    #   OLD : 只外露 `authority_state` ／`authority_reason`；
+    #         `AuthorityResult.detail` 與其判斷輸入完全沒有保存。
+    #   NEW : 另外保存 `authority_detail` 與完整 `authority_result`
+    #         （= `AuthorityResult.as_dict()`，含 pcs_state ／
+    #           last_control_action ／last_control_power_kw ／
+    #           observed_power_kw ／age_sec）。
+    #   WHY : Attempt #9 於 dispatch 後得到 authority=UNKNOWN 而中止，
+    #         但 artifact 只留下 "UNKNOWN" 字串，無法判定是哪一條規則
+    #         -> production postmortem 無法進行。
+    #   EVIDENCE : Attempt #9 artifact 全文搜尋 CA_ / CONTROL_AUTHORITY /
+    #         authority_reason 皆為 0 筆。
+    #   🔴 純 additive：不改變任何判定、順序或終態。
+    authority_detail: str = None
+    authority_result: dict = None
+    authority_ttl_sec: float = None
+    authority_power_tolerance_kw: float = None
     direction_reason: str = None
     safety_allowed: bool = None
     safety_reason: str = None
@@ -339,7 +356,15 @@ class ProductionArbiter:
         # ---- 7. Control Authority（重用既有，不建第二套）----
         auth = CA.evaluate(PCI.build_authority_request(inputs),
                            policy=self.authority_policy, now=now)
-        aud.update(authority_state=auth.state, authority_reason=auth.reason)
+        # 🔴 判斷 authority 用的門檻本身也必須可稽核（取不到記 None）
+        aud["authority_ttl_sec"] = getattr(
+            self.authority_policy, "authority_ttl_sec", None)
+        aud["authority_power_tolerance_kw"] = getattr(
+            self.authority_policy, "authority_power_tolerance_kw", None)
+        aud.update(authority_state=auth.state, authority_reason=auth.reason,
+                   authority_detail=getattr(auth, "detail", None),
+                   authority_result=(auth.as_dict()
+                                     if hasattr(auth, "as_dict") else None))
 
         # ---- 8. Direction Interlock + IDLE 語意（重用既有）----
         ctrl = PCI.build_control_request(fresh.decision_result, ess=ess_obs.ess,

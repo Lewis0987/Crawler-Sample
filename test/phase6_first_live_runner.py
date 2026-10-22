@@ -34,10 +34,29 @@ phase6_first_live_runner.py — Phase 6.9 FIRST LIVE 一次性執行器
 
 🔴 **一次性**：本檔不建立、不續期、不重排任何排程；失敗不重試。
 
+🔴 **DIRECT FIELD EXECUTION = BLOCKED（使用者 2026-09-18 RULING 1）**
+    本檔**不再**是正式 Field FIRST LIVE entry point。
+    正式唯一 field path：
+        Phase 6.10 Handoff -> FIRST LIVE Dispatcher -> 本檔的 live leg
+
+    原因（Trial #2 實測）：external controller 即使當下
+    `PCS = STANDBY` / `Authority = IDLE`，normal loop 仍可能 ACTIVE，
+    之後自行重新進入 `DISCHARGING`。直接執行本檔會繞過
+    external pause / normal-loop halt / PauseVerifier / restore responsibility，
+    形成 TOCTOU / ownership race。
+
+    因此 `python phase6_first_live_runner.py ...` 一律拒絕並回非 0 exit code。
+    **刻意不提供** `--force` / `--bypass-handoff` / 環境變數 / 任何隱藏 override。
+
+    ROLE = INTERNAL LIVE LEG / DISPATCHER
+    本檔的 `main()` 與 live-leg 能力仍可被 `phase6_first_live_handoff.py`
+    以及離線測試 **import 後直接呼叫** —— 被限制的是 **FIELD ENTRY POINT**，
+    不是刪除 6.9 implementation。
+
 用法
-    python phase6_first_live_runner.py                 # 正式（會送實機指令）
-    python phase6_first_live_runner.py --observe-only  # 只做 Phase A，永不 dispatch
-    python phase6_first_live_runner.py --observe-sec 60 --observe-interval 20
+    # 🔴 直接 CLI 執行一律 BLOCKED（exit != 0）
+    # 正式 field path 請走 Phase 6.10 handoff entry point。
+    # 離線測試／整合層仍可 import 本模組後呼叫。
 """
 import os
 import io
@@ -207,9 +226,20 @@ def prime_classifier(obs_source, until_wall, interval, sink=None):
 
 
 def _has_401(reading):
-    """read_all 的 _fail 中是否出現需登入端點的 401。"""
-    return any(isinstance(f, str) and "_error401" in f
-               for f in (reading.get("_fail") or ()))
+    """read_all 的 _fail 中是否出現需登入端點的 401。
+
+    🔴 OLD / NEW / WHY / EVIDENCE（2026-09-22 auth policy 單一化）
+      OLD : 在本檔內自行判斷 `"_error401" in f`。
+      NEW : 委派 `phase6_hmi_auth_renewal.is_auth_expired()` ——
+            **同一份判準**，行為完全相同（同樣只認 `_error401`）。
+      WHY : 使用者裁示「不得建立第二套 auth policy」。provider / scheduled
+            路徑要重用 6.9 的 bounded re-auth，就必須先讓偵測條件只有一份。
+      EVIDENCE : AUTH 系列測試逐項比對兩者在
+            401 / timeout / 500 / malformed / 非 dict 下的結果一致。
+      🔴 bound（`len(relogins) < 2`）與 observe_window 的流程**未更動**。
+    """
+    from phase6_hmi_auth_renewal import is_auth_expired
+    return is_auth_expired(reading)
 
 
 def observe_window(client, meter_client, obs_source, deadline, interval):
@@ -586,9 +616,39 @@ def _finish(out, log_path, json_path, started, outcome=None):
     return 0
 
 
+# ======================================================================
+# RULING 1（2026-09-18）：DIRECT FIELD EXECUTION = BLOCKED
+# ======================================================================
+DIRECT_FIELD_EXECUTION_BLOCKED = True
+DIRECT_ENTRY_REFUSAL = (
+    "FIRST LIVE direct execution disabled. "
+    "Use Phase 6.10 handoff entry point.")
+DIRECT_ENTRY_EXIT_CODE = 2
+
+
+def refuse_direct_execution(stream=None):
+    """
+    直接 CLI 呼叫時的唯一行為：印出拒絕訊息並回非 0 exit code。
+
+    🔴 **沒有任何 bypass** —— 不看 argv、不看環境變數、不提供 flag。
+       函式在被呼叫時就已經決定拒絕，不存在「條件成立才放行」的分支。
+    🔴 本函式**不建立** client / executor / dispatcher，
+       也不 acquire 任何 Phase 6 authority、不送任何指令。
+    """
+    out = stream if stream is not None else sys.stderr
+    try:
+        out.write(DIRECT_ENTRY_REFUSAL + "\n")
+        out.write("  ROLE = INTERNAL LIVE LEG / DISPATCHER\n")
+        out.write("  FIELD PATH = Phase 6.10 Handoff -> FIRST LIVE Dispatcher\n")
+    except Exception:                               # noqa: BLE001
+        pass
+    return DIRECT_ENTRY_EXIT_CODE
+
+
 if __name__ == "__main__":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:                               # noqa: BLE001
         pass
-    raise SystemExit(main())
+    # 🔴 不呼叫 main() —— 直接拒絕。main() 仍保留供整合層 / 離線測試 import。
+    raise SystemExit(refuse_direct_execution())

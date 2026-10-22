@@ -220,8 +220,27 @@ def test_a():
               if isinstance(n, ast.FunctionDef) and n.name == "main")
     calls = [c.func.id for c in ast.walk(fn)
              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)]
-    check("main() 只在一處呼叫 live_leg_main",
-          calls.count("live_leg_main") == 1)
+    # 🔴 OLD / NEW / WHY / EVIDENCE（2026-09-18 RULING 1）
+    #   OLD : check("main() 只在一處呼叫 live_leg_main",
+    #                calls.count("live_leg_main") == 1)
+    #   NEW : main() **完全不呼叫** live_leg_main —— `--live-leg` CLI 在
+    #         任何其他檢查之前即回 LIVE_LEG_CLI_EXIT_CODE。
+    #   WHY : 使用者 2026-09-18 RULING 1 —— FIRST LIVE 正式 field path 只有
+    #         Phase 6.10 Handoff -> FIRST LIVE Dispatcher -> 既有 live leg。
+    #         `--live-leg` 會繞過 external pause / normal-loop halt /
+    #         PauseVerifier / restore responsibility -> TOCTOU / ownership race
+    #         （Trial #2 實測：external 可 STANDBY/IDLE 但 loop 仍 active）。
+    #   EVIDENCE : test_phase6_first_live_handoff.py R4 / R4b（CLI exit != 0、
+    #         未進入 live leg 流程、live_leg_main 與 run_live_leg_cli 函式保留）。
+    #   🔴 這是**收緊**（送出可能性只減不增），不是為了湊數字改斷言。
+    check("★★ main() 完全不呼叫 live_leg_main（RULING 1：CLI field entry 已封鎖）",
+          calls.count("live_leg_main") == 0)
+    check("★★ --live-leg CLI 封鎖旗標存在且為 True",
+          getattr(SVC, "LIVE_LEG_CLI_BLOCKED", False) is True
+          and getattr(SVC, "LIVE_LEG_CLI_EXIT_CODE", 0) != 0)
+    check("  live_leg_main / run_live_leg_cli 函式本體仍保留（只封 CLI）",
+          callable(getattr(SVC, "live_leg_main", None))
+          and callable(getattr(SVC, "run_live_leg_cli", None)))
     check("main() 不直接建立控制出口",
           "build_executor" not in calls and "build_verifier" not in calls)
 

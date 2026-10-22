@@ -1,0 +1,16 @@
+{
+  "_authorization": "使用者 2026-09-29 正式授權：2026-09-30 00:05–00:30 OFF_PEAK 窗口，唯一一次 Scheduled FIRST LIVE Attempt #6（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task、Attempt #7。",
+  "_supersedes": "Attempt #5（FIRST-LIVE-ATTEMPT5-20260925）= MISSED / NOT EXECUTED，root cause = HOST POWERED OFF AT SCHEDULED TRIGGER。Attempt #5 Task 已保存 evidence 後 Disabled，不得重新啟用或沿用。本次使用全新 Attempt ID / config / ledger / artifact / wrapper / Task XML。",
+  "_host_prerequisite": "HOST_POWERED_ON_REQUIRED = True。自 Attempt #6 起，主機必須於 trigger 時刻保持開機且 Water 帳號登入；Task 維持 StartWhenAvailable=False / WakeToRun=False，不補跑、不自行喚醒。",
+  "_baseline": "FULL LIVE-LEG READBACK = VERIFIED；SCHEDULED LIVE-LEG AUTHORIZATION = VERIFIED；FIRST LIVE MOCK SUCCESS = PASS；Full Phase 6 = 6671/6671 PASS / 61 files / 0 FAIL。Attempt #1~#5 皆未完成 5 kW live leg，successful real 5 kW leg 仍為 0 次。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT6-20260930",
+  "target_date": "2026-09-30",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT6-20260930.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live/attempt6_20260930"
+}

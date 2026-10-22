@@ -1,67 +1,191 @@
 # Crawler Sample — BESS Monitoring / Control / Auto Report
 
+> **本文件是專案的 CURRENT STATE 入口。**
+> 目前狀態一律以 [§9 Current Status](#9-current-status) 為唯一權威。
+> 開發歷史、逐步推導與完整 evidence 見 [§15 文件索引](#15-文件索引)。
+
+---
+
 ## 1. 專案簡介
 
-儲能櫃（BESS）HMI 的資料擷取與設備控制工具集，涵蓋：
+儲能櫃（BESS）HMI 的資料擷取與設備控制工具集：
 
-- BESS HMI 資料擷取
-- PCS / Battery / Environment 狀態解析
-- 人工設備控制（CLI）
-- 自動充放電報告
+- BESS HMI 資料擷取（電池 / PCS / 環控）
+- 人工設備控制（CLI，需二次確認）
+- 自動充放電報告（Session → 產表）
 - Windows Service 背景監控
-- Meter-based Phase 6 自動充放電決策
-- Phase 6.10 無人值守 ownership handoff
+- Phase 6 — Meter-based 自動充放電決策
+- Phase 6.10 — 無人值守 ownership handoff
 
 | 項目 | 值 |
 |---|---|
 | API Base | `http://192.168.128.110:8080/admin-api` |
 | 前端 HMI | `http://192.168.128.110:8853/`（Vue，Yudao/ruoyi-vue-pro） |
+| 正式電表來源 | `http://192.168.1.47:6160`（Socket.IO `update`） |
+| External controller | `192.168.70.201`（`~/ems/auto_control.py`，screen `auto`） |
 | 輸出目錄 | `D:\Crawler Sample\output` |
 
-Phase 1~5 已 COMPLETE；Phase 6 決策鏈完成但**實機控制尚未啟用**，
-Phase 6.10 離線開發完成並已凍結。目前狀態一律以 [§9](#9-development-progress) 為準。
+---
 
-## 2. 核心功能
-
-| 功能 | 說明 |
-|---|---|
-| HMI / BESS data scraping | 電池／PCS／空調／進排風／冷卻循環，逐欄對齊 HMI UI |
-| PCS / Battery status | 依 HMI `pcsMode_US` 規則解析，旗標一律讀 `oldValue`（語言無關） |
-| Manual control CLI | 選單式設備控制，控制指令需二次確認 |
-| Auto charge/discharge report | 排程開始自動建立 Session，結束自動收尾產表 |
-| Auto Monitor Windows Service | 不開 Dashboard 也能自動建立與收尾報告 |
-| Session / Auth Recovery | 服務重啟續接同一 Session；登入態失效自動重登 |
-| Ownership / Observer | 同時只有一個寫入者，Dashboard 為唯讀觀察者 |
-| Meter / TOU / Decision / Safety Gate | 電表功率分類、時段判定、決策引擎、安全閘 |
-| Control Authority | 控制權歸屬判定與一次性授權票 |
-| Unattended ownership handoff | 與外部控制程式的暫停／接管／歸還（Phase 6.10） |
-
-## 3. 系統架構
+## 2. 系統架構
 
 ```
-HMI / ESS
-   ↓
-Scraper / API Client
-   ↓
-Monitor / Decision
-   ↓
-Safety / Authority
-   ↓
-Report / Control
+HMI / Meter
+   → Observation（freshness / schema 驗證）
+   → Decision（Grid 分類 → TOU → SOC → 決策）
+   → Safety Gate / Control Authority / Direction Interlock
+   → Execution intent（目前恆停在 WOULD_EXECUTE / NO_CONTROL / BLOCKED）
+   → Report / Durable Audit
 ```
 
 Phase 6.10 ownership handoff：
 
 ```
-External Controller
-   → Pause
-   → Verify Idle
-   → Phase 6 Ownership
-   → Release
-   → Restore External Controller
+External running → Pause → Verify → Phase 6 ownership → Release → Restore → Verify
 ```
 
-任一環節無法確認，一律 **Fail Closed**（不送出、不接管、不清除恢復責任）。
+> 🔴 **Fail Closed 是全案唯一的預設立場**：
+> 任何 unknown / invalid / stale / 無法證明的狀態一律拒絕放行。
+> `None` **不是**「不限制」，而是「未配置 → 不得使用」。
+
+---
+
+## 3. Development Roadmap
+
+> 每列只保留「在做什麼 / 現在到哪」。詳細設計、推導、測試數與歷史 evidence
+> 一律在 [§15 文件索引](#15-文件索引) 指向的 `docs/`。
+> 目前狀態的唯一權威是 [§9 CURRENT STATUS](#9-current-status)。
+
+### 3.1 Phase 1 ~ Phase 6
+
+| Phase | 項目 | 主要目的 | Current Status |
+|---|---|---|---|
+| Phase 1 | Report Framework | 建立報告框架與基本資料輸出 | **COMPLETE** |
+| Phase 2 | Auto Start | 自動偵測測試開始 | **COMPLETE** |
+| Phase 3 | Auto Lifecycle | Session 自動建立、Resume、Finalize | **COMPLETE** |
+| Phase 4 | Auto Monitor Service | 背景監控服務化、Ownership、Observer、Recovery | **COMPLETE** |
+| Phase 5 | Production Ready | Soak / Stress / Deployment / Release Validation | **COMPLETE** |
+| **Phase 6** | **Meter-based Auto Charge / Discharge** | 電表 + TOU + SOC 決策，自動充放電控制架構 | **OFFLINE COMPLETE / LIVE HOLD** |
+| 6.0 | Production Meter Verify | 確認正式 Meter 資料來源 | COMPLETE |
+| 6.1 | Meter Client | 讀取正式電表資料 | COMPLETE |
+| 6.2 | Power Classification | Grid 方向判定（IMPORT / EXPORT / NEAR_ZERO / UNKNOWN） | COMPLETE |
+| 6.2b | TOU Calendar | 尖峰 / 半尖峰 / 離峰判定 | COMPLETE |
+| 6.3-A | Decision Engine | 建立自動控制決策骨架 | COMPLETE |
+| 6.3-B | Decision Policy | SOC / TOU / Meter 充放電規則 | COMPLETE |
+| 6.4 | Safety Gate | 實機控制安全條件 | COMPLETE |
+| 6.5 | PCS Control Integration | 控制出口、ReadBack、Authorization | COMPLETE / LIVE HOLD |
+| 6.5-H | Control Authority | IDLE / OWNED / EXTERNAL 控制權判斷 | OFFLINE VERIFIED |
+| 6.6 | Auto Report Integration | Phase 6 控制與報告 Session 整合 | COMPLETE |
+| 6.7 | Field Validation | Production stack 實機唯讀驗證 | COMPLETE / OBSERVE_ONLY |
+| 6.8 | Regression & Closure | Phase 6 整體離線回歸與結案 | COMPLETE |
+| 6.9 | Controlled FIRST LIVE | 單次受控實機控制 | ATTEMPTED / BLOCKED |
+| 6.9-A | CLI Entry Wiring | FIRST LIVE CLI 安全入口 | OFFLINE VERIFIED |
+
+### 3.2 Phase 6 Offline Application Layer
+
+| Item | Status |
+|---|---|
+| Offline Decision Simulator | COMPLETE |
+| Long-Running Decision Replay | COMPLETE |
+| Runtime / Arbiter Integration | COMPLETE |
+| TariffProvider Production Wiring | COMPLETE / VERIFIED |
+| Service Scheduling / Wait Injection | COMPLETE |
+| Durable Decision Audit | COMPLETE |
+| Process Lifecycle Enum | NOT CURRENTLY REQUIRED |
+
+> **Phase 6 Offline Application Layer = COMPLETE / FROZEN** ——
+> 不再主動新增架構、模組或功能；日後發現問題先分類為
+> BUG / FIELD EVIDENCE / POLICY DECISION / FUTURE ENHANCEMENT，
+> **不得直接解除 FROZEN**。
+
+### 3.3 Phase 6.10
+
+| Phase | 項目 | 主要目的 | Current Status |
+|---|---|---|---|
+| **Phase 6.10** | **Unattended Ownership Handoff** | External Controller 與 Phase 6 自動交接 | **OFFLINE COMPLETE / FIELD IN VALIDATION** |
+| 6.10 Core | Handoff Core | State Machine / Journal / Recovery / Responsibility | COMPLETE |
+| 6.10-A | Remote Adapter | SSH remote abstraction / taxonomy | COMPLETE |
+| 6.10-A1 | Verification | Pause / Restore verification model | COMPLETE |
+| 6.10-B1 | Read-only Guard | Forced-command SSH guard | COMPLETE |
+| 6.10-B1.5 | Production Preconditions | Field prerequisites | COMPLETE |
+| 6.10-B1.6 | Network Identity | SSH source identity validation | COMPLETE |
+| 6.10-B1.7 | Network Identity Acceptance | 本次 deployment 的 identity 裁示 | **ACCEPTED / NOT PASS** |
+| 6.10-B2 | Handoff Guard | pause / restore capability | **DEPLOYED** |
+| 6.10-C | Unattended Service | 無人值守 handoff service | OFFLINE COMPLETE |
+| 6.10-C1 | Service Timing | polling / lifecycle timing | COMPLETE |
+| 6.10-C2 | SSH Architecture | SSH client / guard integration | COMPLETE |
+| 6.10-C3 | SSH Timing | SSH timeout evidence framework | COMPLETE |
+| 6.10-C4 | Live Readiness | unattended live gate | COMPLETE |
+| — | Recovery Contract | Crash / restart recovery evidence | **FIXED / VERIFIED** |
+| — | Field Trial #1 | pause / restore field validation | **PARTIAL PASS** |
+| — | Deployed STOP Semantics | `auto_control.py` stop 語意與 Q1~Q4 | **CONFIRMED / CLOSED**（2026-09-17） |
+| — | Trial #2 Harness | Active baseline / loop halt / one-attempt / evidence | **IMPLEMENTED / OFFLINE VERIFIED** |
+| — | Trial #2（技術結果） | Discriminative pause validation | **PASS / DISCRIMINATIVE PAUSE VERIFIED**（2026-09-18） |
+| — | Trial #2（Field Closure） | 程序與證據閉合 | **CLOSED WITH DOCUMENTED PROCEDURE DEVIATION**（2026-09-18） |
+| — | FIRST LIVE Readiness Review | Offline 重新授權前檢查 | **COMPLETE**（2026-09-18） |
+| — | FIRST LIVE Integration | FIRST LIVE ↔ 6.10 handoff 整合 | **OFFLINE COMPLETE** |
+| — | FIRST LIVE Attempt #1 | 2026-09-18 單次 Controlled Field Attempt | **ABORTED_CURRENT_CONDITIONS**（EXPECTED FAIL-CLOSED SAFETY ABORT） |
+| — | FIRST LIVE Attempt #2 | 2026-09-22 00:05–00:30 排程單次 Attempt | **ABORTED_CURRENT_CONDITIONS** —— ROOT CAUSE = **PROVIDER_WIRING_DEFECT** |
+| — | Provider Wiring Defect 修正 | BUG #1 SOC band／BUG #2 classifier 暖機 | **FIXED / VERIFIED**（294 / 294，含真實 HMI／meter 複驗） |
+| — | HMI Auth Renewal | 抽出 6.9 bounded re-auth 為單一 policy 來源 | **VERIFIED**（105 / 105） |
+| — | FIRST LIVE Attempt #3 | 2026-09-23 00:05–00:30 排程單次 Attempt | **ABORTED_PRE_PAUSE_PREFLIGHT** —— ROOT CAUSE = **PROVIDER_WIRING_DEFECT** |
+| — | Handoff Observation Adapter | BUG #3 修正（詞彙 adapter ＋ soc_max_pct ＋ external liveness canonical） | **OFFLINE FIXED / VERIFIED**（133 / 133） |
+| — | FIRST LIVE Attempt #4 | 2026-09-24 00:05–00:30 排程單次 Attempt | **ABORTED_AT_7_FIRST_LIVE**（交接鏈全程打通） |
+| — | FIRST LIVE Dispatch Scope | scoped temporary enable ＋ permit（16 項前置） | **OFFLINE IMPLEMENTED / VERIFIED**（108 / 108） |
+| — | Scheduled Live-Leg Authorization | 非互動確認（structured authorization） | **OFFLINE VERIFIED**（106 / 106） |
+| — | Full Live-Leg Readback | 完整 readback 狀態機離線收斂 | **OFFLINE VERIFIED**（94 / 94） |
+| — | Attempt #5 Pre-Field Readiness | 正式狀態收斂 | **COMPLETE** |
+| — | FIRST LIVE Attempt #5 | 2026-09-25 00:05–00:30 排程單次 Attempt | **MISSED / NOT EXECUTED**（HOST POWERED OFF） |
+| — | FIRST LIVE Attempt #6 | 2026-09-30 00:05–00:30 排程單次 Attempt | **EXCEPTION_FAIL_CLOSED**（dispatcher factory signature defect） |
+| — | Dispatcher Factory Wiring Fix | factory 透傳 ＋ real provider construction coverage | **OFFLINE FIXED / VERIFIED**（60 / 60） |
+| — | FIRST LIVE Attempt #7 | 2026-10-01 00:05–00:30 排程單次 Attempt | **PAUSE_FAILED**（cross-attempt journal state leak） |
+| — | Handoff Journal Scope Fix | attempt-scoped journal ＋ shared-state inventory | **◀ 目前位置：OFFLINE FIXED / VERIFIED**（66 / 66） |
+| — | Scheduled FIRST LIVE（ONE-SHOT） | 一次性無人值守 commissioning runner | **◀ 目前位置：OFFLINE IMPLEMENTATION / VALIDATION** |
+| — | FIRST LIVE Retry | Phase 6 controlled live retry | **HOLD** |
+| 6.10-C LIVE | Unattended production deployment | 無人值守正式部署 | **NOT STARTED / BLOCKED** |
+
+### 3.4 Flow
+
+```text
+Phase 1  Report Framework
+   ↓
+Phase 2  Auto Start
+   ↓
+Phase 3  Auto Lifecycle
+   ↓
+Phase 4  Background Service
+   ↓
+Phase 5  Production Ready
+   ↓
+Phase 6  Meter-based Auto Control          ← OFFLINE COMPLETE / LIVE HOLD
+   ├─ Meter / TOU / Decision
+   ├─ Safety / Authority
+   ├─ PCS Integration
+   ├─ Auto Report
+   └─ Controlled FIRST LIVE                ← ATTEMPTED / BLOCKED
+            ↓
+Phase 6.10 Ownership Handoff               ← OFFLINE COMPLETE / FIELD IN VALIDATION
+   ├─ Core / Recovery                      ← COMPLETE（Recovery Contract FIXED）
+   ├─ Remote Guard                         ← B2 DEPLOYED
+   ├─ Pause / Restore Verification         ← COMPLETE
+   ├─ Field Trial #1                       ← PARTIAL PASS
+   ├─ Deployed STOP Semantics              ← CONFIRMED / CLOSED（Q1~Q4）
+   ├─ Trial #2 Harness                     ← IMPLEMENTED / OFFLINE VERIFIED
+   ├─ Trial #2 技術結果                     ← PASS（DISCRIMINATIVE PAUSE VERIFIED）
+   ├─ Trial #2 Field Closure                ← CLOSED WITH DOCUMENTED
+   │                                             PROCEDURE DEVIATION
+   ├─ FIRST LIVE Readiness Review          ← COMPLETE
+   ├─ FIRST LIVE Integration               ← OFFLINE COMPLETE
+   ├─ FIRST LIVE Attempt #1                ← ABORTED_CURRENT_CONDITIONS
+   │                                          （EXPECTED FAIL-CLOSED SAFETY ABORT）
+   ├─ FIRST LIVE Attempt #2                ← ABORTED_CURRENT_CONDITIONS
+   │                                          （ROOT CAUSE = PROVIDER_WIRING_DEFECT）
+   ├─ Provider Wiring Defect 修正           ← FIXED / OFFLINE VERIFIED
+   ├─ Scheduled FIRST LIVE（ONE-SHOT）      ← ◀ OFFLINE IMPLEMENTATION / VALIDATION
+   └─ Unattended LIVE Deployment           ← NOT STARTED
+```
+
+---
 
 ## 4. 主要檔案
 
@@ -72,415 +196,861 @@ External Controller
 | `device_control_scraper.py` | 共用解析核心（PCS／電池／環控） |
 | `device_control_menu.py` | CLI 設備控制選單 |
 | `device_control_operator.py` | 控制指令組裝與送出（需 `--execute` + YES） |
+| `charge_discharge_report.py` | Session 與報告產出（CSV／Excel／統計） |
 | `report_monitor.py` | Monitor Core：監看決策、Session 生命週期、Ownership |
 | `auto_monitor_service.py` | 背景服務入口，由 NSSM 啟動常駐 |
-| `charge_discharge_report.py` | Session 與報告產出（CSV／Excel／統計） |
-| `phase6_handoff_orchestrator.py` | Ownership 狀態機、Journal、恢復判定、交接流程 |
-| `phase6_remote_adapter.py` | 遠端 guard 契約、SSH timeout、capability 解析 |
-| `phase6_unattended_service.py` | 無人值守服務 lifecycle 與 live readiness |
-| `phase6_guard_deploy_plan.py` | Guard 部署／回滾套件（只產生指令，不執行） |
-| `pcs_auto_control_runtime.py` | Phase 6 控制 Runtime 狀態機（純邏輯、零 I/O） |
-| `pcs_auto_control_service.py` | Phase 6 服務外殼：Ownership、迴圈節奏、關閉流程 |
-| `pcs_auto_control_production.py` | Production 相依組裝（reader／meter／tariff／policy） |
+| `meter_client.py` | 併網點電表訂閱與 Fail Closed 驗證 |
+| `power_classifier.py` | Grid 方向分類（遲滯 / debounce） |
+| `tou_calendar.py` / `tariff_provider.py` / `annual_off_peak_calendar.py` | 時段規則 / 時區感知 provider / 年度離峰日 |
+| `decision_engine.py` / `decision_policy.py` | 決策引擎與充放電策略 |
+| `safety_gate.py` / `control_authority.py` | 安全閘與控制權判定 |
+| `pcs_control_integration.py` | 方向互鎖、控制請求組裝、Dry-run pipeline |
 | `decision_observer.py` | 觀測層：meter + ESS → 分類 → TOU → 決策（OBSERVE-ONLY） |
 | `production_arbiter.py` | 仲裁／授權：freshness 複驗、Safety、Authority、互鎖 |
 | `production_execution_chain.py` | 執行鏈（唯一可能呼叫 executor 之處；目前未注入） |
-| `phase6_decision_simulator.py` | 離線決策模擬器（零 I/O、可重播） |
-| `phase6_decision_replay_runner.py` | 長時間虛擬時鐘 replay runner（不 sleep） |
-| `phase6_decision_audit.py` | Durable Decision Audit（append-only JSONL；零控制能力） |
-| `run_all.py` | 一鍵執行全部**擷取腳本**（⚠️ **不是** Phase 6 regression 入口） |
+| `execution_reconciler.py` / `last_control_store.py` | 啟動恢復判定 / 控制紀錄（原子寫入） |
+| `pcs_auto_control_runtime.py` | Phase 6 控制 Runtime 狀態機（純邏輯、零 I/O） |
+| `pcs_auto_control_service.py` | Phase 6 服務外殼：Ownership、迴圈節奏、關閉流程 |
+| `pcs_auto_control_production.py` | Production 相依組裝 |
+| `phase6_decision_audit.py` | Durable Decision Audit（append-only JSONL） |
+| `phase6_handoff_orchestrator.py` | Ownership 狀態機、Journal、恢復判定 |
+| `phase6_remote_adapter.py` | 遠端 guard 契約、SSH timeout、capability、liveness |
+| `phase6_unattended_service.py` | 無人值守服務 lifecycle 與 live readiness |
+| `phase6_trial2_harness.py` | **Trial #2 field-validation harness**（trial tooling，非 production；零 I/O） |
+| `phase6_first_live_handoff.py` | **FIRST LIVE ↔ 6.10 整合層**：dispatcher、Phase 6 authority lease、command-count guard、handoff execution artifact |
+| `phase6_scheduled_first_live.py` | **Scheduled FIRST LIVE（ONE-SHOT）**：時間窗、durable ledger、crash recovery、self disarm。**非** Unattended LIVE |
+| `run_scheduled_first_live.py` | **ONE-SHOT CLI launcher**：`--config` 解析／Fail Closed 驗證／provider allowlist／穩定 exit code |
+| `phase6_first_live_field_provider.py` | **正式 field dependency provider**（WIRING ONLY；模組層只 import stdlib，其餘全部 lazy） |
+| `phase6_guard_ssh_runner.py` | B2 guard 專用 SSH runner（**硬性動詞 allowlist**，非允許動詞一律拒絕） |
+| `phase6_hmi_auth_renewal.py` | **HMI READ 認證續期（單一 auth policy 來源）**：bound 沿用 6.9＝2，只認 `_error401`，原地 re-login |
+| `phase6_first_live_runner.py` | Phase 6.9 controlled live leg。**ROLE = INTERNAL LIVE LEG / DISPATCHER；DIRECT FIELD EXECUTION = BLOCKED** |
+| `phase6_decision_simulator.py` / `phase6_decision_replay_runner.py` | 離線決策模擬器 / 虛擬時鐘 replay runner |
 | `run_phase3_regression.py` | Phase 2~5 Regression 總表 |
+| `run_all.py` | 一鍵執行全部**擷取腳本**（⚠️ **不是** Phase 6 regression 入口） |
+
+---
 
 ## 5. 快速使用
 
 ```bash
 python device_control_scraper.py     # 產生 device_control_readonly.json + 摘要
 python dashboard_scraper.py --once   # Dashboard 抓一次
-python dashboard_scraper.py --loop   # Dashboard 背景循環（Ctrl+C 停止）
 python device_control_menu.py        # CLI 設備控制選單
-python run_all.py                    # 一鍵執行全部擷取
 python run_phase3_regression.py      # Phase 2~5 Regression
 ```
 
-**登入設定**：放在 `test/` 下的 `*.env`（例如 `login.env`），
-可依 `.env.example` 建立本機檔。**`.env` 已由 `.gitignore` 排除，不可 commit。**
+- **登入設定**放在 `test/` 下的 `*.env`（例如 `login.env`），依 `.env.example` 建立。
+  **`.env` 已由 `.gitignore` 排除，不可 commit。**
+- ⚠️ **`run_all.py` 不是 Phase 6 regression 入口** —— 它會對 HMI 發出唯讀 GET 並寫入
+  `output/`。任何名稱不明的 `run_all.py` / `main.py` / `service.py` / `runner.py`，
+  執行前必須先確認 I/O side effects。
+- Phase 6 regression 以**逐檔執行** `test_phase6*.py` 為準（見 [§14](#14-regression)）。
+
+---
 
 ## 6. Auto Monitor / Auto Report
 
 ```
 排程 / 控制方向 → Session → Sampling → Finalize → report.xlsx
-```
-
-輸出：`output\charge_discharge_reports\<session_id>\`
-（`samples.csv`、`events.csv`、`summary.json`、`statistics.json`、`report.xlsx`
-及 `alarms.csv`、`cell_snapshots.json`、`session_state.json`）
-
-```
 Windows SCM → NSSM → auto_monitor_service.py → report_monitor.py
 ```
 
-重點：
-
-- Dashboard 未開啟時也能產生報告
+- 輸出：`output\charge_discharge_reports\<session_id>\`
 - **Service = Owner；Dashboard = Observer**（唯讀，不寫報告）
-- Graceful Recovery（正常停止）與 Crash Recovery（異常中斷）皆續接同一
-  `session_id` 與 folder，`sample_index` 繼續遞增，**不會建立第二份 Session**
+- Graceful / Crash Recovery 皆續接同一 `session_id` 與 folder，
+  `sample_index` 繼續遞增，**不會建立第二份 Session**
 - `tools\nssm.exe` 為 runtime dependency，不可刪除／改名／搬移
 - Service log：`output\logs\auto_monitor_service.log`
 
-> Service 六個動作（install / update / start / stop / status / remove）的完整說明見
-> [`../tools/README.md`](../tools/README.md)（權威來源）。
-> 部署、健康檢查、Upgrade、Rollback、Troubleshooting 見
+> Service 六個動作的權威說明見 [`../tools/README.md`](../tools/README.md)；
+> 部署 / 健康檢查 / Upgrade / Rollback 見
 > [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md)。
-> Recovery 兩條路徑的實機證據見
-> [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md)。
 
-## 7. Phase 6 — Meter-based Auto Charge / Discharge
+---
 
-以電表功率、時段與 SOC 產生充放電決策，經 Safety Gate 與 Control Authority
-才可能送出 PCS 指令。逐階段狀態見
-[§9 Development Progress](#9-development-progress)。
+## 7. Phase 6 — Production Contract
 
-重點結論：
+### 7.1 已核准參數
 
-- Production 正常控制目標 **±5 kW**。
-- `max_power_kw = 150 kW` **僅為 Safety Gate 的指令上限**，不是營運功率。
-- 方向反轉 **Layer 1 direction interlock 已完成**；
-  **Layer 2 `min_switch_interval` = DEFERRED**（無正式依據，不得自行填值）。
-- `dispatch_ready` 與 `dispatch_enabled` **分離** —— 條件齊備不等於允許送出。
-- 任一條件無法確認一律 **Fail Closed**。
-- **External Controller 已 field confirmed**（`192.168.70.201` 的
-  `~/ems/auto_control.py`）。
-- FIRST LIVE 因該 competing controller 自動接管而**安全 ABORT**，
-  Phase 6 即時偵測到外部控制並停止，未送出任何指令。
-- **Phase 6 實機 CHARGE / DISCHARGE / PCS STOP = 0 / 0 / 0。**
-
-> 三種 kW 語意（Grid Meter `+=IMPORT`、Battery `+=CHARGE`、
-> PCS Command `CHARGE→負 setpoint`）**嚴禁混用**。
-> 逐階段開發歷史見 [Appendix](#appendix--historical-development-notes)。
-
-### 7.1 Offline Application Layer
-
-決策鏈本身（6.0~6.5）早已完成；後續補的是**應用層工具與 orchestration 驗證**，
-全部 OFFLINE / ZERO-I/O / 虛擬時鐘，**沒有第二套決策實作**：
-
-| 元件 | 內容 | 狀態 |
+| 參數 | 值 | 狀態 |
 |---|---|---|
-| Offline Decision Simulator | A–P 決策矩陣端到端組裝、`_UNSET` vs `None` 語意 | COMPLETE |
-| Long-Running Decision Loop | L1–L16 時間軸重播、24h synthetic day、13 條不變量 | COMPLETE |
-| Runtime / Arbiter Integration | 直接驅動正式 Runtime + Arbiter + Execution Chain | COMPLETE |
-| Service Scheduling | cadence 接線與可注入等待 | COMPLETE |
-| Durable Decision Audit | 一 cycle 一筆、跨 process 可追溯 | COMPLETE |
+| `charge_power_kw` | 5.0 | **FINAL** |
+| `discharge_power_kw` | 5.0 | **FINAL** |
+| `max_power_kw` | 150 | **FINAL**（Safety Gate 指令上限，**不是**營運功率） |
+| `decision_interval_sec` | 30 | **FINAL** |
+| `authorization_ttl_sec` | 10 | **FINAL** |
+| `authority_ttl_sec` | 180 | **FINAL** |
+| `authority_power_tolerance_kw` | 1.25 | **FINAL** |
+| `readback_timeout_sec` / `poll` / `samples` | 75 / 5 / 1 | **FINAL** |
+| `min_switch_interval_sec` | `None` | **DEFERRED**（Layer 2 時間互鎖未啟用） |
+| `meter_stale_grace_sec` | `None` | **DEFERRED**（採最保守解釋＝不等待） |
 
-驗證要點：
+### 7.2 三種 kW 語意（**嚴禁混用**）
 
-- **冷啟動**：分類器第一個 debounce 窗內 `grid = UNKNOWN` → `no_action`，
-  這是**預期的 Fail Closed**，不得以灌假樣本繞過。
-- **方向反轉**：PCS 實際為 `CHARGING`／`DISCHARGING` 時要求反向 →
-  `DIRECTION_REVERSAL_REQUIRES_STOP`；Arbiter 層會另外形成獨立 STOP leg。
-  PCS 實際狀態一律來自 observation，**不得**由上一輪意圖推導。
-- **Authority**：每個 cycle 重新佐證；上一輪 `OWNED_BY_PHASE6` 不得沿用。
-- **稽核**：兩層並存（見 §7.4）——
-  `AUDIT_LIMIT = 200` 記憶體 ring（即時 diagnostics）
-  ＋ durable JSONL sink（歷史 trace）。
+| 來源 | 正號 | 負號 |
+|---|---|---|
+| **Grid Meter**（6160 `meter`） | `+` = GRID_IMPORT 取電 | `−` = GRID_EXPORT 逆送 |
+| **Battery measurement** | `+` = CHARGE | `−` = DISCHARGE |
+| **PCS command** | `CHARGE` → **負** setpoint | `DISCHARGE` → **正** setpoint |
 
-### 7.2 Production TOU（時段）接線
+> 禁止 `meter +kW → PCS +kW` 直通。Decision 一律用 IMPORT / EXPORT，
+> 只有 PCS 控制邊界才轉 setpoint 正負。
+
+### 7.3 Layer 1 Direction Interlock
+
+- PCS 實際為 `CHARGING` 時要求 `DISCHARGE` → `DIRECTION_REVERSAL_REQUIRES_STOP`
+- PCS 實際為 `DISCHARGING` 時要求 `CHARGE` → 同上
+- PCS 為 `STANDBY` → 方向已隔離，**合法換向**
+- 🔴 判準一律是 **PCS 實際回報狀態**，**不得**用「上一筆送出的指令」推導
+- Arbiter 層遇反轉會另外形成獨立的 **STOP leg**，不直接反向
+
+### 7.4 `dispatch_ready` ≠ `dispatch_enabled`
+
+- `dispatch_ready`：production 參數是否齊備
+- `dispatch_enabled`：是否允許送出（模組層恆為 `False`）
+- **條件齊備不等於允許送出。** OBSERVE_ONLY 下 executor / verifier 恆為 `None`，
+  「送不出指令」是**結構事實**，不是旗標判斷。
+
+### 7.5 Production TOU
 
 ```
-build_production_stack() / build_live_chain_bundle()
-  → PRD.build_tariff_provider(AC.PRODUCTION_PROVIDER)
-  → PRD.build_local_now()            # Asia/Taipei aware datetime
-  → DecisionObserver(tariff_provider=..., local_now=...)
-  → TariffProvider.observe(aware_dt)
-  → tou_calendar.classify_tou(...)   # 規則仍只有這一套
+build_production_stack() → PRD.build_tariff_provider(AC.PRODUCTION_PROVIDER)
+                         → PRD.build_local_now()   # Asia/Taipei aware
+                         → DecisionObserver(tariff_provider=…, local_now=…)
+                         → tou_calendar.classify_tou(...)   # 規則只有這一套
 ```
 
-- 時區 **Asia/Taipei**，時間一律 **aware datetime**。
-- **naive datetime 明確拒絕** → `NAIVE_DATETIME_REJECTED` → TOU `UNKNOWN`
-  → `INVALID_TOU_STATE` → `no_action`（**UNKNOWN 絕不等同 OFF_PEAK**）。
-- 年度離峰日沿用已人工驗收的 **2026 / 2027** 清單（`AC.PRODUCTION_PROVIDER`）。
-- 時區無法解析時**不 fallback UTC、不用系統本機時間** —— 回 naive 讓
-  TariffProvider 拒絕，維持 Fail Closed。
-- `local_now` 仍可注入，供離線測試／虛擬時鐘／確定性重播使用。
+- 時區 **Asia/Taipei**，時間一律 **aware datetime**
+- **naive datetime 明確拒絕** → TOU `UNKNOWN` → `no_action`（**UNKNOWN ≠ OFF_PEAK**）
+- 年度離峰日沿用已驗收的 **2026 / 2027** 清單
+- 時區無法解析時**不 fallback UTC、不用系統本機時間**
 
-### 7.4 Durable Decision Audit
-
-兩層稽核**互不取代**：
+### 7.6 Durable Decision Audit
 
 | 層 | 內容 | 保存 |
 |---|---|---|
-| `AutoControlRuntime.audit` | 最近 `AUDIT_LIMIT = 200` 筆 `CycleResult` | 記憶體，重啟即失 |
-| `phase6_decision_audit.AuditSink` | 每個 cycle **一筆** immutable 紀錄 | `output/phase6_audit/decision_audit.jsonl` |
+| `AutoControlRuntime.audit` | 最近 200 筆 `CycleResult` | 記憶體，重啟即失 |
+| `phase6_decision_audit.AuditSink` | 每 cycle **一筆** immutable 紀錄 | `output/phase6_audit/decision_audit.jsonl` |
 
-已裁示的 policy：
+- `ONE_CYCLE_ONE_RECORD` / `APPEND_ONLY_JSONL` / fsync `EVERY_CYCLE`
+- 寫入失敗 = **`NON_GATING_CONTINUE`**：控制照跑，但**絕不假裝成功**
+- `at_wall` = Asia/Taipei aware ISO-8601（**僅供鑑識**）；
+  `at_monotonic` 是**唯一**用於 elapsed / freshness / TTL 的基準
+- 🔴 Audit 是 **evidence，不是控制狀態恢復來源**
+- 🔴 **不得增加任何 device I/O**（已由測試鎖住讀取次數相同）
+- 🔴 **不得寫入**密碼 / token / cookie / 私鑰 / 原始 response / `alarm_rows`
 
-| 項目 | 值 |
-|---|---|
-| `AUDIT_GRANULARITY` | `ONE_CYCLE_ONE_RECORD` |
-| `AUDIT_FORMAT` | `APPEND_ONLY_JSONL` |
-| `AUDIT_FSYNC_POLICY` | `EVERY_CYCLE`（append → flush → fsync） |
-| `AUDIT_WRITE_FAILURE_POLICY` | `NON_GATING_CONTINUE` |
-| `ROTATION_POLICY` | **DEFERRED** |
-| `RETENTION_POLICY` | **DEFERRED** |
+### 7.7 Service Cadence
 
-Schema：`SCHEMA_VERSION = 1`，**46 個 required key**
-（Identity / Time / Runtime / Meter / Tariff / ESS / PCS / Decision /
-Authority / Safety / Direction / Authorization / Execution / Recovery /
-detail / `audit_sink_healthy`）。
-
-欄位語意：
-
-- `seq` 跨 process 單調遞增（開檔時由**檔尾**回復，不整檔掃描）；
-  `cycle` 是 runtime 內序號，restart 後歸零；
-  `run_id` 區分每次執行；`boot_id` 區分每次開機。
-- `at_wall` = **Asia/Taipei aware ISO-8601**（例：`2026-09-15T10:12:34+08:00`）
-  —— **僅供人閱讀的鑑識時間戳**，不參與任何判定。
-  時間來源沿用該鏈已在使用的 aware `local_now`（production 由
-  `PRD.build_local_now()` 注入），**不新造第二套 timezone helper**、
-  不使用 naive 的 `time.strftime()` / `datetime.now()`、**不 fallback UTC**。
-  時區不可解析時 `at_wall` 為 `null`（同一筆的 `tou_reason` 會說明原因）。
-- `at_monotonic` 是 **唯一** 用於 elapsed / freshness / TTL 計算的時間基準
-  （跨 boot 不可比）。
-- **REQUIRED KEY 契約**：每個 key 必定存在，**值可為 null** ——
-  觀測不到就是 null，並由對應的 `*_reason` 說明原因。
-  「能回答問題」的標準是「有值 **或** 有明確 reason」。
-
-硬性邊界：
-
-- 🔴 Audit 是 **evidence**，**不是控制狀態恢復來源** ——
-  不得用來恢復 pending authorization / previous decision / `COMMAND_PENDING`。
-  正式 recovery 仍走 fresh observation + `LastControlStore` + `ExecutionReconciler`。
-- 🔴 **不得增加任何 device I/O**：一律使用該 cycle 已取得的 fresh observation，
-  絕不為了寫稽核而再讀一次 ESS 或電表（已由測試鎖住 with/without audit
-  的讀取次數必須完全相同）。
-- 🔴 寫入失敗 = `NON_GATING_CONTINUE`：控制服務照常運轉，但**絕不假裝成功** ——
-  `healthy` 轉 False、`write_failure_count` 累加（成功後**不清零**）、
-  `last_error` 保留，並印出明確 WARNING。它不得改變 Runtime / Authority /
-  Safety / dispatch 任何狀態。
-- 🔴 **不得寫入**密碼 / token / Bearer / cookie / session secret / SSH 私鑰 /
-  SM2 私鑰材料，也不得把原始 HTTP response 或 `alarm_rows` 原封 dump 進去。
-- 🔴 與 **Phase 6.10 ownership journal 是不同的東西**：本層沒有 intent→outcome
-  狀態機、沒有 handoff state，只共用「append-only + fsync」的寫入模式。
-
-**已知限制（不是缺陷，是目前設計的明確邊界）：**
-
-1. **Rotation** — `ROTATION_POLICY = DEFERRED`，本版不做任何刪除或搬移。
-2. **Retention** — `RETENTION_POLICY = DEFERRED`。
-3. **檔案成長** — cadence 30 s、每筆約 1.3 KB → **約 4 MB/天**。
-   rotation / retention 另行裁示前，**請自行留意磁碟使用量**。
-4. **crash 前最後一次寫入失敗** —— `seq` 由 JSONL 中最後一筆成功紀錄回復。
-   若「最後一次 audit write 失敗後隨即 process crash」，單靠同一份 JSONL
-   **無法**得知那個失敗的 seq 曾經存在，restart 後可能從最後成功 seq + 1
-   重新使用該號碼。這是 **single-file non-gating audit 的既有限制** ——
-   目前 **沒有 sidecar watermark、沒有 manifest**。
-   因此**不得宣稱**「每一次 write failure 跨 restart 都能由 seq gap 偵測」。
-   （同一個 process 內的失敗仍會留下 seq 空洞，已由測試佐證。）
-5. **`ObserveRecord.meter_state` 恆為 `None`** —— 來源／schema 不一致
-   （`ProductionArbiter` 的 `ArbitrationResult` 並無該欄位）。
-   影響範圍**僅限** `--status` 的 observation 顯示；
-   對 Decision / Authority / Safety / Direction Interlock / Runtime /
-   Durable Audit / Fail Closed **完全無影響** ——
-   Durable Audit 並未使用該欄位，而是直接取
-   `DecisionObservation` 的 `grid_power_kw` / `meter_valid` /
-   `meter_reason` / `meter_age`。待日後獨立的 status/schema cleanup 處理。
-6. **LIVE dispatch atomicity** —— 目前 `ONE_CYCLE_ONE_RECORD` 適用於
-   `DISPATCH_ENABLED = False` / `executor = None` 的現況。未來若 LIVE policy
-   要求「audit durable success 是 dispatch 的前提」，需另行設計
-   **PRE-DISPATCH INTENT + POST-DISPATCH OUTCOME** 的兩段式 durability protocol。
-   目前 **NOT IMPLEMENTED / NOT REQUIRED FOR CURRENT OFFLINE SCOPE**。
-
-### 7.3 Service Cadence
-
-- 正式節奏 `decision_interval_sec = 30.0 FINAL`，
-  **唯一來源**為 `pcs_auto_control_config.DEFAULT_CONTROL_CONFIG`；
-  service 內**不再**保留第二份數值。
-- CLI `--interval` override 保留；未指定時走 production config。
-- cadence 必須 **finite 且 > 0**。`0` / 負數 / `None` / `NaN` / `inf` /
-  非數字一律 **不進入主迴圈**（Fail Closed），不自行 fallback 成任何秒數。
-  （`0` 會讓常駐服務變成 tight loop，而一個正常 cycle 至少會產生
-  ESS ×2 + 電表 ×2 次讀取。）
-- `run(waiter=...)` 可注入等待機制；production 預設仍為 `stop_event.wait`。
-  離線測試一律以「正式 cadence + fake waiter」達成零等待，
-  **不得**把 cadence 設成 0 來規避等待。
+- cadence **唯一來源** = `DEFAULT_CONTROL_CONFIG.decision_interval_sec`
+- cadence 必須 **finite 且 > 0**；`0` / 負 / `None` / `NaN` / `inf` / 非數
+  → **不進入主迴圈**（Fail Closed），不 fallback 任何秒數
+- `run(waiter=…)` 可注入等待機制；離線測試以「正式 cadence + fake waiter」零等待
 - cadence 屬 service shell 的 I/O 排程，**不得**塞進 `AutoControlRuntime`
-  —— Runtime 必須維持「可被任意／虛擬節奏驅動的純 cycle」。
-- `authorization_ttl_sec = 10.0` < cadence 30.0 **不構成衝突**：
-  授權票的生命週期在單一 cycle 內，不跨輪（已由測試佐證）。
 
-## 8. Phase 6.10 — Unattended Ownership Handoff
+---
 
-目的：安全完成 `External → Pause → Phase6 → Release → Restore External`。
-
-核心特性：Ownership State Machine、Fail Closed、Restore Responsibility、
-Crash / Restart Recovery、Durable JSONL Journal、Remote SSH Guard、
-Capability Reporting、Single Instance、Live Readiness Gate、
-Deployment / Rollback Package。
+## 8. Phase 6.10 — Ownership Handoff
 
 ```
-Phase 6.10 OFFLINE DEVELOPMENT = COMPLETE / FROZEN
+External running → Pause → Verify → Phase 6 ownership → Release → Restore → Verify
 ```
 
-逐子階段狀態見 [§9 Development Progress](#9-development-progress)。
+### 8.1 核心 Safety 規則
 
-### Production Parameters
+- **同一時間只能有一個控制者**
+- 任何不確定 → **Fail Closed**
+- `pause` 一旦可能送出 → **restore responsibility 成立，且不可清除**，
+  直到 `RV_RESUMED` 驗證通過
+- **`SEND_UNKNOWN`（SSH exit 41 / command timeout）唯一代表「可能已執行」**
+  → 責任成立、**禁止重送**、必須 probe / recover
+- crash / 重啟後責任不消失：`recover()` 依證據重建
+- 停止軟體服務 **≠** 停止 PCS（`shutdown` = relinquish authority only）
 
-**Service**
+### 8.2 Recovery Evidence Contract
 
-| 參數 | 值 |
-|---|---|
-| `decision_interval_sec` | 30 FINAL |
-| `retry_backoff_sec` | 5 FINAL |
-| `service_health_timeout_sec` | 300 FINAL |
+`running` 的語意是 **external controller active loop confirmed**，
+**不是** process exists、**不是** screen exists。
 
-**SSH**
-
-| 項目 | 值 |
-|---|---|
-| connect | 5 FINAL |
-| probe | 5 FINAL |
-| status | 12 FINAL |
-| loopcheck | 26 FINAL |
-| pause | 12 **STRUCTURAL CANDIDATE / NOT FINAL**；production default = `None` |
-| restore | 12 **STRUCTURAL CANDIDATE / NOT FINAL**；production default = `None` |
-
-**Handoff**
-
-| 項目 | 值 |
-|---|---|
-| idle power | −3 ~ +1 kW |
-| pause settling | 120 s |
-| stable verify | 4 samples / 15 s / 45 s |
-| restore verify | 3 observations / 3 s / 6 s |
-
-> `pause` / `restore` 恆列於 `missing()` 與 `not_field_verified()`，
-> **不得升格 FINAL**，直到取得真正的控制路徑實測。
-> 各參數的推導與 evidence 見測試檔、`output/` 下的量測紀錄，
-> 以及 [Appendix](#appendix--historical-development-notes)。
-
-## 9. Development Progress
-
-| Phase | Item | Status |
+| 條件 | verdict | `recover()` |
 |---|---|---|
-| Phase 1 | Report Framework | COMPLETE |
-| Phase 2 | Auto Start | COMPLETE |
-| Phase 3 | Auto Lifecycle | COMPLETE |
-| Phase 4 | Auto Monitor Service | COMPLETE |
-| Phase 5 | Production Ready | COMPLETE |
-| 5.1 | Production Validation Plan | COMPLETE |
-| 5.2 | Long-running Stability / Soak Test | COMPLETE |
-| 5.3 | Stress / Boundary Test | COMPLETE |
-| 5.4 | Production Documentation / Deployment | COMPLETE |
-| 5.5 | Release Validation | COMPLETE |
-| Phase 6 | Meter-based Auto Charge / Discharge | OFFLINE COMPLETE / LIVE HOLD |
-| 6.0 | Production Meter Verify | COMPLETE |
-| 6.1 | Meter Client | COMPLETE |
-| 6.2 | Power Classification | COMPLETE |
-| 6.2b | TOU Calendar | COMPLETE |
-| 6.3-A | Decision Engine Framework | COMPLETE |
-| 6.3-B | Decision Policy | COMPLETE |
-| 6.4 | Safety Gate | COMPLETE |
-| 6.5 | PCS Control Integration | COMPLETE / LIVE HOLD |
-| 6.5-H | Control Authority / Arbitration | OFFLINE VERIFIED |
-| 6.6 | Auto Report Integration | COMPLETE |
-| 6.7 | Field Validation | COMPLETE / OBSERVE_ONLY |
-| 6.8 | Regression & Closure | COMPLETE |
-| 6.9 | Controlled FIRST LIVE | ATTEMPTED / BLOCKED |
-| 6.9-A | CLI Entry Wiring | OFFLINE VERIFIED |
-| Phase 6 (offline app layer) | Offline Decision Simulator | COMPLETE |
-| Phase 6 (offline app layer) | Long-Running Decision Replay | COMPLETE |
-| Phase 6 (offline app layer) | Runtime / Arbiter Integration | COMPLETE |
-| Phase 6 (offline app layer) | TariffProvider Production Wiring | COMPLETE / VERIFIED |
-| Phase 6 (offline app layer) | Service Scheduling / Wait Injection | COMPLETE |
-| Phase 6 (offline app layer) | Durable Decision Audit | COMPLETE |
-| Phase 6 (offline app layer) | Process Lifecycle Enum | NOT CURRENTLY REQUIRED |
-| Phase 6.10 | Unattended Ownership Handoff | OFFLINE COMPLETE / FROZEN |
-| 6.10 Core | Ownership Handoff Core | COMPLETE |
-| 6.10-A | Remote Adapter | COMPLETE |
-| 6.10-A1 | Verification | COMPLETE |
-| 6.10-B1 | Read-only Guard | COMPLETE |
-| 6.10-B1.5 | Production Preconditions | COMPLETE |
-| 6.10-B1.6 | Network Identity Blocker | COMPLETE / BLOCKER CONFIRMED |
-| 6.10-B1.7 | Network Identity Verification | ACCEPTED FOR CURRENT DEPLOYMENT |
-| 6.10-B2 | Offline Handoff | COMPLETE |
-| 6.10-B2 LIVE | Live Handoff Deployment | DEPLOYED / READ-ONLY VERIFIED |
-| 6.10-C | Offline Unattended Service | COMPLETE |
-| 6.10-C1 | Service Timing | COMPLETE |
-| 6.10-C2 | SSH Architecture | COMPLETE |
-| 6.10-C3 | SSH Timing Evidence | COMPLETE |
-| 6.10-C4 | Live Readiness | COMPLETE |
-| 6.10-C LIVE | Unattended Service Live Deployment | NOT STARTED / BLOCKED |
+| probe 必要事實取不到 | `EXTERNAL_UNKNOWN` | `R_UNKNOWN` |
+| 事實齊備但 screen / process / identity 任一為 False | `EXTERNAL_NOT_RUNNING` | `R_PENDING_RESTORE` |
+| runtime 健康 + loop marks **前進** | `EXTERNAL_RUNNING` | `R_CLEAN` |
+| runtime 健康 + loop marks **未前進** | `EXTERNAL_NOT_RUNNING` | `R_PENDING_RESTORE` |
+| runtime 健康但 loop 證據不足 | `EXTERNAL_UNKNOWN` | `R_UNKNOWN` |
 
-### Current Summary
+> recovery 證據**只准** `probe` + `loopcheck`（皆 PASSIVE_READ_ONLY），
+> **不得**使用 `status`。
 
-- Phase 1 ~ Phase 5：COMPLETE
-- Phase 6：OFFLINE COMPLETE / LIVE HOLD
-- Phase 6 offline application layer：Offline Decision Simulator /
-  Long-Running Decision Replay / Runtime·Arbiter Integration /
-  TariffProvider Production Wiring / Service Scheduling 皆 COMPLETE
-- Durable Decision Audit：COMPLETE
-  （RAM ring 200 筆 ＋ append-only JSONL；rotation / retention 仍 DEFERRED）
-- Process Lifecycle Enum：NOT CURRENTLY REQUIRED
-  （目前沒有 evidence 需要新增，非永久禁止）
-- REAL_REPLAY_FIXTURE：DEFERRED（未讀取任何現場 CSV / JSON / JSONL）
-- 未裁示的 production 參數（一律維持 `None`，**不得**自行填值）：
-  `min_switch_interval_sec` = None / DEFERRED（Layer 2 時間互鎖，見 §7）、
-  `meter_stale_grace_sec` = None / DEFERRED（電表 stale 寬限，採最保守解釋＝不等待）
-- Phase 6.10：OFFLINE COMPLETE / FROZEN
-- Phase 6.10-B1.7：ACCEPTED FOR CURRENT DEPLOYMENT
-- Phase 6.10-B2 LIVE：DEPLOYED / READ-ONLY VERIFIED
-- Phase 6.10-C LIVE：NOT STARTED / BLOCKED
-- FIRST LIVE：HOLD
-- LIVE_READINESS：BLOCKED
+### 8.3 遠端動詞分類
 
-> 🔴 **`ACCEPTED` 不是 `PASS`。** B1.7 的實機驗證（受控 reconnect / DHCP renew
-> 後重新確認 IP、DHCP server、route/source 與 guard 三動詞）**從未執行**；
-> server-side DHCP reservation 證據也**未取得**。目前是使用者裁示接受
-> `192.168.128.234` 作為此次 deployment 的固定 source identity。
-> 只要 IPv4 / NIC / route / DHCP policy / Wi-Fi source / SSH `from=`
-> 任一改變，狀態必須退回 `NOT_VERIFIED` 並重跑 B1.7。
->
-> 🔴 **B2 已部署 ≠ pause / restore 已驗證。** guard 回報
-> `capability_pause=true` / `capability_restore=true` 只代表**具備能力**；
-> 兩者實機執行次數仍為 0，command timeout 仍是 STRUCTURAL CANDIDATE
-> （production 預設 `None`），`PAUSE_TIMEOUT_VERIFIED` /
-> `RESTORE_TIMEOUT_VERIFIED` 皆為 False。
+| 動詞 | 遠端動作 | 分類 |
+|---|---|---|
+| `probe` | `screen -ls` / `pgrep` / `ps` / `readlink` | **PASSIVE_READ_ONLY** |
+| `loopcheck` | `screen -X hardcopy`（抓兩次時間戳，暫存檔即刪） | **PASSIVE_READ_ONLY** |
+| `status` | `screen -X stuff $'status\n'` —— **寫入 controller stdin**；deployed source 已確認只 `print` 參數，**無** device control effect | **QUERY_ONLY_WITH_STDIN_WRITE**（transport 仍是 stdin write，**不得**稱 PASSIVE_READ_ONLY） |
+| `pause` / `restore` | `screen -X stuff $'stop\n'` / `$'start\n'` | **CONTROL_VERB**（需 `armed=True`） |
 
-### Current Safety State
+> 🔴 `status` **不得**被描述為 pure read-only。
 
-- DISPATCH_ENABLED = False
-- MODE = DRY_RUN
-- DEPLOYED_GUARD_VARIANT = B2
-- RemoteSenders armed = False
-- NETWORK_IDENTITY_STABILITY = ACCEPTED / USER CONFIRMED
-- DHCP Reservation = NOT VERIFIED / NON-BLOCKING BY USER DECISION
+### 8.4 Deployed PAUSE / STOP Semantics（2026-09-17 CONFIRMED）
 
-Field command count：
+> 來源：直接讀取 `192.168.70.201:/home/etica/ems/auto_control.py`
+> （`sha256 964bb642…76ce`，789 行）。**此為 deployed behavior 的最高權威**；
+> 本機 2025-04 舊副本（361 / 314 / 242 行）僅為 historical reference。
 
-- Phase 6 CHARGE / DISCHARGE / PCS STOP = 0 / 0 / 0
-- External pause / restore / stop / start = 0 / 0 / 0 / 0
+```
+PAUSE SEMANTICS = ZERO-UNTIL-STOP-CONFIRMED → THEN COMMAND SILENCE
+```
 
-### Live Blockers
+```
+stop
+ ├─ running = False                       ← 正常 control loop 立即停用
+ └─ 進入停止確認 loop（每 ~5s）
+      ├─ bess_client_read()；registers 空 → continue（不宣稱停止完成）
+      ├─ LastPd[i] = 0 / Step[i] = 0
+      ├─ 讀實際 BESS power
+      ├─ 若仍非 0 → request_kw(i, 0) 並 is_stop = False
+      └─ 全部收斂為 0 → is_stop = True
+            → print("已停止運行") / Pd = 0 / LastVer.clear() / break
+之後回到 outer while：running == False → sleep(1); continue
+（thread 存活，正常 control loop 不執行；僅 start 可恢復）
+```
 
-- Remote Guard（field）：`probe` / `loopcheck` / `status` / `pause` /
-  `restore` 皆在 B2 allowlist 內；`pause` / `restore` **實機執行次數 = 0**
-- `pause` / `restore` command timeout = STRUCTURAL CANDIDATE，尚無實測
-- FIRST_LIVE_PREREQUISITE = False；`DISPATCH_ENABLED = False`
+🔴 **`pause` 不是純 software flag change。**
+收斂期間會**重複**送出 `request_kw(i, 0)` = 真實 HMI control write
+（`activePowerSetPoint = 0`），**不是** Modbus write。
 
-### Next Field Sequence
+> **`PAUSE TRANSITIONAL CONTROL EFFECT = REPEATED ZERO SETPOINT WHILE CONVERGING`**
+> 它**不是** Phase 6 CHARGE / DISCHARGE / PCS STOP，
+> 但**是**由 B2 pause 觸發的真實 external-controller command，
+> 必須在 field evidence 中明文記錄。
 
-1. Controlled FIRST LIVE
-2. pause / restore timing evidence
-3. 評估 pause / restore timeout FINAL
-4. Phase 6.10-C Live Service Deployment
+**Timestamp / loopcheck 語意**：deployed 的 `strftime("%Y-%m-%d %H:%M:%S")` print
+位於 `if not running: sleep(1); continue` **之後**的正常 demand loop 內。因此
+`running=False` 時 marks 應停止前進 —— 這可支持 **NORMAL CONTROL LOOP HALTED**，
+但**不能單獨**證明 stop convergence 已完成（收斂 loop 期間正常 timestamp 已不再輸出）。
 
-> **上述任何 Field 階段均需要新的明確授權。**
+**`start` / restore 語意**：`start` 僅將 `running = True`，**本身不送 `request_kw()`**。
+恢復後是否出力由 controller 依其 policy / demand / SOC / TOU 自行決定 ——
+因此 `RestoreVerifier` 不要求 restore 後一定 CHARGING / DISCHARGING 是正確的。
 
-## 10. Regression
+🔒 deployed `bess_request.py` 內存在 hard-coded credential。
+**SECURITY ISSUE / SEPARATE TRACK**；本專案文件不記錄任何 secret 值。
+
+### 8.5 Trial #2 Harness（field-validation tooling）
+
+`phase6_trial2_harness.py` —— **trial tooling，不是 production application layer**。
+零 I/O：sample / probe / loop mark / sender 全部由呼叫端注入，模組本身不含
+SSH / HTTP / Modbus / subprocess（由回歸 AST 掃描鎖住）。
+
+**兩層分離（G2 POLICY）**
+
+| 層 | 內容 |
+|---|---|
+| **LAYER 1 SAFETY PREFLIGHT** | 15 項。合法 PCS 觀測狀態 = `CHARGING` / `DISCHARGING` / `STANDBY` / `STOPPED`。🔴 **不得**因 PCS 正在充放電就判 FAIL（Trial #1 的 idle-only 條件明文不得沿用）；`UNKNOWN` / `FAULT` / `None` 仍 Fail Closed |
+| **LAYER 2 ACTIVE BASELINE GATE** | `loop marks ADVANCING` **AND**（`PCS=CHARGING` ∨ `PCS=DISCHARGING` ∨ `Authority=EXTERNAL_OR_UNKNOWN`）。Meter = **CORROBORATING ONLY**，結構上不進入判定 |
+
+observe duration / sample interval 是 **trial 參數**（建議 ≈600 s / 20 s），
+由 `BaselineConfig` **必填**傳入，**不得**預設、**不得**寫進任何 production 模組。
+
+**ABORT RULE**：baseline 未成立 → ABORT、**不送 pause**、**不需 restore**
+（`pause_attempt_count == 0`，責任未成立）。
+
+**LOOP HALT（G4）**
+
+```
+marks stopped  = NORMAL CONTROL LOOP HALTED
+marks stopped != STOP CONVERGENCE COMPLETE
+marks stopped != PAUSE PASS
+```
+
+**唯一**的鑑別結論函式：
+
+```python
+discriminative_pause_verified(normal_loop_halted, pause_verifier_state)
+    -> normal_loop_halted is True AND pause_verifier_state == PV_VERIFIED
+```
+
+**ONE ATTEMPT（G5）**：`OneAttemptGuard` 已版控化，`pause` / `restore`
+各硬上限 1 次，超額**拋 `OneAttemptExceeded`**（不是回 False）。
+即使 `SEND_UNKNOWN` 也**禁止**自動 resend。
+
+**Evidence artifact（G7）**：schema v1、37 欄位，必備 9 項 ——
+`pause_transitional_control_effect` / `normal_loop_halted` / `pause_verified` /
+`restore_resumed` / `active_baseline_established` / `pause_attempt_count` /
+`restore_attempt_count` / `pause_send_outcome` / `restore_send_outcome`。
+`validate_artifact()` 會擋下計數超額、鑑別結論與證據不一致、
+以及把 pause 寫成 `immediate command silence` 的用語錯誤。
+
+**BASELINE WINDOW POLICY（2026-09-18 裁示）**
+
+```
+BASELINE_WINDOW_POLICY = "MAX_OBSERVATION_WINDOW"
+BASELINE_EARLY_SUCCESS_ALLOWED = True
+```
+`observe_duration_sec` 是 **MAX OBSERVATION WINDOW**，**不是** MANDATORY DWELL TIME。
+Active Gate 在窗口內成立即可 EARLY SUCCESS 並立即保存 terminal active evidence ——
+因為 Trial #2 要證明的是「pause 當下 external 確實 active」，時間鄰接性優先。
+🔴 **此為 FUTURE POLICY，不回溯**抹除 2026-09-18 Trial #2 的
+EXECUTION PROCEDURE DEVIATION（見 [§11](#11-current-blockers)）。
+
+**計數語意（2026-09-18 閉合）**
+
+| 欄位 | 意義 |
+|---|---|
+| `baseline_sample_count` / `sample_count` | 餵進 observer 的 baseline 樣本數，**不含** runner step 1 的 safety-preflight 取樣 |
+| `observing_sample_count` | 成立前的觀測筆數（＝ baseline − 1） |
+| `terminal_active_sample_index` | Active Gate 成立那筆的 **1-based** baseline 索引；未成立為 `None` |
+| `counts_exclude_preflight_sample` | 恆為 `True` |
+
+> 執行腳本若把 preflight 取樣一起編號，其日誌序號會比 artifact 大 1 ——
+> 那是**執行腳本的日誌編號**，**不是** artifact off-by-one。
+
+**SOURCE-SIDE FRESHNESS（evidence layer only）**
+
+```
+source_freshness(raw_source_time, observed_at, max_age_sec)
+    -> SOURCE_FRESH / SOURCE_STALE / SOURCE_TIME_UNAVAILABLE / SOURCE_TIME_MALFORMED
+    age_sec = local observation time − device raw_source_time
+```
+🔴 `EssSnapshotAdapter` 的 `age_sec` / `stale` 由**讀取開始時刻**推算，衡量的是
+**HTTP 往返延遲**，**不代表設備端資料新鮮度** —— 兩者不得互相冒充（由 F5 測試鎖住）。
+🔴 取不到 → `SOURCE_TIME_UNAVAILABLE`；解析失敗 → `SOURCE_TIME_MALFORMED`。
+兩者 `source_age_sec` 皆為 `None`，**絕不造 timestamp**。
+artifact schema **v2** 起必備 `raw_source_time` / `source_time_available` /
+`source_age_sec` / `source_freshness_state`；**v1 歷史 artifact 維持可驗證**。
+
+> `PauseVerifier` / `RestoreVerifier` / SSH taxonomy / responsibility 生命週期 /
+> Phase 6 decision semantics / production arbiter / production safety policy
+> **一律沿用既有實作，未修改**。
+
+### 8.6 FIRST LIVE ↔ 6.10 Handoff 整合（2026-09-18 P3 裁示）
+
+FIRST LIVE 正式路徑改走 **Phase 6.10 HANDOFF PATH**。
+**不再**以 Phase 6.9「external 當下 idle 就直接執行」作為 field execution path。
+
+> **理由（Trial #2 實測）**：external 可能 `PCS=STANDBY` / `Authority=IDLE`
+> 但 normal loop marks 仍持續 advancing，之後自行轉入 `DISCHARGING`。
+> 「external 當下 idle」**不等於**「external 已 relinquish control」——
+> 6.9 原 Phase A 存在 **TOCTOU / ownership race**。
+
+```
+External Controller
+  → Fresh observation / safety preflight
+  → Phase 6.10 pause
+  → NORMAL LOOP HALTED + PauseVerifier VERIFIED
+  → external command silence established
+  → Phase 6 FIRST LIVE dispatcher
+  → 既有 5 kW charge-only live leg
+  → Phase 6 release
+  → Phase 6.10 restore
+  → RestoreVerifier RV_RESUMED
+  → post-check → COMPLETE
+```
+
+**兩種 ownership 嚴格分離**
+
+| | 由誰管 | 清除條件 |
+|---|---|---|
+| EXTERNAL CONTROLLER OWNERSHIP | 6.10 pause / restore responsibility | 只有 `RV_RESUMED` |
+| PHASE 6 CONTROL AUTHORITY | `Phase6AuthorityLease` | `release()`（一律在 `finally`） |
+
+🔴 禁止：external 尚未 verified pause 就 Phase 6 acquire / send。
+🔴 禁止：Phase 6 authority 尚未 release 就 restore external ——
+由 `LifecycleRecorder` 的事件序列證明（`release_before_restore`）。
+
+**Dispatcher 介面**
+
+```
+(observation) -> {"dispatched", "verified", "released", "outcome", "reason", ...}
+outcome ∈ DISPATCH_NOT_ATTEMPTED / DISPATCH_SUCCEEDED / DISPATCH_FAILED / DISPATCH_UNKNOWN
+```
+🔴 `DISPATCH_UNKNOWN` **不得**當成 verified；例外、未知終態一律 Fail Closed 成 UNKNOWN。
+🔴 dispatcher **不知道** CHARGE 怎麼送 —— `live_leg_runner` 由呼叫端注入
+（production 即既有 `SVC.run_live_leg_cli`）。**不建立第二套 charge execution logic。**
+
+**FIRST LIVE FIELD ENTRY POINT = PHASE 6.10 HANDOFF PATH ONLY**（RULING 1）
+
+| 模組 | 角色 | 直接 CLI |
+|---|---|---|
+| `phase6_first_live_runner.py` | INTERNAL LIVE LEG / DISPATCHER | 🔴 **BLOCKED**（exit 2） |
+| `pcs_auto_control_service.py --live-leg` | 既有 live-leg CLI | 🔴 **BLOCKED**（exit 2） |
+
+兩者的拒絕訊息一致：
+`FIRST LIVE direct execution disabled. Use Phase 6.10 handoff entry point.`
+
+🔴 **刻意不提供** `--force` / `--bypass-handoff` / 環境變數 / 任何隱藏 override。
+🔴 被限制的是 **FIELD ENTRY POINT**，**不是刪除 6.9 implementation** ——
+`live_leg_main()` / `run_live_leg_cli()` / `main()` 函式本體完全未動，
+整合層與離線測試仍可 import 後直接呼叫。
+
+**Command count（硬上限，超額拋 `CommandLimitExceeded`）**
+
+| 項目 | 上限 |
+|---|---|
+| `phase6_charge` | **≤ 1**（ONE CONTROLLED LEG ONLY） |
+| `phase6_discharge` | **0** |
+| `phase6_pcs_stop` | **≤ 1** —— 🔴 **包含** live-leg cleanup STOP |
+| `pause` / `restore` | **≤ 1** |
+
+🔴 **RULING 2**：既有 live leg 實際送出的 cleanup PCS STOP **必須**計入
+`phase6_pcs_stop` aggregate。**不得**因為它叫 `live_leg_internal_stop` 就排除於總數。
+`live_leg_internal_stop` 改為 **subtype / reason**（`pcs_stop_reason = LIVE_LEG_CLEANUP`），
+**不是豁免**。
+
+> 未來若 FIRST LIVE 送出一次 5 kW CHARGE 並由 live leg 送出一次 cleanup STOP，
+> artifact 必須如實記 **CHARGE = 1 / DISCHARGE = 0 / PCS STOP = 1**，
+> **不得**寫成 `PCS STOP = 0`。
+> ⚠️ 允許 `≤ 1` **不代表**可新增任何新的 STOP 路徑 —— 只認既有 6.9 live-leg
+> lifecycle 本來就存在的 cleanup STOP。本次僅為 **COUNTING / EVIDENCE SEMANTICS**
+> 修正，未動 STOP policy / timing / trigger / PCS control semantics。
+
+**兩個 ELIGIBILITY GATE（2026-09-18 P0 flow correction）**
+
+| Gate | 問的問題 | Authority 的角色 |
+|---|---|---|
+| **GATE A** `pre_handoff_policy_eligibility()`（9 項） | 「**如果** ownership 可以合法取得，目前正式策略是否應該執行 CHARGE？」 | 🔴 **完全不看** —— 由 AST 鎖住不引用 `authority` / `arbitration_outcome` / `authorized` / `CONTROL_AUTHORITY_BLOCKED` |
+| **GATE B** `post_handoff_revalidation()`（10 項） | 「pause 已 VERIFIED，用**新的** fresh 觀測重新確認策略是否仍成立？」 | 🔴 **必須** `authority == IDLE`（`external_relinquished`） |
+
+🔴 `Authority = EXTERNAL_OR_UNKNOWN` 在 external identity / runtime / handoff
+capability 正常時，代表 **HANDOFF REQUIRED**，**不是** FIRST LIVE POLICY INELIGIBLE。
+若在 GATE A 因 `CONTROL_AUTHORITY_BLOCKED` 就 abort，等於要求「Authority 必須先
+IDLE 才能進 handoff」——那正是舊 6.9 的 **TOCTOU** 問題，也讓 handoff 失去意義
+（handoff 的前提本來就是 external 目前持有控制權）。
+
+```
+HANDOFF_ALWAYS_REQUIRED = True    # 刻意沒有「跳過 handoff」的分支
+```
+`handoff_requirement()` 只輸出**為什麼仍需 handoff**的證據
+（`authority_external_or_unknown` / `external_loop_active` /
+`authority_idle_is_not_relinquish_proof`），**不**提供跳過選項。
+
+**GATE B 的位置**：在 `FirstLiveDispatcher.__call__()` 內、**`Phase6AuthorityLease.acquire()` 之前**。
+未通過 → 不 acquire、不送任何 Phase 6 command（counts 維持 `0 / 0 / 0`）、
+`dispatcher_outcome = DISPATCH_NOT_ATTEMPTED`，由 `HandoffRunner` 走 restore responsibility path，
+分類為 `ABORTED_POST_HANDOFF_REVALIDATION`。
+🔴 **不得**沿用 pause 前的 decision / SOC / TOU / PCS state 直接 dispatch；
+樣本未標記 `post_handoff_fresh` 一律 Fail Closed。
+
+**兩層 FIRST LIVE PRECHECK**
+
+| 層 | 內容 |
+|---|---|
+| **LAYER 1 SAFETY PREFLIGHT**（11 項） | comm / source / fault / critical / screen / process / identity / ownership≠BOTH / guard B2 / DRY_RUN baseline / armed=False baseline。🔴 **不得要求 external 本來 idle** |
+| **LAYER 2 HANDOFF READINESS**（4 項） | external runtime 可確認、loop evidence 可取得、pause capability、restore capability |
+
+**兩套 evidence（刻意不揉合）**
+
+| | 內容 |
+|---|---|
+| Durable Decision Audit（既有 46 欄，**未新增任何欄位**） | Phase 6 decision / control evidence |
+| `PHASE6_10_HANDOFF_EXECUTION_ARTIFACT` v1（34 欄） | ownership / handoff evidence：pause·restore attempt 與 outcome、`normal_loop_halted`、PauseVerifier / RestoreVerifier、responsibility lifecycle、Phase 6 authority acquired/released、dispatcher outcome、command counts、`release_before_restore`、final ownership、fault / critical、timestamps |
+
+`timeout_status` 恆記 `FIELD_VALIDATION_CANDIDATE 12.0 / final=False / n=2`；
+標成 FINAL 會被 `validate_handoff_artifact()` 擋下。
+`validate_handoff_artifact()` 另擋：`pcs_stop ≥ 1` 卻無 `pcs_stop_reason`、
+subtype 數量大於 aggregate（cleanup STOP 被排除）、`charge > 1`、`discharge > 0`、
+`pcs_stop > 1`。
+
+**FIRST LIVE outcome 語意（三者必須並存）**
+
+```
+handoff_outcome     = 交接生命週期是否安全收斂（external 已 restore）
+dispatcher_outcome  = FIRST LIVE 是否成功（只有 DISPATCH_SUCCEEDED 才算）
+live_leg_outcome    = 既有 leg 的終態與 dispatch / stop 次數
+```
+🔴 `handoff_outcome = COMPLETE` **不等於** FIRST LIVE CHARGE PASS ——
+避免把「restore 成功」誤寫成「charge 成功」。
+
+### 8.7 Scheduled FIRST LIVE（ONE-SHOT commissioning）
+
+```
+SCHEDULED_MODE      = ONE_SHOT_COMMISSIONING
+IS_UNATTENDED_LIVE  = False      IS_RECURRING = False
+AUTO_RETRY_ALLOWED  = False
+```
+
+🔴 **不是** Unattended LIVE、**不是** recurring schedule、**不是** auto retry。
+它是「使用者白天先授權一次，runner 在指定 field window 內自動做**一次** fresh
+eligibility 判斷」的 commissioning runner。
+
+**架構 —— 只是包在既有流程外層的 orchestration shell**
+
+```
+Scheduler / One-Shot Gate
+  → Fresh STEP 0 → Fresh Safety Preflight → GATE A
+  → 既有 Phase 6.10 Handoff（pause / PauseVerifier / GATE B /
+     Phase6AuthorityLease / FIRST LIVE Dispatcher / 既有 6.9 5 kW live leg /
+     cleanup STOP / release / restore / RestoreVerifier）
+  → post-check → artifact → SELF DISARM / EXIT
+```
+AST 鎖住：模組**未** import `decision_engine` / `decision_policy` / `safety_gate` /
+`pcs_control_executor` / `device_control_operator` / `pcs_auto_control_service` /
+`control_authority` / `tou_calendar` / `subprocess`，只相依
+`phase6_first_live_handoff`。**沒有第二套 control logic。**
+
+**Time window**
+
+| 情況 | 行為 |
+|---|---|
+| 早於 `window_start` | 只等待（可設 `max_wait_sec` 上限，超過即 `EXPIRED_NO_ATTEMPT`） |
+| 在窗內 | 進 Fresh Preflight，**只做一次** |
+| 晚於 `window_end` | `EXPIRED_NO_ATTEMPT`，0 commands |
+| 非授權日期 | `WRONG_TARGET_DATE` |
+
+🔴 窗內 GATE A 不成立 → `ABORTED_CURRENT_CONDITIONS`，**ONE-SHOT 結束**。
+**不**每 10 秒 retry、**不**等 decision 改變、**不**重跑第二次 preflight。
+
+**授權消耗**：任何結果（PASS / ABORT / FAIL / UNKNOWN / EXCEPTION / TIMEOUT /
+EXPIRED）都寫入 `CONSUMED`，同一 task 再啟動一律 `ALREADY_CONSUMED`。
+`target_date` / `window_start` / `window_end` / `timezone` / `attempt_id`
+**全部必填、由 one-shot config 注入**，production code **不得寫死**（AST 鎖住原始碼
+無 `Asia/Taipei` / `00:00` / `00:30` 字面值）。
+
+**Durable ledger（crash / restart safety）**
+
+```
+NOT_STARTED → PREFLIGHT → EXTERNAL_PAUSE_RESPONSIBILITY → PHASE6_AUTHORITY
+→ LIVE_LEG → PHASE6_RELEASED → RESTORE_PENDING → RESTORED → COMPLETE
+```
+append-only JSONL ＋ 每筆 `fsync`；**意圖先落盤再執行**。
+只要 `pause` 的 INTENT 落過盤，`restore_responsibility` 即成立（即使 OUTCOME
+因 crash 未寫入），且只有 `restore_verified = RV_RESUMED` 才解除。
+重啟後 `recover()` → `RECOVERY_PENDING_RESTORE` / `RECOVERY_ALREADY_CONSUMED` /
+`RECOVERY_CLEAN` / `RECOVERY_CRITICAL_MANUAL`；
+🔴 **一律 NO RESEND pause / charge / restore**，UNKNOWN → Fail Closed。
+半截的最後一行（crash 當下未寫完）會被忽略，且**不影響**前序狀態。
+
+**SELF DISARM**：結束時一律確認 `DISPATCH_ENABLED=False`、`armed=False`、
+production `pause`/`restore` timeout `= None`、`FIRST_LIVE_PREREQUISITE_SATISFIED=False`。
+
+**Result states（19 項）**：含使用者指定的 15 項，另加
+`NOT_ENABLED` / `ALREADY_CONSUMED` / `WRONG_TARGET_DATE` / `EXCEPTION_FAIL_CLOSED`。
+
+**Host runtime precondition**：`evaluate_host_runtime()` 為**純判定**，
+evidence 由呼叫端唯讀取得；任一未知即 Fail Closed，且**不修改任何電源設定**。
+
+**CLI launcher（`run_scheduled_first_live.py`）**
+
+```
+"<python.exe>" "<absolute launcher path>" --config "<absolute config path>"
+```
+| 面向 | 內容 |
+|---|---|
+| config 必填欄位 | `enabled` / `attempt_id` / `target_date` / `window_start` / `window_end` / `timezone` / `dependency_provider` |
+| 驗證 | 缺欄位・壞 JSON・非法 date/window/timezone → `CONFIG_INVALID`；`enabled` 非**明確 True** → `NOT_ENABLED`。**不猜預設、不自動補 enabled** |
+| 路徑 | 相對路徑一律以 **config 檔所在目錄**解析（**不看 cwd**）；支援含空白路徑 |
+| 互動 | **不呼叫 `input()`、不讀 stdin**；無 `--force` / `--bypass` 覆寫參數 |
+| 設備相依 | 由 **symbolic provider ID ＋ launcher allowlist** 解析；launcher 模組層**不 import** 任何 control / executor 模組 |
+
+**Provider allowlist**
+
+```python
+PROVIDER_ALLOWLIST = {"phase6_first_live_field": "phase6_first_live_field_provider"}
+```
+🔴 config 只能給 **symbolic ID**；任意 dotted module（`os` / `subprocess` / …）、
+檔案路徑、相對路徑一律 `CONFIG_INVALID`（exit 2）。
+**刻意不提供** `--provider-module` / `--force-provider` / filesystem import。
+
+**`--validate-only` = PASSIVE ONLY**
+
+只驗證 config schema / provider ID allowlist / module importability /
+provider interface shape / path resolution / static dependency declaration。
+🔴 **不連 HMI・Meter・SSH、不 probe、不建立 control transport、不 arm、
+不 pause / restore、不取得 authority、不送任何 command**，
+且**不建立** ledger / artifact；回報 `field_side_effects = 0`。
+
+`validate_provider_definition()`（純離線）與 `build_field_dependencies()`
+（只在 execution path）**嚴格分離** —— config parse / launcher import /
+`--help` / `--validate-only` 皆不產生任何 field side effect。
+
+**Exit code（穩定契約）**
+
+| code | 意義 |
+|---|---|
+| **0** | `HANDLED_TERMINAL_RESULT` —— runner 走完並產生可辨識終態（**不代表 PASS**；安全 ABORT / EXPIRED 也是 0） |
+| **2** | `CONFIG_OR_INVOCATION_INVALID` |
+| **3** | `REFUSED_ALREADY_CONSUMED_OR_NOT_ENABLED` |
+| **4** | `RECOVERY_REQUIRES_MANUAL_ATTENTION` |
+| **5** | `UNEXPECTED_LAUNCHER_FAILURE` |
+
+🔴 **不得**「只有 PASS 才 exit 0」—— 否則 Task Scheduler 會把安全 ABORT 誤判成 crash。
+
+### 8.8 Production / Candidate 參數
+
+| 項目 | 值 | 狀態 |
+|---|---|---|
+| SSH connect | 5 | **FINAL** |
+| `probe` | 5 | **FINAL** |
+| `status` | 12 | **FINAL** |
+| `loopcheck` | 26 | **FINAL** |
+| **`pause`** | **12** | **FIELD_VALIDATION_CANDIDATE / NOT FINAL**；production default = `None` |
+| **`restore`** | **12** | **FIELD_VALIDATION_CANDIDATE / NOT FINAL**；production default = `None` |
+| idle power band | −3 ~ +1 kW | FINAL |
+| pause settling | 120 s | FINAL |
+| stable verify | 4 samples / 15 s / 45 s | FINAL |
+| restore verify | 3 observations / 3 s / 6 s | FINAL |
+| `retry_backoff_sec` / `service_health_timeout_sec` | 5 / 300 | FINAL |
+
+> `pause` / `restore` 恆列於 `missing()` 與 `not_field_verified()`。
+> Trial #1 實測 pause 2.068 s / restore 0.610 s，但 **n = 1，不足以升格 FINAL**。
+
+---
+
+## 9. CURRENT STATUS
+
+> **本節是 README 唯一的 Current Status Authority。**
+
+| Item | Current Status |
+|---|---|
+| Phase 1 ~ Phase 5 | **COMPLETE** |
+| Phase 6 | **OFFLINE COMPLETE / LIVE HOLD** |
+| Phase 6 Offline Application Layer | **COMPLETE / FROZEN** |
+| Phase 6 Regression | **4972 / 4972 PASS ／ 51 files ／ 0 FAIL** |
+| Phase 6.10 Offline | **COMPLETE / FROZEN** |
+| Recovery Evidence Contract | **FIXED / VERIFIED** |
+| Deployed STOP Semantics | **CONFIRMED**（2026-09-17，`sha256 964bb642…76ce` / 789 行） |
+| Q1 ~ Q4 | **CLOSED** —— Q4 = `ZERO-UNTIL-STOP-CONFIRMED → THEN NO COMMAND` |
+| Trial #2 Harness | **IMPLEMENTED / OFFLINE VERIFIED**（184 / 184） |
+| `request_restore` one-attempt 對稱保護 | **FIXED / VERIFIED**（P2） |
+| **Trial #2 Handoff Technical Result** | **PASS**（2026-09-18 08:54:25 ~ 09:02:27） |
+| **DISCRIMINATIVE_PAUSE_VERIFIED** | **TRUE** —— `normal_loop_halted` ∧ `PauseVerifier = VERIFIED` |
+| **Trial #2 Field Validation Closure** | **CLOSED WITH DOCUMENTED PROCEDURE DEVIATION**（2026-09-18 裁示） |
+| Documented Procedure Deviation | `EXECUTION PROCEDURE DEVIATION = BASELINE EARLY-ACTIVE TERMINATION` —— 見 [§13](#13-known-limitations--deferred) |
+| Historical Evidence Limitation | `SOURCE-SIDE TIMESTAMP UNAVAILABLE`／`SOC 2 % → 98 % ROOT CAUSE NOT DETERMINABLE` |
+| **FIRST LIVE FIELD ENTRY POINT** | **PHASE 6.10 HANDOFF PATH ONLY**（P3 ＋ RULING 1） |
+| `phase6_first_live_runner.py` | ROLE = **INTERNAL LIVE LEG / DISPATCHER**；DIRECT FIELD EXECUTION = **BLOCKED** |
+| `pcs_auto_control_service.py --live-leg` | CLI field entry = **BLOCKED** |
+| Phase 6 PCS STOP 計數 | **包含** live-leg cleanup STOP（RULING 2） |
+| **FIRST LIVE Integration** | **OFFLINE VALIDATION COMPLETE**（171 / 171） |
+| **FIRST LIVE EXECUTION READINESS** | **READY FOR AUTHORIZATION**（≠ FIELD AUTHORIZED、≠ EXECUTED） |
+| **FIRST LIVE Integration** | **OFFLINE COMPLETE** |
+| **FIRST LIVE Attempt #1**（2026-09-18） | **ABORTED_CURRENT_CONDITIONS** —— EXPECTED FAIL-CLOSED SAFETY ABORT，**不是** FAIL／CODE DEFECT／HANDOFF FAILURE |
+| **FIRST LIVE Attempt #2**（2026-09-22） | **ABORTED_CURRENT_CONDITIONS** —— 終端結果不變，但 ROOT CAUSE = **PROVIDER_WIRING_DEFECT**（見下） |
+| **Attempt #2 ROOT CAUSE** | **SAFE FAIL-CLOSED ABORT CAUSED BY PROVIDER WIRING DEFECT** —— **不是** 現場條件不符、**不是** policy 正常否決 |
+| **Attempt #2 SOC 事後判定** | **SOC_ELIGIBLE_THROUGHOUT_GATE_WINDOW** —— 窗內 SOC 2 % → 6 %，任何時點都在可充電區間 |
+| **BUG #1 canonical SOC band 斷線** | **CONFIRMED / FIXED**（2026-09-22，offline） |
+| **BUG #2 classifier warm-up omission** | **CONFIRMED / FIXED**（2026-09-22，offline） |
+| **HMI 401 session renewal（provider 路徑）** | **HMI_AUTH_RENEWAL_UNVERIFIED** —— provider / scheduled 路徑**沒有** re-login／token refresh；唯一既有實作在 6.9 `observe_window`（≤ 2 次） |
+| **FIRST LIVE SUCCESSFUL FIELD LEG** | **NOT YET COMPLETED** |
+| **FIRST LIVE Attempt #3** | **NOT AUTHORIZED**（本輪僅離線修正，未建立任何 Attempt #3 Task） |
+| GATE A / GATE B（pre/post-handoff） | **IMPLEMENTED / OFFLINE VERIFIED**（324 / 324） |
+| **FIRST LIVE ATTEMPT #2 READINESS** | **CONSUMED**（2026-09-22 已執行並 `ABORTED_CURRENT_CONDITIONS`） |
+| HMI auth renewal | **VERIFIED**（105 / 105）—— 抽出並重用既有 6.9 bounded re-auth，bound = 2 |
+| REAL_SOC_WIRING | **PASS**（2026-09-22 真實 HMI：SOC 90.0 → canonical `S_HIGH`） |
+| REAL_CLASSIFIER_PRIME | **PASS**（真實 meter：`UNKNOWN → NEAR_ZERO`，12.0 s／3 samples，bounded budget 內） |
+| **FIRST LIVE Attempt #3**（2026-09-23） | **ABORTED_PRE_PAUSE_PREFLIGHT** —— GATE A 首次 PASS，但 6.10 PRE_PAUSE_PREFLIGHT FAIL |
+| **Attempt #3 ROOT CAUSE** | **PROVIDER_WIRING_DEFECT**（handoff observation vocabulary ／ `soc_max_pct` wiring） |
+| **Attempt #3 原始 runner 分類** | `AUTHORITY_ACQUIRE_FAILED` —— **POSTMORTEM: MISCLASSIFIED TERMINAL RESULT**，不是真實 field root cause |
+| `external_behaviour_known` | **CONFIGURED / VERIFIED** —— canonical = `phase6_remote_adapter.external_liveness()` 三態；`RUNNING`／`NOT_RUNNING` → True，`UNKNOWN` → False |
+| **FIRST LIVE Attempt #4**（2026-09-24） | **ABORTED_AT_7_FIRST_LIVE** —— PRE_PAUSE 11/11、pause SENT、PauseVerifier PASS、GATE B PASS、restore PASS |
+| **Attempt #4 ROOT CAUSE** | **DISPATCH AUTHORIZATION GATE NOT SCOPED FOR FIRST LIVE** |
+| **Attempt #4 原始 runner 分類** | `ABORTED_POST_HANDOFF_REVALIDATION` —— **POSTMORTEM: MISCLASSIFIED**（GATE B 其實 PASS） |
+| **DISPATCH_ENABLED 安全不變式** | **AT REST = False**；僅在已授權 one-shot 的 authority-acquired live-leg scope 內 temporarily True；finally 無條件 False |
+| FULL LIVE-LEG READBACK | **VERIFIED** —— 離線完整驅動到 `LEG_COMPLETE`；成功終態分類缺口已修正 |
+| FIRST LIVE MOCK SUCCESS | **PASS**（CHARGE 5.0 kW ×1 / DISCHARGE 0 / readback VERIFY_SUCCESS） |
+| Scheduled live-leg authorization | **VERIFIED** —— 互動路徑用真人輸入、scheduled 路徑用 permit 產生的 structured authorization，**同一道 `confirm_live_leg` gate**；無 bypass、不依賴 stdin |
+| **FIRST LIVE Attempt #5**（2026-09-25） | **MISSED / NOT EXECUTED** —— ROOT CAUSE = **HOST POWERED OFF AT SCHEDULED TRIGGER** |
+| Attempt #5 執行證據 | ledger／artifact／launcher log **皆未建立** -> wrapper 未執行、runner 未啟動、`one_shot_runner_consumed = False` |
+| Attempt #5 Task | evidence 保存後 **Disabled**；trigger 已過期，**不得重新啟用或沿用** |
+| **新增正式前提** | `HOST_POWERED_ON_REQUIRED = True`（自 Attempt #6 起） |
+| **FIRST LIVE Attempt #6**（2026-09-30） | **EXCEPTION_FAIL_CLOSED** —— failure_stage = **DISPATCHER_CONSTRUCTION** |
+| **Attempt #6 ROOT CAUSE** | **DISPATCHER FACTORY SIGNATURE / PROVIDER WIRING DEFECT** |
+| Attempt #6 執行階段 | Fresh Safety **PASS**／GATE A **PASS**／Handoff readiness **PASS**；`build_first_live_dispatcher()` 拋 `TypeError` |
+| Attempt #6 Task | evidence 保存後 **Disabled** |
+| **PRODUCTION PROVIDER CONSTRUCTION** | **VERIFIED**（57 / 57）—— 走真正的 `build_field_dependencies()` ＋ fake 依賴，0 field I/O |
+| **validate-only 覆蓋範圍正式界定** | 只證明 static／structural；**不能**證明 production dependency graph 建得起來 |
+| **FIRST LIVE Attempt #7**（2026-10-01） | **PAUSE_FAILED** —— ROOT CAUSE = **CROSS-ATTEMPT HANDOFF JOURNAL STATE LEAK** |
+| Attempt #7 執行階段 | Fresh Safety **PASS**／GATE A **PASS**／Handoff readiness **PASS**／**PRE_PAUSE 11-11 PASS**；2_PAUSE 被 OnceGuard 擋下 |
+| Attempt #7 實際送出 | pause `NOT_SENT`；**SSH pause verb = 0**；restore／authority／CHARGE 全 0 |
+| Attempt #7 Task | evidence 保存後 **Disabled** |
+| **HANDOFF JOURNAL SCOPE** | **ATTEMPT_SCOPED** —— `handoff_journal_<attempt_id>.jsonl`，path 由 attempt_id 決定性導出 |
+| LEGACY SHARED JOURNAL | `handoff_journal.jsonl` **保留 immutable**（含 Attempt #4 證據），不再寫入 |
+| **FIRST LIVE ATTEMPT #8** | **COMPLETED / CONSUMED / CLOSED** —— RESULT = `ABORTED_FIRST_LIVE`，SAFE FAIL-CLOSED |
+| Attempt #8 root cause | **ENTRY-POINT / CONTROL-FLOW ORDERING GAP** —— step 7 的前置閘要求完整 permit（含 authority），但 authority 只能在 dispatcher 內取得 -> CONTROL-FLOW CYCLE |
+| Attempt #8 修正 | **TWO-STAGE AUTHORIZATION**：STAGE A entry gate（14 項，不含 authority）／STAGE B full permit（16 項，未降低 safety） |
+| **FIRST LIVE ATTEMPT #9** | **COMPLETED / CONSUMED / CLOSED** —— historical `attempt_result = DISPATCH_UNKNOWN`；postmortem 語意更正為 **dispatch 確定成功、abort 原因為 UNCERTAIN OWNERSHIP AFTER DISPATCH** |
+| 🔴 **Phase 6 首次真實 5 kW CHARGE** | `activePowerSetPoint = -5`／http 200 operation successful／readback `VERIFY_SUCCESS`／observed_state `CHARGING` —— Phase 6 real cumulative CHARGE 由 0 變 **1** |
+| Attempt #9 root cause | **POST-DISPATCH AUTHORITY BECAME UNKNOWN** —— `LEG_OWNED` 之後重新觀測得 `authority=UNKNOWN`，依既有契約中止且**不自動 STOP** |
+| Attempt #9 safety | **SAFE HANDOFF RECOVERED WITH UNRESOLVED PHASE6 LIVE LEG**（不是單純的 SAFE FAIL-CLOSED） |
+| 🔴 Attempt #9 evidence gap | authority UNKNOWN 的 **root subreason = NOT RECORDED / UNRESOLVED** —— 歷史 artifact 未保存 `AuthorityResult.reason`，**不得猜測、不得回填、不得改寫歷史** |
+| **FIRST LIVE ATTEMPT #10** | **NOT AUTHORIZED** |
+| FIRST LIVE Attempt #9 Task | `Phase6_Scheduled_FirstLive_Attempt9_20261006` = **Disabled**／NextRun N/A（2026-10-06 結案後停用；**未** Unregister，`LastRunTime` / `LastTaskResult` 未回寫） |
+| Phase6 Task 全盤狀態 | **10 個 Task 全部 Disabled**，NextRunTime 全 N/A，future executable project Task = **0** |
+| **FIRST LIVE ATTEMPT #10** | **HOLD —— PRE-FIELD FAIL**（2026-10-06）：STEP 6 shadow rehearsal ＋ STEP 8 external baseline 皆 FAIL |
+| Attempt #10 blocker | ① **HMI `ConnectTimeout`**（192.168.128.110:8080，provider 建構即 Fail Closed）② **`auto_control.py` 未運行**（`EXTERNAL_NOT_RUNNING`，三天內第二次） |
+| Attempt #10 Task | **NOT CREATED**（從未註冊；ledger／journal／artifact 亦皆無） |
+| Attempt #10 config / wrapper / XML | 已建立但**未武裝**；`enabled=true`、`target_date=2026-10-07`。2026-10-07 00:31 之後任何誤觸一律 `WRONG_DATE` -> 0 command |
+| FIRST LIVE Attempt #9 ID | `FIRST-LIVE-ATTEMPT9-20261006`（全新 config／per-attempt handoff journal／ledger／artifact／wrapper／Task XML／baseline evidence） |
+| Attempt #9 PRE-FIELD 八步 | **全部 PASS**（2026-10-05 fresh）：regression 7022／rehearsal I／construction 60-60／entry-point 92-92／deadline 133-133／host／external baseline／legacy scan |
+| Attempt #9 production parameters | 🔴 **不得**自行推定日期、不得沿用 Attempt #8、不得自行填 00:05–00:30、不得依當前日期產生 —— 必須由使用者明確指定 |
+| **EXECUTION DEADLINE 契約** | `window_end` = **NO-NEW-RISK-ACTION DEADLINE**，**不是** process termination deadline。到期後禁止**開始** PAUSE／authority acquire／CHARGE／DISCHARGE／第二條 live leg；但 cleanup STOP／release／restore／RestoreVerifier **必須允許完成** |
+| canonical deadline | `test/phase6_execution_deadline.py`（`ExecutionDeadline`）—— 9 個 production checkpoint；wall clock 建立、**monotonic** 推進；其他 module **不得**自行解析 `target_date` / `window_end` |
+| deadline terminal results | `DEADLINE_BEFORE_FIELD_ACTION`／`DEADLINE_DURING_HANDOFF`／`DEADLINE_DURING_LIVE_CLEANUP` —— 三者皆為 **HANDLED_TERMINAL_RESULT**（exit 0） |
+| **attempt_result vs live_leg_result** | **兩個不同維度，不得互相覆蓋**。`attempt_result` = 排程／deadline／handoff／safety contract 結果；`live_leg_result` = 實際 PCS 5 kW control leg 結果 |
+| successful real 5 kW leg 計數 | 依 **`live_leg_result == SUCCESS`** 計數（CHARGE 送出 ＋ readback `VERIFY_SUCCESS` ＋ `LEG_COMPLETE`），**不看** `attempt_result`。即使 `attempt_result = DEADLINE_DURING_LIVE_CLEANUP`，真實成功的 leg 仍計 +1 |
+| ATTEMPT RESULT PRECEDENCE | P0 safety-uncertain ＞ P1 control failure ＞ **P2 deadline** ＞ P3 pause NOT_SENT ＞ P4 real terminal step ＞ P5 derived ＞ P6 PASS —— **deadline 不得掩蓋 SEND_UNKNOWN／restore responsibility／未完成 cleanup／實際 control failure** |
+| `ExecutionTimeLimit=PT1H` | **LAST-RESORT OS PROCESS LIMIT** —— ≠ 正常 FIRST LIVE 執行預算、≠ `window_end`、≠ safe cleanup 機制。正常流程**不得**依賴 `AllowHardTerminate` 完成安全收尾 |
+| FIRST LIVE Attempt #8 Task | `Phase6_Scheduled_FirstLive_Attempt8_20261002` = **Disabled**／NextRun N/A（2026-10-02 結案後停用；**未** Unregister，Task XML 與全部證據保留） |
+| Phase6 Task 全盤狀態 | 9 個 Task **全部 Disabled**，NextRunTime 全 N/A，future executable Task = **0** |
+| FIRST LIVE Attempt #8 ID | `FIRST-LIVE-ATTEMPT8-20261002`（全新 config／per-attempt handoff journal／ledger／artifact／wrapper／Task XML） |
+| Attempt #8 PRE-FIELD 六步 | 全部 PASS（regression 6797／rehearsal G／smoke 60-60／host／external baseline／legacy scan） —— 但六步**不含** entry-point ordering，因此未攔下本次缺陷 |
+| **FIRST LIVE ATTEMPT #7** | **COMPLETED / CONSUMED / CLOSED** —— one-shot 授權已用盡；COMPLETED 指「排程 Attempt 跑完並結案」，**不代表** FIRST LIVE 目標達成 |
+| Attempt #8 執行期產物 | ledger／**handoff journal**／artifact dir／launcher log **皆尚未建立**（由 runtime 於 trigger 後首次寫入時建立） |
+| **OFFLINE vs PRODUCTION COVERAGE GAP 分類** | #6 = **PRODUCTION CONSTRUCTION PATH COVERAGE GAP**；#7 = **PERSISTENT / SHARED-STATE REALISM GAP**；#8 = **ENTRY-POINT / CONTROL-FLOW ORDERING GAP** —— **三者不是同一類 root cause** |
+| **PRODUCTION ENTRY-POINT SMOKE** | `test_phase6_entry_point_ordering.py`（92 項）—— 新列為 **mandatory**；唯一進入點 `arm_and_run_handoff()`，禁止直接 `disp()` 或直接建構 `FirstLiveDispatcher` |
+| **CONSTRUCTION_SMOKE_COMMAND** | `cd /d "D:\Crawler Sample"` ＋ `python test/test_phase6_provider_construction.py`（exit 0、57 / 57、0 field I/O） |
+| **HOST_POWERED_ON_REQUIRED** | **True** —— fresh verify 只代表建立 Task 當下成立；trigger 前仍須人工保持主機開機＋Water 登入（可 Win+L；禁關機／重開／登出／切換／睡眠／休眠） |
+| **PRE-FIELD 九步前置** | ① Full Phase 6 regression → ② validate-only rehearsal → ③ **construction smoke** → ④ **entry-point / control-flow smoke** → ⑤ **execution-deadline / safe-cleanup smoke** → ⑥ **production read-only shadow rehearsal**（**0 control side effect**） → ⑦ fresh host verify → ⑧ fresh external baseline → ⑨ fresh legacy Task scan；**九步全 PASS 才可建立 field Task**。③／④／⑤／⑥ 責任不同，**不得混稱** |
+| SHADOW PASS 語意 | 只證明「到 PAUSE 之前的 production 路徑可用」，**不得**描述成 real field PASS |
+| **FIRST LIVE successful real 5 kW leg** | **NOT YET COMPLETED —— 0 次** |
+| Attempt #1 ~ #4 分類更正 | 舊 `classify_dispatch_outcome` 對「已達 LEG_COMPLETE 後 teardown 回 OBSERVE_ONLY」存在**錯誤分類風險**；但 #1~#4 **實際都沒有完成 5 kW live leg**，**不得**回頭改判為成功 |
+| FIRST LIVE Attempt #4 Task | `Phase6_Scheduled_FirstLive_Attempt4_20260924`，Trigger 2026-09-24 00:05，One Time Only，**未手動 /Run** |
+| FIRST LIVE Attempt #4 ID | `FIRST-LIVE-ATTEMPT4-20260924`（全新 ledger／artifact，未沿用 #2／#3／rehearsal） |
+| FIRST LIVE Attempt #3 Task | `Phase6_Scheduled_FirstLive_Attempt3_20260923`，Trigger 2026-09-23 00:05，One Time Only，**未手動 /Run** |
+| FIRST LIVE Attempt #3 ID | `FIRST-LIVE-ATTEMPT3-20260923`（全新 ledger／artifact 路徑，未沿用 #2 或 rehearsal） |
+| SOC 90% → 2% 差異 | **EXPLAINED BY NORMAL CHARGE / DISCHARGE CYCLE**；`SOC_SOURCE_MISMATCH = NOT INDICATED`；**不是** Attempt #3 blocker |
+| **SCHEDULED FIRST LIVE ONE-SHOT** | **OFFLINE IMPLEMENTATION / VALIDATION**（core 133 / 133 ＋ launcher 132 / 132）—— **不是** Unattended LIVE、**不是** recurring、**不是** auto retry |
+| CLI launcher | **IMPLEMENTED / OFFLINE VERIFIED**（134 / 134） |
+| **Official field provider** | **IMPLEMENTED / OFFLINE VERIFIED**（294 / 294）—— scratchpad 相依已移除；2026-09-22 wiring defect 已修正 |
+| **HOST RUNTIME READINESS** | **PASS**（2026-09-21 唯讀確認：AC Sleep = Never、AC Hibernate = Never、CBS/WU pending reboot = False） |
+| **SCHEDULED FIRST LIVE READINESS** | **READY FOR FIELD SCHEDULING**（≠ Task 已建立、≠ Field 已授權、≠ 已執行） |
+| Unattended LIVE（6.10-C） | **HOLD** |
+| Field Precondition | **POWERED ON / AVAILABLE** |
+| Fresh STEP 2 Read-Only Precheck | **COMPLETE**（2026-09-17，20 / 20） |
+| B2 Field Validation Trial #1 | **PARTIAL PASS**（2026-09-17） |
+| Phase 6.10 Field Work | **IN VALIDATION / NOT COMPLETE** |
+| Phase 6.10-B1.7 Network Identity | **ACCEPTED FOR CURRENT DEPLOYMENT**（**不是** PASS） |
+| Phase 6.10-C LIVE | **NOT STARTED** |
+| Trial #2 | **HOLD** |
+| FIRST LIVE | **HOLD** |
+
+---
+
+## 10. CURRENT SAFETY / COMMAND COUNTS
+
+| 項目 | 值 |
+|---|---|
+| `DISPATCH_ENABLED` | **False** |
+| `MODE` | **DRY_RUN** |
+| RemoteSenders armed | **False** |
+| `DEPLOYED_GUARD_VARIANT` | **B2** |
+| `NETWORK_IDENTITY_STABILITY` | ACCEPTED / USER CONFIRMED |
+| DHCP Reservation | NOT VERIFIED / NON-BLOCKING BY USER DECISION |
+
+**Field command counts（累計）**
+
+| 指令 | 次數 |
+|---|---|
+| Phase 6 real CHARGE / DISCHARGE / PCS STOP | **0 / 0 / 0** |
+| External B2 `pause` / `restore` | **3 / 3**（Trial #1 各 1、Trial #2 各 1、Attempt #4 各 1） |
+
+---
+
+## 11. CURRENT BLOCKERS
+
+> 只列**目前仍未解決**的項目。已修復者見 [§9](#9-current-status)。
+
+1. **`pause` / `restore` timeout = FIELD_VALIDATION_CANDIDATE 12.0 / NOT FINAL**
+   n = 2 field samples —— Trial #1（pause 2.068 s / restore 0.610 s）、
+   Trial #2（pause 0.573 s / restore 0.573 s）。
+   production default 維持 `None`；**未**升格 FINAL。
+
+2. **Trial #2 為單次觀測（n = 1 discriminative run）**
+   pause 恰好落在 external `DISCHARGING` 轉態邊緣，
+   無法區分「pause 造成停止」與「external 自行結束放電」的**時間重疊部分**；
+   鑑別力來自 `loop marks 停止` 而非功率變化本身。
+
+3. **FIRST LIVE = HOLD**
+   整合已離線驗證（`READY FOR AUTHORIZATION`），但**未獲 field execution 授權**。
+
+4. **Scheduled FIRST LIVE 需要的現場 baseline 尚未重建**
+   `auto_control.py` 目前為 **MANUALLY STOPPED BY OPERATOR**（使用者 2026-09-21 說明）。
+   執行前需由現場以正常方式重新啟動並輸入 `start`，再 fresh verify
+   `screen alive` / `process alive` / `process identity OK` / `loop marks advancing`，
+   並讓 controller **依真實 OFF_PEAK 自然進入 CHARGE**
+   —— 🔴 **不得**人工啟動 PCS CHARGE 作為 baseline。
+
+5. **Phase 6.10-C LIVE = NOT STARTED**
+   無人值守正式部署尚未開始。
+
+> Trial #2 **不再列為 blocker** —— 已 `CLOSED WITH DOCUMENTED PROCEDURE DEVIATION`。
+> `SOURCE-SIDE TIMESTAMP UNAVAILABLE` **不是** FIRST LIVE blocker：
+> 它是現有端點的證據限制，**不是** handoff failure，列於
+> [§13 KNOWN FIELD EVIDENCE LIMITATION](#13-known-limitations--deferred)。
+
+> 🔴 **`pause` 用語規範**：**不得**寫成 `immediate command silence`。
+> 正確描述為 **`ZERO-UNTIL-STOP-CONFIRMED → THEN COMMAND SILENCE`** ——
+> 收斂期間會重複送出 0 kW setpoint（真實 external-controller command effect）。
+> 完整 deployed evidence 見
+> [`../docs/Phase6_10_Field_Validation.md`](../docs/Phase6_10_Field_Validation.md)。
+
+---
+
+## 12. NEXT STEP
+
+1. ~~取得 deployed source、閉合 Q1~Q4~~ —— **COMPLETE（2026-09-17）**
+   ~~Trial #2 field execution~~ —— **PASS（2026-09-18）**
+2. ~~Trial #2 harness 實作與離線驗證~~ —— **COMPLETE**
+   `phase6_trial2_harness.py` ＋ `test_phase6_trial2_harness.py`（184 / 184）。
+   執行順序與 evidence 設計見
+   [`../docs/Phase6_10_Field_Validation.md`](../docs/Phase6_10_Field_Validation.md)。
+3. 🔴 **Attempt #2 已於 2026-09-22 執行並 `ABORTED_CURRENT_CONDITIONS`。**
+   事後判定 ROOT CAUSE = **PROVIDER_WIRING_DEFECT**（provider 取不到 canonical
+   SOC band、且未依既有 classifier contract 暖機），**不是**現場條件不符。
+   兩個缺陷已於同日離線修正並加測（294 / 294）。
+   **Attempt #3 = NOT AUTHORIZED**，需使用者重新明確授權。
+4. **FIRST LIVE Attempt #3** —— 只在新的 fresh observation 顯示
+   **formal natural decision = CHARGE**，且 TOU / SOC / Safety Gate /
+   Authority / communication / fault / alarm 全部符合既有正式 policy 時
+   才有執行意義。🔴 **不自動 retry、不 polling 後自行送出、不建立 scheduled auto retry**；
+   必須由使用者重新明確授權**單次** Controlled Field Attempt，
+   且一律從 STEP 0 / Fresh Preflight 重新開始，**不得沿用**本次的
+   preflight / decision / Authority / loop evidence。
+
+> 🔒 **SCOPE FREEZE（2026-09-18 起）**：下一次 FIRST LIVE 之前，只處理會阻止
+> FIRST LIVE 的 **P0 safety issue / ownership race / restore responsibility issue /
+> command resend issue / false evidence issue**。
+> DEFER：README 美化、架構重構、dead path cleanup、timeout 最佳化、
+> 額外 audit 欄位、新功能、非 blocker refactor。
+4. 即使 Trial #2 PASS，**也不自動進 FIRST LIVE**。
+5. FIRST LIVE 需另行裁示；其後才是 Phase 6.10-C LIVE 部署。
+
+> **任何 Field 階段都需要新的明確授權。**
+
+---
+
+## 13. KNOWN LIMITATIONS / DEFERRED
+
+| 項目 | 狀態 |
+|---|---|
+| `min_switch_interval_sec` | **DEFERRED**（Layer 2 未啟用；Layer 1 已無條件生效） |
+| `meter_stale_grace_sec` | **DEFERRED**（採最保守解釋） |
+| `REAL_REPLAY_FIXTURE` | **DEFERRED**（未讀任何現場 CSV / JSON / JSONL） |
+| `ROTATION_POLICY` | **DEFERRED**（audit 檔約 4 MB/天，需自行留意磁碟） |
+| `RETENTION_POLICY` | **DEFERRED** |
+| Process Lifecycle Enum | **NOT CURRENTLY REQUIRED** |
+| `ObserveRecord.meter_state` | 恆為 `None`（來源／schema 不一致）；**status / diagnostic only**，對 Decision / Authority / Safety / Audit **無影響** |
+| Audit final failed-write | crash 前最後一次寫入失敗，跨 restart **不保證**留下 durable seq gap（無 sidecar watermark） |
+| LIVE audit-before-control PRE/POST protocol | **NOT IMPLEMENTED / NOT REQUIRED** |
+| `Orchestrator.verify_restore()` 依賴 `running` | **NON-BLOCKING DEAD-PATH**（正式 `HandoffRunner` 走 `RestoreVerifier`，不經此路徑） |
+| External deployed STOP semantics | **CONFIRMED / CLOSED**（2026-09-17）；`pause` = `ZERO-UNTIL-STOP-CONFIRMED → THEN COMMAND SILENCE`，收斂期間會重複送 0 kW |
+| **DOCUMENTED PROCEDURE DEVIATION**（2026-09-18 Trial #2） | `EXECUTION PROCEDURE DEVIATION = BASELINE EARLY-ACTIVE TERMINATION`。授權文字要求**完整 600 sec**，實際約 **365 sec**；原因為現有 harness 在 `ACTIVE_BASELINE_ESTABLISHED` 後 early break。**不得回溯刪除，也不得改寫成「完全符合程序」。** 未來政策 `MAX_OBSERVATION_WINDOW` **不**回頭消除本次偏差 |
+| **KNOWN FIELD EVIDENCE LIMITATION** —— source-side timestamp | `EP_MAINCTL` 的 `createTime` / `collectTime` 實測皆為**空字串** → `SOURCE_TIME_UNAVAILABLE`。這是**設備資料來源本身的限制，不是 harness 漏存**。`SOURCE-SIDE FRESHNESS = NOT DETERMINABLE`。🔴 **不得**寫成 `SOURCE_COHERENCE_CONFIRMED` |
+| **HISTORICAL EVIDENCE LIMITATION** —— SOC 2 % → 98 % | 已知：相同 endpoint、相同 `rackSoc` mapping、無 device selector、相同 external controller process（pid 44728）。未知：14 小時期間 SOC 變化的實際原因。🔴 **不得推測** overnight charging 或任何其他原因，除非未來有直接 evidence |
+| Hard-coded credential risk | 於本機 controller 副本中觀察到。**SECURITY ISSUE / SEPARATE TRACK**，不在 Phase 6.10 scope；本專案文件不記錄任何 secret 內容 |
+
+---
+
+## 14. Regression
 
 | 範圍 | 基準 | 執行方式 |
 |---|---|---|
 | Phase 2~5 | **1802 / 1802 PASS**，0 FAIL / 0 SKIP | `python run_phase3_regression.py` |
-| Phase 6 | **4925 / 4925 PASS**，50 檔，0 FAIL | 逐檔執行 `test_phase6*.py` |
+| Phase 6 | **6797 / 6797 PASS**，**63 檔**，0 FAIL | 逐檔執行 `test_phase6*.py` |
+| Phase 6.10 dedicated | **1173 / 1173 PASS**，**11 檔**，0 FAIL | 逐檔執行 `test_phase6_610*.py` |
 
 主要 dedicated 基準：
 
@@ -492,1504 +1062,55 @@ Field command count：
 | `test_phase6_gap3_tariff_wiring.py` | 50 / 50 |
 | `test_phase6_gap12_service_scheduling.py` | 63 / 63 |
 | `test_phase6_gap4_durable_audit.py` | 90 / 90 |
+| `test_phase6_610d_recovery_contract.py` | 47 / 47 |
+| `test_phase6_trial2_harness.py` | 257 / 257 |
+| `test_phase6_first_live_handoff.py` | 327 / 327 |
+| `test_phase6_scheduled_first_live.py` | 133 / 133 |
+| `test_phase6_scheduled_launcher.py` | 134 / 134 |
+| `test_phase6_first_live_field_provider.py` | 294 / 294 |
+| `test_phase6_hmi_auth_renewal.py` | 105 / 105 |
+| `test_phase6_attempt3_postmortem.py` | 133 / 133 |
+| `test_phase6_attempt4_postmortem.py` | 108 / 108 |
+| `test_phase6_scheduled_live_leg_auth.py` | 106 / 106 |
+| `test_phase6_live_leg_readback.py` | 94 / 94 |
+| `test_phase6_provider_construction.py` | 60 / 60 |
+| `test_phase6_journal_scope.py` | 66 / 66 |
+| `test_phase6_69a_cli_entry.py` | 128 / 128 |
 
-> `run_phase3_regression.py` 只涵蓋 Phase 2~5，**不含 Phase 6**；
-> Phase 6 目前**沒有**專屬的 runner 入口，以逐檔執行為準。
->
-> ⚠️ **`run_all.py` 不是 regression 入口** —— 它是 dashboard scraper 總入口，
-> 會對 HMI 發出唯讀 GET 並寫入 `output/`。任何名稱不明的
-> `run_all.py` / `main.py` / `service.py` / `runner.py`，
-> 執行前必須先確認其 I/O side effects。
+> `run_phase3_regression.py` **不含** Phase 6；Phase 6 沒有專屬 runner 入口。
+> ⚠️ Windows 主控台預設 cp950，部分測試含 `−` / emoji 會 `UnicodeEncodeError`。
+> 逐檔執行前請設 `PYTHONIOENCODING=utf-8` —— 這是**輸出編碼**問題，
+> 不是測試失敗。
+> ⚠️ **`run_all.py` 不是 regression 入口**（見 [§5](#5-快速使用)）。
 
-## 11. 文件
+---
+
+## 15. 文件索引
 
 | 文件 | 內容 |
 |---|---|
-| [`../docs/Phase3_Closure_Report.md`](../docs/Phase3_Closure_Report.md) | Phase 3 自動生命週期收尾報告 |
-| [`../docs/Phase4.6_Closure_Report.md`](../docs/Phase4.6_Closure_Report.md) | Windows Service 包裝與 NSSM 驗證 |
-| [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md) | Phase 4 收尾：架構、Ownership、Recovery、已知限制 |
-| [`../docs/Phase5_Validation_Plan.md`](../docs/Phase5_Validation_Plan.md) | Phase 5 驗證計畫與驗收基準 |
-| [`../docs/Phase5_Closure_Report.md`](../docs/Phase5_Closure_Report.md) | Phase 5 收尾：Soak / Stress / 文件 / Release Validation |
 | [`../docs/Operations_Guide.md`](../docs/Operations_Guide.md) | **部署 / 維運手冊** |
 | [`../tools/README.md`](../tools/README.md) | NSSM 版本、授權、SHA-256；**Service action 權威來源** |
+| [`../docs/Phase3_Closure_Report.md`](../docs/Phase3_Closure_Report.md) | Phase 3 自動生命週期收尾 |
+| [`../docs/Phase4_Closure_Report.md`](../docs/Phase4_Closure_Report.md) | Phase 4 收尾：架構、Ownership、Recovery |
+| [`../docs/Phase4.6_Closure_Report.md`](../docs/Phase4.6_Closure_Report.md) | Windows Service 包裝與 NSSM 驗證 |
+| [`../docs/Phase5_Validation_Plan.md`](../docs/Phase5_Validation_Plan.md) | Phase 5 驗證計畫與驗收基準 |
+| [`../docs/Phase5_Closure_Report.md`](../docs/Phase5_Closure_Report.md) | Phase 5 收尾：Soak / Stress / Release |
+| [`../docs/Phase6_Historical_Development.md`](../docs/Phase6_Historical_Development.md) | **Phase 6 開發歷史**：D.x 各階段、TOU / 年度行事曆推導、參數 derivation、FIRST LIVE 歷史、架構決策 |
+| [`../docs/Phase6_10_Handoff_History.md`](../docs/Phase6_10_Handoff_History.md) | **Phase 6.10 開發歷史**：Core / A / A1 / B1 / B1.5 / B1.6 / B1.7 / B2 / C / C1~C4、舊 state 與舊 blocker |
+| [`../docs/Phase6_10_Field_Validation.md`](../docs/Phase6_10_Field_Validation.md) | **實機驗證紀錄**：Fresh STEP 2、Trial #1 完整證據、deployed source 調查、Q1–Q4、Trial #2 provisional design |
 
-> Phase 6 / Phase 6.10 目前**沒有**專屬 closure 文件；
-> 完整敘述保留在本檔 [Appendix](#appendix--historical-development-notes)、
-> 測試檔與 `output/` 下的實測紀錄。
+Field evidence 原始檔：`output/phase6_field_validation/`、`output/phase6_live_charge/`、
+`output/phase6_ssh_timing/`。
 
-## 12. 注意事項
+---
 
-- **`.env` 不可 commit**（已由 `.gitignore` 排除）。
-- **`tools/nssm.exe` 為 runtime dependency**，不可刪除／改名／搬移。
+## 16. 注意事項
+
+- **`.env` 不可 commit**（已由 `.gitignore` 排除）；文件內不得出現任何 secret。
+- **`tools\nssm.exe` 為 runtime dependency**，不可刪除／改名／搬移。
 - Service 運行時 **Dashboard 為 Observer**，不會寫入報告。
 - **不要同時啟動第二個 Monitor writer** —— Ownership 會擋下，但應避免。
 - **Phase 6 預設不允許實機控制**：`DISPATCH_ENABLED = False`、`MODE = DRY_RUN`。
 - 任一條件無法確認一律 **Fail Closed**；不確定不等於安全。
-- **Durable Decision Audit 目前無 rotation / retention**（皆 DEFERRED）：
-  `output/phase6_audit/decision_audit.jsonl` 會持續成長（約 4 MB/天），
-  需自行留意磁碟；它是稽核證據，**不是**控制狀態恢復來源。
-- 詳細歷史、實機證據與量測紀錄請看 `docs/`、`test/`、`output/`。
-
----
-
-## Appendix — Historical Development Notes
-
-> 以下為逐階段開發過程的原始紀錄，**內容未經刪改**，僅由主文搬移至此。
-> 這些是 field evidence 與設計論證的來源，目前沒有對應的獨立 docs 文件，
-> 因此保留全文。日常閱讀請看上方 §1~§12。
-
-<details>
-<summary><b>Phase 1~6 逐階段開發歷史（含 D.2~D.5 架構決議、6.5 blocker 推導、FIRST LIVE 逐秒紀錄、Source Authority / Annual Calendar / crash window 研究）</b></summary>
-
-#### 10. 開發階段
-
-| Phase | 內容 | 狀態 |
-|---|---|---|
-| Phase 1 | Report Framework | COMPLETE |
-| Phase 2 | Auto Start | COMPLETE |
-| Phase 3 | Auto Lifecycle | COMPLETE |
-| Phase 4 | Auto Monitor Service | COMPLETE |
-| Phase 5 | Production Ready | COMPLETE |
-| Phase 6 | Meter-based Auto Charge / Discharge | IN PROGRESS |
-
-**Phase 5 進度**
-
-| | 項目 | 狀態 |
-|---|---|---|
-| 5.1 | Production Validation Plan | COMPLETE |
-| 5.2 | Long-running Stability / Soak Test | COMPLETE |
-| 5.3 | Stress / Boundary Test | COMPLETE |
-| 5.4 | Production Documentation / Deployment | COMPLETE |
-| 5.5 | Release Validation | COMPLETE |
-
-5.2：原始 Soak 發現 OpenBLAS 一次性資源成本；限制 Windows Service
-`OPENBLAS_NUM_THREADS=1` 後，部署與 Fix Validation 均 PASS。
-
-5.3：Stress / Boundary Test 完成，#1～#12 全部 PASS；Phase 5.3-A 244/244、
-Full Regression 1802/1802，正式 Service / Ownership / output 全程維持隔離。
-
-5.4：Production Documentation / Deployment 文件化完成；新增
-[`../docs/Operations_Guide.md`](../docs/Operations_Guide.md)，涵蓋部署、設定、
-Service Health、Upgrade、Rollback、Troubleshooting 與 Security，文件 DoD 8/8 PASS。
-
-5.5：Release Validation 驗證性項目全數 PASS —— Full Regression 1802/1802、
-實機 Session evidence 3 份各 8/8、Service health 11/11、Security 無 Critical/High。
-收尾報告見 [`../docs/Phase5_Closure_Report.md`](../docs/Phase5_Closure_Report.md)。
-
-> **Phase 5 = COMPLETE 指的是 Validation 完成。**
-> tag / push / deployment package 屬**後續人工 Release 動作，尚未執行**。
-
-**Phase 6 進度**
-
-| | 項目 | 狀態 |
-|---|---|---|
-| 6.0 | Production Meter Verify（正式環境電表確認） | COMPLETE |
-| 6.1 | Meter Client（電表資料讀取） | COMPLETE |
-| 6.2 | Power Classification（功率狀態判斷） | COMPLETE |
-| 6.2b | TOU Calendar（尖峰／離峰時段判斷） | COMPLETE |
-| 6.3-A | Decision Engine Framework（決策骨架） | COMPLETE |
-| 6.3-B | Decision Policy（充放電策略規則） | COMPLETE |
-| 6.4 | Safety Gate（安全條件檢查） | COMPLETE |
-| 6.5 | PCS Control Integration（PCS 自動充放電控制） | **COMPLETE / LIVE AUTHORIZATION PENDING** |
-| 6.5-H | Control Authority / Command Arbitration（控制權判定） | IMPLEMENTED / OFFLINE VERIFIED |
-| 6.6 | Auto Report Integration（自動報告整合） | **COMPLETE / OFFLINE VERIFIED** |
-| 6.7 | Field Validation（實機驗證） | **COMPLETE / OBSERVE_ONLY FIELD VALIDATED** |
-| 6.8 | Regression & Closure（完整回歸與結案） | **COMPLETE / TECHNICALLY READY FOR EXPLICIT LIVE AUTHORIZATION** |
-| 6.9 | Controlled LIVE Enablement（受控單次上線） | **OFFLINE COMPLETE / FIRST LIVE ATTEMPTED-BLOCKED** |
-| 6.9-A | CLI Entry Wiring（上線入口接線） | **OFFLINE IMPLEMENTED / VERIFIED**（入口已接通，尚未執行任何實機 LIVE） |
-
-**Phase 6.5 Go-Live Blockers / Check Items**
-
-Phase 6.5 各子項雖已離線驗證，但下列項目未解除前**不得**標示 Production Go-Live Ready：
-
-| | 項目 | 狀態 |
-|---|---|---|
-| 1 | ReadBack timeout 合理 SOC 實機驗證 | **CLOSED** —— `timeout_sec` 已 **FINAL**，並於 D.5-A 依裁示寫入 production config |
-| 2 | Control Authority TTL | **CLOSED / FINAL**（D.5-C）—— 已依既有 freshness 契約推導並寫入；不需實機 |
-| 3 | Control Authority power tolerance | **CLOSED / FINAL（綁定 target 5 kW）**（D.5-C） —— 依 4 段穩態實測（誤差 ≤0.40 kW／≤8%，無 outlier）推導；改功率須重新評估 |
-| 4 | 最小切換間隔（時間互鎖） | **CLOSED FOR CURRENT GO-LIVE SCOPE / LAYER 2 DEFERRED** —— 無反轉間隔的實機依據，明確維持停用；方向安全由 Layer 1 保證 |
-| 5 | STOPPED → STANDBY 無獨立啟動路徑 | **CLOSED / NOT REQUIRED — DOCUMENTED BEHAVIOR** |
-| 6 | Field steady detector false-positive | **CLOSED**（Phase C.1） |
-| 7 | Direction-Reversal State Interlock | **IMPLEMENTED / OFFLINE VERIFIED**（Phase D.1） |
-| 8 | Production Orchestrator 尚未接通 | **WIRED / OBSERVE_ONLY**（D.5-B） —— 整條 production path 已接起並可跑完；控制出口刻意未建立，結構上不可能送出指令 |
-| — | Production 參數 | **ALL REQUIRED SATISFIED**（`dispatch_ready=True`）；`dispatch_enabled` 仍為 False，OBSERVE_ONLY 未改變 |
-| 10 | 同向目標功率變更的正式語意 | **OPEN** —— 現有回讀機制**結構上無法驗證**同向設定值更新；維持 Fail Closed |
-| 11 | 崩潰／重啟後的執行協調 | **CLOSED / DOCUMENTED FAIL-CLOSED** —— 四個崩潰視窗全部安全，不需新增持久化執行日誌 |
-| 9 | 年度離峰日清單尚未核准 | **CLOSED / OFFICIAL ANNUAL DATA PROVISIONED** —— 經人工驗收的兩個年度已升為 verified 並正式 provision（D.4-E.2）；驗收綁資料，資料一變即失效。⚠️ 關閉本項**不等於** Go-Live |
-| 13 | Authority 功率佐證的時機守則 | **CLOSED / OFFLINE IMPLEMENTED**（D.5-A） —— 「尚未取得指令後的新功率」不再誤判為功率衝突或外部控制 |
-| 12 | Production 時區契約 | **CLOSED** —— 已核准並完成接線（IANA 名稱，非固定時差；不含時區資訊的時間一律拒絕） |
-
-**方向反轉採兩層互鎖，兩層彼此獨立、不得合併為同一個檢查：**
-
-| 層 | 名稱 | 依據 | 狀態 |
-|---|---|---|---|
-| Layer 1 | Direction-Reversal **State** Interlock | fresh PCS 旗標 | **IMPLEMENTED / OFFLINE VERIFIED** |
-| Layer 2 | Minimum **Time** Interlock（`min_switch_interval_sec`） | 尚無反轉間隔的實機依據 | **DISABLED / PARAMETER NOT PROVISIONED**（刻意，非遺漏） |
-
-Layer 1 規則：運轉中不得直接送出相反方向的控制（`CHARGING` → discharge、
-`DISCHARGING` → charge 一律 BLOCK）。上層必須自行送出一個明確的 STOP leg，
-待 read-back 確認進入閒置狀態後，由**新的** decision cycle 重新決定方向。
-系統**不會**自動把一個控制請求展開成 STOP + 反向兩個指令。
-方向判定只採用當次的 fresh PCS 旗標，**不採用** LastControl 的動作紀錄
-（可能過期、跨 boot、或與外部控制不同步）。狀態無法確認時一律 Fail Closed。
-STOP 不受本互鎖限制；Safety Gate 對 STOP 的既有豁免亦維持不變。
-
-Layer 2 目前**沒有**正式依據可決定門檻，維持未設定。
-既有的排程間隔 / 去抖動 / 冷卻等常數屬監看層語意，**不得**挪用為切換間隔。
-PCS 方向反轉的最小間隔列為 **VENDOR DATA REQUIRED**；
-在取得正式設備規格前，不以實機做門檻的二分搜尋。
-
-**STOPPED 是 Phase 6 合法的閒置起始狀態。** 一般 CHARGE / DISCHARGE 指令本身即完成所需的
-啟動轉態（manualControl 的啟動語意內含於充放電指令），因此**不需要**獨立的 START / STANDBY 指令；
-Phase 6 下一次控制可由 STOPPED 直接開始。
-
-Production 參數狀態：`timeout_sec` / `poll_interval_sec` / `stability_samples` 皆為 **FINAL**；
-`authority_ttl_sec` / `authority_power_tolerance_kw` / `min_switch_interval_sec` /
-充放電功率與額定上限**仍未設定**（數值一律不寫入本文件）。
-
-**Production Path Audit（Phase D.2 唯讀稽核結論）**
-
-Phase 6 目前的定位是：**CONTROL ALGORITHM READY，BUT PRODUCTION ORCHESTRATOR NOT YET WIRED。**
-
-**Phase D.3 架構決議**：Report Monitor 與 PCS Automatic Control 採**獨立服務、獨立行程、
-獨立 Named Mutex**。兩者重用既有的 Mutex / DACL / Ownership / Service lifecycle **技術**，
-但**不得共用同一把鎖** —— Report Monitor Ownership（誰可以寫報告檔）與
-PCS Control Ownership（哪個行程可以驅動自動控制）是兩種不同的所有權語意。
-
-**Phase D.3-A 已完成（Runtime Skeleton，離線）**：新增控制服務外殼、Runtime 狀態機骨架、
-與 production 參數來源。此階段刻意**不具備任何實機出口** ——
-不 import 既有控制程式、不建立 Executor 實例、不存在 dispatch 路徑；
-Runtime 只會停留在 DISABLED / OBSERVE_ONLY / FAULT_BLOCKED / SHUTTING_DOWN。
-即使注入明確的充放電意圖，也只產生「本來會做什麼」的稽核事件。
-
-**Phase D.3-B 已完成（ESS Snapshot Adapter，離線）**：新增設備觀測邊界，
-唯一責任是把既有的整批讀取結果轉成控制所需的觀測，只回答「設備現在回報什麼」。
-它**不做**決策、政策、授權、方向互鎖或安全判定，也不重新發明 PCS 狀態分類 ——
-一律重用已通過實機驗證的既有純函式。
-
-資料新鮮度以**讀取開始時刻**為基準（Phase 6.5-G 實機教訓的正式保留）：
-整批讀取本身可能耗費數秒，若從「讀完」才起算，一份已經過時的資料會被誤認為全新。
-Adapter **不快取**任何觀測結果 —— 上一筆成功的觀測絕不會在本次讀取失敗時被沿用。
-告警來源的完整性證明（來源不完整即 Fail Closed，空清單不等於沒有告警）於本階段完整保留。
-
-D.3-B **未接上 production reader**：控制服務維持零設備能力，觀測一律回報「讀取來源未設定」。
-觀測有效**不會**讓 Runtime 取得任何控制能力，狀態仍只停留在既有的四個。
-
-**Phase D.3-C 已完成（電表觀測 + 決策觀測，離線）**：新增電表觀測邊界與決策觀測層。
-至此 Production Runtime **已經可以看資料並做出決策，但仍然沒有能力執行決策**。
-
-決策鏈完全由既有且已驗證的正式模組負責：尖峰／離峰判定、逆送與盲帶分類、
-充放電策略、Fail Closed 順序 —— 觀測層不得出現第二套規則，僅負責把正確的輸入
-交給正確的模組並如實記錄結果。電表 payload 的解讀亦完全委派既有電表客戶端，
-其中「台電電錶瞬時功率」與「原始需求量」是兩個不同量測，**不得互相取代**。
-
-**Consumer-time freshness（D.3-B 觀察的正式落點）**：Adapter 判定的是「資料取得完成時」
-是否夠新；決策層必須在**真正使用資料的當下**以當時的時鐘重新計算兩份資料的年齡，
-任一超過既有門檻即進入「資料不足以判斷」的阻擋狀態。
-**禁止**假設「Adapter 當時有效」等同「決策當下仍然有效」。
-
-**Snapshot coherence**：設備與電表是兩個獨立來源，取得時刻不同。本階段**只記錄**兩者
-時間差，**不設定**任何門檻 —— 目前沒有已裁定的正式規格，不猜數值。
-
-決策結果只是**稽核事實**，不是指令：整條鏈沒有建立任何執行器實例、任何一次性授權、
-任何控制紀錄寫入，也沒有任何抵達設備控制介面的途徑。
-
-⚠️ **正式離峰日來源尚未確認**，因此 TOU 目前一律為 UNKNOWN，決策必然 Fail Closed。
-   這是誠實的保守行為，不是功能缺陷；在取得正式來源前不得假裝今天不是假日。
-
-⚠️ 控制服務自 D.3-C 起因讀取電表而具備**通往電表**的網路能力。
-   已有專屬驗證證明：行程內**沒有**任何通往 HMI／設備控制介面的能力。
-
-**Phase D.3-D 已完成（仲裁與授權，離線）**：新增一次性授權票與仲裁層。
-至此系統可以**授權**一個控制腿，但仍然沒有能力**送出**它 ——
-「已授權」與「已送出」是完全不同的兩件事。
-
-授權票具備三個不可違反的性質：**只對綁定的那一個動作有效**（充電票絕不能拿去放電）、
-**消費一次即永久失效**（送出失敗、回讀失敗、例外都不得重用，重試必須重新走完整流程）、
-**必須有明確有效期**（有效期未取得正式依據時一律不核發，絕不解讀成「永不過期」）。
-
-授權前必須重新取得觀測並重新比對：決策當下有效**不等於**授權當下仍然有效。
-兩次之間若決策、設備狀態、模式開關、告警來源任一改變，一律不得沿用舊結論。
-控制權判定、方向互鎖、閒置語意、安全條件全部重用既有已驗證模組，
-安全檢查失敗時**原始原因完整保留**，不得被換成籠統的阻擋碼。
-
-反向切換時，仲裁層會**明確另外形成一個停止腿**並只授權它；
-反方向的授權必須等停止完成後、由新的一輪重新評估才可能出現。
-
-同一時間最多只有一張有效授權票；已有未消費的票時不得建立第二張。
-設備已在目標狀態且目標未改變時，**不重複授權**（意圖狀態 ≠ 指令邊緣）。
-
-⚠️ **同向但目標功率改變**的正式語意尚未裁定（見 Blocker 10）。唯讀證據盤點結論：
-
-- 既有控制程式的前置檢查**不消費**目前運轉狀態，人工選單亦不檢查 ——
-  也就是說「送得出去」在程式層面沒有被擋，但這**不等於**設備契約已確認支援。
-- 前端實抓確認的範圍是 payload 欄位、模式列舉與正負號慣例，
-  **完全沒有**「運轉中可更新設定值」的任何既有證據。
-- 既有實機紀錄中**從未**出現同向連續指令，因此沒有任何可援引的實測樣本。
-- **決定性障礙**：既有回讀機制的成功條件只看「是否觀測到目標狀態」，
-  功率永不參與、也不要求發生狀態轉變。設備原本就在該方向時，
-  回讀會在**第一次輪詢**就判定成功 —— 它結構上**無法**區分
-  「新設定值已生效」與「舊設定值仍在跑」。
-- 因此若在此前提下更新控制紀錄，等於把「已送出但未驗證」記成「已驗證」，
-  直接違反控制紀錄「只記錄已驗證成功結果」的既有契約。
-
-結論：在取得設備契約證據**並且**補上可驗證同向更新的回讀條件之前，
-一律維持 Fail Closed，不猜測、不預設走「先停再啟」。
-
-⚠️ 授權所需的正式參數全部尚未取得依據，因此以 production 預設值執行時
-   **永遠不會核發任何授權**。這是誠實的保守行為。
-
-**Phase D.3-E 已完成（執行鏈，離線）**：授權票消費 → 送出 → 回讀驗證 → 控制紀錄提交
-的完整生命週期已離線跑通，並以注入的替身驗證全部失敗路徑。
-
-**控制紀錄只記錄可證明的成功**：只有回讀驗證成功才寫入。授權核發、等待消費、
-呼叫控制程式、API 已接受、驗證進行中、回讀逾時、回讀失敗、例外 —— **一律不得寫入**。
-
-**「未驗證成功」不等於「指令沒有執行」**：API 已接受但驗證未成功時，設備**可能其實已經照做**。
-因此一律回報為「指令結果不明」並 Fail Closed —— 不宣稱擁有、不更新紀錄、
-**不自動重送**、**不自動停止**。只有能證明未送出的情況（控制程式未注入／
-乾跑／前置檢查擋下）才會被歸類為「未送出」。
-
-**回讀成功但紀錄寫入失敗**是獨立的失敗類別：設備確實已被控制，但持久化擁有權紀錄
-沒有建立成功。既不能當成正常擁有，也不能當成指令失敗 —— 一律 Fail Closed。
-
-**授權票一次性**：消費後永久失效。送出失敗、回讀失敗、例外、逾時都不得重用；
-重試必須重走觀測 → 決策 → 仲裁 → 授權的完整流程。送出前還會再做一次新鮮度重驗，
-**有效期未過期不等於資料仍然新鮮**，兩者分別檢查。
-
-⚠️ **重複抑制是安全條件，不是效能最佳化**：既有回讀在「設備原本就在目標狀態」時
-會在第一次輪詢就判定成功。因此相同動作＋相同目標必須在仲裁層就被抑制，
-**絕不能**進到控制程式 —— 否則舊狀態會被誤認為新指令已成功。此不變量已由回歸鎖死。
-
-⚠️ 崩潰視窗分析結論：四個視窗全部 Fail Closed（見下）。**不需要**新增持久化執行日誌 ——
-   它只能提升可用性，且要自動恢復擁有權就必須在未驗證的情況下宣稱擁有，與既有契約衝突。
-
-⚠️ production 預設下控制程式、回讀、控制紀錄儲存**全部未注入**，且執行狀態不可達，
-   因此零授權、零送出、零紀錄寫入。
-
-**Phase D.3-F 已完成（崩潰／重啟協調，離線）**：新增純邏輯的擁有權重判層。
-它**只分類、不判定** —— 擁有權的唯一判定者仍是既有的控制權模組，
-本層只把結論翻譯成「重啟後應回到哪個狀態」，不覆寫、不補強、不放寬。
-它**不可能**送出任何指令，也不會改動任何控制紀錄（已由回歸逐條鎖住）。
-
-**重啟後只有兩樣證據**：磁碟上的控制紀錄（且必須通過開機識別與信任判定），
-以及設備自己的當下狀態。**記憶體中「曾經驗證成功」在重啟後並不存在**，不得作為證據。
-
-四個崩潰視窗的結論：
-
-| 視窗 | 重啟後判定 | 重複指令 | 錯誤宣稱擁有 | 失去擁有權 |
-|---|---|---|---|---|
-| 授權已消費 → 送出前崩潰 | 可重新評估並重新授權 | 否 | 否 | 否 |
-| 已送出 → 回讀前崩潰 | 運轉中但無紀錄 → 判為外部控制 | 否 | 否 | **是**（安全，需人工） |
-| 回讀成功 → 提交前崩潰 | 磁碟世界與上一列**完全相同**，同樣不得認領 | 否 | 否 | **是**（安全，需人工） |
-| 提交成功 → 狀態更新前崩潰 | 紀錄有效且與現況相符 → **完整自動恢復** | 否 | 否 | 否 |
-
-**服務重啟 ≠ 作業系統重開機**：服務重啟（未重開機）時控制紀錄仍可信，
-擁有權可完整恢復；作業系統重開機後開機識別改變，紀錄降為僅供歷史查閱，
-**自動失去擁有權信任** —— 這正是既有設計的預期行為。
-
-**不需要新增持久化執行日誌**：四個視窗全部 Fail Closed，沒有任何一個會造成
-重複指令或錯誤宣稱擁有。日誌唯一能改善的是中間兩個視窗的**可用性**，
-但要自動恢復擁有權，就必須在未驗證的情況下宣稱擁有 —— 與控制紀錄
-「只代表已驗證結果」的契約直接衝突。因此這兩個視窗維持「需人工介入」，
-並登記為明確的可用性取捨。
-
-**Phase D.3-G 已完成（啟動恢復整合，離線）**：服務啟動／重啟時，
-以明確的恢復入口重建擁有權狀態。建構後**一律**從停用狀態開始 ——
-不存在「一建立就宣稱擁有」的路徑。
-
-恢復只做三件事：**讀取 → 判定 → 映射狀態**。它不送指令、不寫控制紀錄、
-不建立授權、不改變送出開關、也不恢復「等待消費」的狀態
-（授權是一次性且僅存在於記憶體，重啟後必然不存在）。
-
-**擁有權恢復不等於啟用送出**：即使恢復判定為「我們仍擁有這台設備」，
-送出開關維持原狀。兩者完全獨立，各有專屬驗證。
-
-**以持久證據與當下實況為準，不是以記憶體殘留為準**：記憶體殘留「擁有」但證據
-判為外部控制時必須被覆寫；反之記憶體是阻擋狀態而證據合法時，也應恢復為擁有。
-
-**恢復只在啟動或明確呼叫時執行**，一般週期不重跑判定（已由回歸鎖住）。
-任何讀取例外、判定例外、來源未接、觀測無效 —— 一律 Fail Closed，
-且**不得**沿用先前的擁有狀態。
-
-⚠️ 「找不到控制紀錄」與「讀不出控制紀錄」是**不同**的事：前者在設備閒置時可安全
-重新開始；後者無法排除「其實有一筆有效紀錄」，一律 Fail Closed。既有儲存層
-**已提供**此區分，本階段未修改其契約。
-
-⚠️ 本階段**未新增任何 runtime 狀態**，全部沿用既有狀態；擁有狀態原本受送出開關
-保護，恢復走的是**明確且獨立的通道**，並以測試逐條鎖住其邊界。
-
-**Phase D.4 已完成（時段提供者，離線）**：新增正式的「現在屬於哪一種台電時段」來源。
-
-**盤點結論**：專案內**已有**正式時段規則來源（Phase 6.2b 的時段模組），
-其規則出處為台電電價表所定的二段式時間電價方案，並已明文記載
-「這是指定的工作基準，不是已由現場電費單／契約證實採用」。
-本階段**完全沿用**該規則，一行未改、未重寫任何時段表。
-
-**Provider 與 Policy 分離**：時段提供者只回答「時段事實」，不介入充放電決策；
-取得當下時間的責任集中於此，不再散落於決策層。
-
-**兩個維度完全分離**：時段維度只有尖峰／半尖峰／離峰／未知；
-逆送屬於電網潮流維度，由電表判定，**不是一種電價時段**（值域互不重疊，已鎖住）。
-⚠️ 週六為**半尖峰**且有獨立費率，**不得**併入離峰。
-
-**時區必須明確**：production 時區設定目前為**未配置** → 一律未知（Fail Closed）。
-不做固定時差運算、不依賴「主機剛好設在本地」。不含時區資訊的時間戳**一律拒絕**，
-避免它成為 production 契約。建議值待核准後才可填入（見 Blocker 12）。
-
-**任何來源不足即未知**：時區未設定／無法解析、時鐘失效或回傳非時間、
-離峰日來源未設定／失效／不涵蓋該年度、時段設定無效 —— 全部回未知。
-**未知絕不等同離峰**，決策端據此 Fail Closed（已驗證）。
-
-**Phase D.4-A 已完成（年度離峰日供應與時區接線，離線）**
-
-**時區契約已核准並接線**：production 時段一律以 IANA 時區名稱交由時區資料庫解析，
-**不做固定時差運算**、**不依賴主機所在地**。不含時區資訊的時間戳一律拒絕。
-時區核准**不等於**啟用送出 —— 送出開關維持關閉（有專屬驗證）。
-
-**年度離峰日採「靜態年度清單、隨程式版本控管」**，**不使用任何外部服務**：
-自動控制不能因為外部服務中斷就突然不知道今天能否充放電。每份清單必須完整記載
-出處、版本、生效日，並經人工核准；**未核准的清單視同不存在**。
-資料有任何問題（年份不符、重複、非日期、來源或生效日缺失）一律**拒絕建立**，
-不做任何自動修正。排序具決定性。
-
-**三態語意維持不變**：年度未知／未核准 → 無法判定（**不是**「不是假日」）。
-禁止「不是週末所以當平日」「查不到假日所以當非假日」這類推論。
-
-⚠️ **production 年度清單目前為空**，因此所有年度皆為未知 → 時段一律未知 →
-   決策必然 Fail Closed。**未自行產生任何離峰日**。
-
-⚠️ 已驗證的日型優先順序（沿用既有規則，未修改）：年度離峰日**優先於**星期 ——
-   落在週六的離峰日仍為全日離峰，覆蓋半尖峰。
-
-**Phase D.4-B 已完成（年度資料供應與保守判定，離線）**
-
-**保守判定已核准啟用**：只有在「是離峰日」與「不是離峰日」兩種互斥假設下
-**得到完全相同的時段**時，才允許在離峰日來源未知的情況下回答那個唯一結果。
-實務上只有**週日**符合（兩種假設皆為離峰）。
-
-⚠️ 這**不是** best guess、預設值、fallback 或啟發式。只要兩種假設結果不同就一律未知：
-週六（離峰 vs 半尖峰）與平日（離峰 vs 尖峰）在年度資料到位前**必須**維持未知。
-**禁止**以「假設不是假日」作為 production 的退路。
-
-**年度資料供應**採人工、可 code review、可版本控管的本機檔案，**零網路**：
-每份必須完整記載出處、版本、生效日，並經人工核准。未核准的檔案可以載入但
-**不可用**（草稿不得悄悄生效）。載入時完整驗證格式版本、日期格式、年份一致性、
-重複、來源與生效日 —— 任何問題一律拒絕，不做自動修正。
-production **不會自動掃描目錄**，納入必須是明確、可審查的動作。
-
-**年度資料就緒狀態**共四態：已就緒／未提供／未核准／無效。
-只有「已就緒」的年度能判定離峰日；其餘一律視同不存在。
-**不得 fallback 使用其他年度的清單。**
-就緒狀態**只是回報，不會因此啟用任何控制能力**。
-
-**年度切換**：跨年後若新年度清單尚未供應，受年度資料影響的日期一律未知，
-**不得沿用上一年度**（已驗證）；但該年的週日仍可由保守判定得到離峰。
-
-**Phase D.4-C 已完成（年度日期具體化，離線）**
-
-**規則與年度日期嚴格分離**：規則表回答「哪些節日屬於離峰日」，永遠不含任何特定年度的
-國曆日期；年度資料回答「這些規則在該年度實際落在哪幾天」，每年重新產生並重新核准。
-
-規則依可判定性分四類：固定國曆日、農曆單日、農曆區間、國曆但逐年變動。
-**只有固定國曆日能由規則自動展開**；其餘三類一律必須人工提供年度日期。
-
-⚠️ **專案內完全沒有農曆能力**（無函式庫、標準庫不支援），且**不新增第三方相依**、
-   **不自行手刻農曆演算法**。因此農曆項目的國曆日期一律由人工提供並核對 ——
-   這也讓年度資料可 code review、可版本控管。
-
-⚠️ **逐年變動項目不得自行固定**：官方記載為「兩個候選日之一」者，未提供即列為待解，
-   且提供非候選日一律拒絕。
-
-**草稿永遠不可能自己變成已核准**：產生器結構上不接受核准參數，產出恆為未核准；
-放進 Provider 只會是「未核准」狀態，完全無法用於判定。只有人工核准後才成為已就緒。
-**有任何待解項目即不得升級。**
-
-⚠️ **政府補假／彈性放假／補班日不得自動視為離峰日** —— 除非官方文件或正式契約另有規定。
-   政府行事曆**不等於**電價離峰日曆。
-
-**Phase D.4-D（官方規則對帳，離線）—— SUPERSEDED / CORRECTED BY D.4-E PRIMARY SOURCE**
-
-⚠️ 下段保留 D.4-D 當時的查證紀錄，供事後追溯；
-   其中三項 domain 結論已由 D.4-E 的官方年度日曆表直接證據**撤銷**，
-   詳見後面的「Phase D.4-D 狀態更正」表格。不得再依據下段的舊結論。
-
-以台電官方網站查證後，Production 規則表已對帳。查證結論：
-
-- 官方離峰日 = **週日 + 9 個具名節日**（開國紀念日、春節、和平紀念日、兒童節、
-  民族掃墓節、勞動節、端午節、中秋節、國慶日）
-- **教師節、臺灣光復紀念日、行憲紀念日不在官方離峰日清單中** ——
-  這三項只出現在 repo 既有測試 fixture，已標記為「官方清單中不存在」，**永不進入 production**
-- repo 註解所稱「12 個離峰日」**無法由官方來源佐證**；規則數改由清單長度決定，
-  程式中不再以任何數字硬編碼項目數
-- **彈性放假日、補假日、颱風假不適用離峰電價** —— 官方明確排除，
-  因此政府行事曆**確定不等於**電價離峰日曆
-- 週日雖是官方離峰日的第一項，但**已由既有日型規則涵蓋**，不需要年度資料、
-  也不進入年度清單
-
-⚠️ **官方 PDF 的文字未能成功擷取**（檔案無法解析），因此**逐字原文未取得**。
-   上述結論的依據是使用者提供的官方清單與兩次獨立查證所得的一致定義 ——
-   三者互相吻合，但**不等於逐字原文核對**。此限制已寫入規則表的來源註記。
-
-⚠️ 測試 fixture 與官方清單不一致時，**修正的是認知與註記，不是 production 規則**：
-   fixture 內容刻意未修改（改它只會讓既有邊界測試失去意義），
-   但已明確標註其與官方清單的差異與用途邊界。
-
-規則版本與生效資訊（核定日、生效日、核備文號）已完整記錄於規則表，供事後追溯。
-
-**Phase D.4-E 已完成（官方年度日曆表取得與解析，研究＋離線）**
-
-官方年度時間電價日曆表**已成功取得並完整解析**，解析全程只用 Python 標準庫，
-**未安裝任何套件、未變更 Python 環境、未使用任何第三方資料來源**。
-
-- 兩份**互相獨立**的官方檔案（總公司電價表頁面、區營業處公告）各自下載並解析，
-  重疊年度的整年度日型摘要**完全相同**，構成獨立互證
-- 日型由儲存格顏色編碼，已完成幾何對位；兩個年度皆通過完整性自我檢核：
-  全年日數、每月日數、星期欄位、週日全部標示為離峰、平日無週六標示 —— **零例外**
-- 年度資料**直接取自日曆表本身**，未由規則表回推、未自行推算農曆
-
-**Phase D.4-D 狀態更正：SUPERSEDED / CORRECTED BY D.4-E PRIMARY SOURCE**
-
-D.4-D 僅依搜尋摘要（最低優先來源）建立認知，造成三項錯誤結論，已正式撤銷：
-
-| 舊結論 | 官方年度日曆表的直接證據 |
-|---|---|
-| 教師節／光復節／行憲紀念日**不在**官方離峰日清單 | 三項**皆為**離峰日，且各有不受週日遮蔽的年度可佐證 |
-| 春節區間自**農曆除夕**起 | 實為自**農曆除夕前一日**起 |
-| 「12 個節日項目」**無法**由官方來源佐證 | 官方年度日曆還原結果**支持**「12 個節日項目 ＋ 每週日」 |
-
-D.4-D 的**架構與測試方法保留**，但錯誤的 domain 結論已逐項撤銷並留下可追溯紀錄；
-既有 regression 不再斷言舊結論（每一處更動都在測試檔內就地標註更正理由）。
-
-**來源優先序（Source Authority）已正式建立**
-
-P1 官方年度時間電價日曆表（年度實際日型／日期）→ P2 正式詳細電價表（規則語意）
-→ P3 其他官方公告 → P4 搜尋摘要／第三方（**只能 research**）。
-🔴 高優先來源與低優先來源衝突時，低優先來源**不得覆蓋**；同級亦不得互相覆蓋；
-   來源未知一律視為最低優先（Fail Closed）。
-
-**Phase D.4-E.1 已完成（官方年度資料具體化，離線）**
-
-新增官方日曆表解析器與年度資料集模組：解析器**零網路、零第三方相依**，
-任何一項對不上就整份拒絕（缺日、週日非離峰、平日被標成週六、色格對位歧義……），
-**不交出半份資料**。
-
-年度草稿已產生，但**尚未核准**：
-
-- 兩年度草稿一律 `verified=false`，`build_draft()` **結構上不接受** verified 參數
-- `PRODUCTION_ANNUAL_LISTS` **仍為空**，Production 時段判定完全未受影響
-- 草稿放進 Provider 只會是 UNVERIFIED（視同不存在）
-- 年度資料**不得 fallback**：未涵蓋年度一律回 None，不沿用其他年度
-
-🔴 **Production 不保存整年度日型，但三態證據沒有遺失**：
-   OFF_PEAK／SATURDAY／WEEKDAY 可由「非週日離峰日清單 ＋ 星期」完全還原，
-   還原結果的摘要必須等於當初從官方 PDF 解析出來的摘要 —— 由 regression 鎖住。
-   因此「只存清單」不等於「丟失日型證據」，也避免為此重構既有 schema。
-
-⚠️ 週日雖是官方離峰日，但**不重複**寫進年度清單（已由既有日型規則涵蓋）。
-⚠️ 民族掃墓節**不建立通用公式**：規則維持「4/4 或 4/5」候選，
-   年度實際日期直接由官方日曆表給出。節日剛好落在週日的年度，
-   日曆表的紅色來自「週日」本身，**無法單獨佐證該節日規則** —— 此限制已寫入規則表。
-⚠️ 「離峰日數量」的註解已改為**不依賴任何數量的描述**：
-   「節日項目數」與「年度日曆日數」本質上不相等（春節本身即為跨多日區間）。
-   數量只作為 documentation／validation，**不得**成為 runtime business logic ——
-   程式中不存在任何數量常數，項目數一律由清單長度決定。
-
-**Phase D.4-E.2 已完成（已驗收年度資料上線，離線）**
-
-經人工驗收的 2026／2027 年度離峰日清單已升為 `verified=true` 並正式
-provision 到 `PRODUCTION_ANNUAL_LISTS`，`PRODUCTION_PROVIDER` 的已核准年度
-精確為兩個年度，無任何被拒絕或無效的年度殘留。
-
-🔴 **`verified=true` 的唯一依據**：官方 Calendar provenance ＋ 官方檔案
-   SHA-256 ＋ 本次人工驗收，三者缺一不可。**不得**因為「測試 PASS」
-   「fixture 對得上」「搜尋摘要一致」「程式自行推導」而成立。
-
-🔴 **驗收是綁資料的**：驗收憑據記錄了當時核對過的資料摘要與檔案 hash。
-   任何一天被改動、或來源檔案換了一份，該年度會**直接從 production 消失**，
-   退回「年度未知 → UNKNOWN → Fail Closed」，而不是悄悄沿用舊資料。
-   要讓新資料生效只能重新送人工驗收 —— 無法靠改程式繞過。
-   全模組只有一個地方會產生 `verified=true`，且該函式只收年度一個參數。
-
-明令禁止項皆有對應的結構性驗證：**runtime 自動下載日曆表、任何 runtime
-網路相依、自動掃描目錄加入年度、未涵蓋年度自動 fallback、把某年度資料沿用到
-相鄰年度、自行產生未涵蓋年度的日期、第三方 Calendar fallback** —— 全部不存在。
-
-年度邊界行為（**不因相鄰年度而 fallback**）：
-已 provision 年度的最後一天正常判定；下一年度的第一天即為 UNKNOWN；
-未 provision 年度的任何一天都只會得到「無法判定」，不會得到 True/False。
-
-時間契約未放寬：時區為 Asia/Taipei（IANA 名稱），不含時區資訊的時間
-**一律拒絕** —— 已 provision 的離峰日也不例外。
-
-⚠️ 年度資料上線**不等於** Production Go-Live：本階段只解決年度時段資料，
-   控制參數仍全數未取得依據，dispatch 仍結構性關閉。
-
-**Phase D.5-A 已完成（參數決策與 Authority 時機守則，離線）**
-
-**Blocker 13 — Authority 功率佐證的時機守則**
-
-實機證據顯示 PCS 充放電旗標與 AC 功率暫存器**不保證同步**（0 或 1 個 backend
-refresh cycle，延遲案例約 15~16 秒）。原本的功率佐證在指令送出後的更新窗內，
-會把**我們自己剛送出的作業**判成 `CONFLICT_POWER`，重啟時更會被 recovery
-翻譯成 `EXTERNAL_CONTROL` —— 那不是保守，是把自家作業誤認成別人的。
-
-🔴 **這不是容差數值問題**：離線重現顯示，任何有意義的容差都會誤判；
-   唯一「能通過」的容差大到等於廢掉整道佐證。因此**禁止**以放寬容差
-   或拉長決策間隔來掩蓋，兩者都已由 regression 鎖住。
-
-修正後明確區分四種情況，各有獨立 reason code：
-
-| 情況 | 結論 |
-|---|---|
-| 指令後 AC 尚未更新 | UNKNOWN / **NOT_YET_CORROBORATED** |
-| 真正的功率衝突 | CONFLICT / CONFLICT_POWER |
-| 資料無效或不新鮮 | UNKNOWN / DATA_INSUFFICIENT |
-| 正常 | OWNED_BY_PHASE6 |
-
-判定依據是**資料新舊的證據**，不是固定秒數：
-① 觀測時刻必須嚴格晚於指令驗證時刻（同一時間基準才比較）；
-② 觀測值必須**已經離開** LastControl 所記錄的「驗證當下觀測功率」——
-   值沒變就無法證明暫存器已更新。兩者皆成立才允許進行容差比對。
-⚠️ 舊資料即使數值「剛好符合」也不算佐證；巧合不是證據。
-⚠️ 全程**不使用任何固定 timer、不 sleep、不阻塞**，也不依賴決策間隔。
-
-同時補上**方向**判定：取得指令後的新觀測時，AC 有功的正負號必須與動作一致
-（充電為正、放電為負，實機四筆一致）。此前只比絕對值，方向相反會被誤判為相符。
-
-**Recovery 語意修正**：新增 `OWNERSHIP_PENDING` 這一個 runtime 狀態，
-語意是「有 durable 證據指向本方作業，但擁有權尚待佐證」——
-**不宣稱、也不放棄**。它不在執行／派工狀態集合內，因此結構上不可能送出指令：
-**Fail Closed for dispatch，但不誤判 ownership**。真正的外部控制
-（無紀錄、信任度不足、上次命令為 stop、動作與狀態矛盾、原生排程 ON）
-仍然全部可辨識為 EXTERNAL。
-
-**參數決策**
-
-`readback_timeout_sec` 依既有 FINAL 裁示寫入 production config
-（實機四筆狀態確認耗時遠低於此上限）。其餘尚無正式依據的參數**一項都沒有填**，
-全部維持未設定；單一參數就緒**不構成**放行理由，dispatch 仍結構性關閉。
-
-**Phase D.5-B 已完成（Orchestrator Wiring / OBSERVE_ONLY，離線）**
-
-整條 production path 已**真的接起來並且會跑完**：
-
-```
-Meter → Tariff/TOU → Decision → Safety Gate → Control Authority
-      → Layer 1 Interlock → Executor decision → ReadBack config → Report
-```
-
-已接上的相依：ESS reader（唯讀取樣）、Meter source（唯讀訂閱）、
-已人工驗收 provision 的年度離峰日、Decision Policy（功率取自 production config）、
-Safety Gate、Control Authority、LastControl（**唯讀**）、Layer 1 互鎖、
-ReadBack 參數（三項皆已定案）。
-
-🔴 **刻意沒有接上的**：executor 與 verifier。OBSERVE_ONLY 一律不建立控制出口、
-   不 import operator —— 因此「不送指令」是**結構事實**，不是旗標判斷。
-   即使上游全部放行（決策成立、Safety 通過、Authority IDLE、互鎖未擋），
-   即使必要參數日後全部補齊，也**沒有任何東西可以被呼叫**。
-
-🔴 **連線是明確操作**：所有來源預設未注入 → 對應層 Fail Closed。
-   跑測試或啟動服務都不會意外連上真機。整個組裝**不相依量測工具**。
-
-啟動時輸出完整就緒盤點（各層是否接上、ReadBack 參數、Layer 1/2 狀態、
-缺少的必要參數、`can_dispatch`），**只回報，不修補、不放行**。
-
-每一輪 OBSERVE_ONLY 都會產出可稽核紀錄，把「為什麼沒有動作」攤平成獨立欄位：
-電表狀態與新鮮度、併網流向、時段、決策與目標功率、Safety 結果、Authority 結果、
-互鎖結果、派工就緒狀態、以及最終的 no-action 理由 —— 供 Phase 6.7 事後分析。
-
-⚠️ 觀測鏈的時鐘已一路貫穿 ESS / Meter / Observer / Arbiter。
-   四者若不同時基，freshness 會跨基準相減而算出無意義的 age。
-
-**R1 —— Direction-driven Auto Report Trigger（僅設計，未接線）**
-
-Auto Report 目前的自動啟動條件之一是「PCS 原生排程主開關為 ON」，而 Phase 6
-控制的前提**恰好相反**（排程 ON 時 Authority 一律判為 EXTERNAL）。兩者互斥。
-R1 的方向是讓報告 session 由**實際控制方向與生命週期**驅動，而非排程開關。
-🔴 R1 **不得反過來影響控制**：報告需求不構成送出指令的理由，也不得改變
-   Control Authority、dispatch 規則或 Layer 1 互鎖。
-⚠️ 既有 Auto Report lifecycle 本輪**一行未改**。
-
-**Phase D.5-C 已完成（Production 參數決策分析，離線唯讀）**
-
-🔴 本階段**未修改任何 production 參數** —— 原則是 **EVIDENCE FIRST**，
-   不是「把所有值都填成非 None」。缺依據就維持缺依據。
-
-七項缺項的分類結果：
-
-| 參數 | 目前值 | 狀態 |
-|---|---|---|
-| `charge_power_kw` | **5.0** | FINAL —— 第一版保守 baseline（已完成實機驗證） |
-| `discharge_power_kw` | **5.0** | FINAL —— 同上 |
-| `decision_interval_sec` | **30** | FINAL —— 約 2 個 backend refresh cycle |
-| `authorization_ttl_sec` | **10** | FINAL —— 涵蓋實測單輪最壞延遲並保留餘裕 |
-| `authority_ttl_sec` | **180** | FINAL —— 涵蓋一次決策週期＋最壞回讀時間 |
-| `authority_power_tolerance_kw` | **1.25** | FINAL —— **綁定目前 target 5 kW**；改功率必須重新評估 |
-| `max_power_kw` | **150.0** | **FINAL** —— **HMI AC active-power command upper bound**（**不是** PCS rated power） |
-| `min_switch_interval_sec` | **None** | DEFERRED —— 刻意未配置，不在必要參數之內 |
-
-🔴 現場曾觀察到的約 80 kW **不是** production 依據 —— 那是無 LastControl 的
-   OBSERVED EXTERNAL / FIELD OPERATION；`max_power_kw` 亦未由 5 kW 量測值反推，
-   更**未**以實機極限功率測試取得。
-
-**`max_power_kw = 150.0` 的來源與語意**
-
-直接來源是本機 HMI「設備控制 → 手動模式 → 併網 → 交流有功」所示的
-有功功率設定範圍 **0 ~ 150 kW**，並由 operator 在送出前強制
-`abs(activePowerSetPoint) <= 150`（第二層防線）。
-
-設備能力級別的**交叉佐證**（僅作上界，不是本值來源）：原廠 Sinexcel
-PWS1-160M-H-EX/NA User Manual V1.3_7.0，欄位 `Nominal Power` = **160 kVA**。
-⚠️ 官方單位是 **kVA（視在功率）**，**不得**改寫成「額定有功 160 kW」。
-實測 DC 匯流排 886.6~930.5 V 落在該系列範圍，排除舊 50K~250K 系列。
-
-⚠️ **已記錄的落差（DOCUMENTED / NON-BLOCKING）**：本機銘牌 400 V / 60 Hz；
-   公開手冊 EX = 400 V/50 Hz、NA = 480 V/60 Hz，皆不完全對應。
-   狀態：**MODEL_FAMILY_CONFIRMED / EXACT_VARIANT_UNRESOLVED**。
-   本值不由 EX/NA 額定推導，而由本機 HMI 指令範圍決定，故不受此落差影響。
-
-🔴 **150 kW 不是操作目標**。Production 正常指令仍為 **±5 kW**；
-   這只是一道 Safety Gate 上限閘，不得據以提高充放電功率或安排實機測試。
-
-🔴 **`dispatch_ready` 現已為 True，但 `dispatch_enabled` 仍為 False。**
-   參數齊備**不等於**允許派工 —— executor / verifier 仍不建立，
-   模式仍為 OBSERVE_ONLY，開啟派工必須是另一次明確授權。
-
-**參數相依鏈**（後者的合理範圍由前者決定，不可各自獨立取值）：
-
-```
-decision_interval_sec → authorization_ttl_sec → dispatch → LastControl
-                                                              ↓
-authority_power_tolerance_kw ← fresh observation ← authority_ttl_sec
-```
-
-必須成立的約束：`authorization_ttl_sec` **遠小於** `authority_ttl_sec`
-（兩者只是名稱都有 TTL，語意完全不同：前者是「這張一次性授權票還能不能被消費」，
-後者是「LastControl 這份擁有權證據還能不能被相信」）。
-授權票必須足以涵蓋「決策→安全→權限→互鎖→送出」的單輪延遲，
-但**不能長到**讓一個過期很久的決策仍被執行。
-
-🔴 **`dispatch_ready` 與 `dispatch_enabled` 完全分離**：
-   即使七項全部補齊使 `dispatch_ready=True`，`dispatch_enabled` 仍為 False、
-   executor / verifier 仍不建立 —— 開啟派工必須是另一次明確授權。
-
-**Phase 6.6 已完成（Auto Report Integration / R1，離線）**
-
-**問題**：既有自動報告的建立條件是「智慧模式 ＋ 排程主開關 ON」，
-而 Phase 6 自動控制的前提**恰好相反**（排程 ON 時 Control Authority 一律判為
-EXTERNAL，Phase 6 不介入）。兩者互斥 → Phase 6 在控時報告永遠不會開始。
-
-**R1 —— Direction-driven Auto Report Trigger**：報告改由**實際控制方向與擁有權**
-驅動，取代「排程開關」這一個條件。其餘守門**一項都沒有放寬** ——
-方向、已有 session、PCS 故障、pending 狀態、cooldown、start debounce、
-Owner 檢查、主開關全部原封不動。
-
-🔴 **未建立第二套報告系統**：完全沿用既有 session / resume / finalize /
-   ownership / Named Mutex / observer 機制，report engine 一行未重寫。
-   收尾本來就是**方向無關**的（idle debounce），因此 STOP → finalize 不需任何修改。
-
-🔴 **唯一整合點是一座橋**：報告層**不** import 任何 Phase 6 模組（只多一個注入式
-   hook，預設 `None`）；Phase 6 wiring 層**不** import 任何報告模組。
-   兩邊只在 `phase6_report_bridge` 相遇，要拆除只需一行 `uninstall()`。
-
-🔴 **控制與報告解耦**：橋接只**單向**餵唯讀狀態，不呼叫任何控制函式、
-   不碰任何 Mutex（AST 驗證）。報告層拿不到任何可以改變控制的把手；
-   提供者拋例外時報告層安全退回既有條件，控制側完全不受影響。
-
-🔴 **擁有權判準**：Authority == `OWNED_BY_PHASE6` —— 代表 durable LastControl
-   存在、信任度足夠、狀態相符、TTL 內、且已完成指令後的功率佐證。
-   只有 LastControl 存在不算；只有設備在運轉更不算。
-   Phase 6 宣稱的方向與設備實際方向不符 → **Fail Closed，不建立報告**。
-
-⚠️ **OBSERVE_ONLY 期間橋接恆回 None** —— Phase 6 不會產生任何 verified
-   direction，因此既有報告行為**完全不受影響**。這是目前的實際狀態。
-
-**Phase 6.7 已完成（Production Field Validation — OBSERVE_ONLY）**
-
-以**正式 production stack**（真實電表、真實 ESS、正式 Tariff／年度日曆／
-Decision／Safety／Authority／Interlock 設定）在現場資料上連續觀察，
-全程**未送出任何 PCS 指令**。
-
-🔴 **實機驗證發現一個 production wiring 缺口並已修正**：
-   `build_api_client()` 原本回傳**未登入**的 client。
-   `getRunMode` / `getScheduleSwitch` / `getDOAndDIMsg` 需要認證，未登入回 **401**
-   → 排程／手動開關讀不到 → ESS 觀測 `PCS_MODE_UNAVAILABLE`
-   → **整條鏈永遠 Fail Closed**。行為本身安全，但 orchestrator 等於空轉，
-   在真機上跑之前看不出來。已改為預設登入（登入只取讀取權限，不送任何控制），
-   並補上 regression。⚠️ 登入失敗**不拋例外、不重試** —— 交由上層 Fail Closed。
-
-修正後現場觀測正常：排程開關 / 手動開關可讀、時段判定有效、Control Authority
-可判為 IDLE、決策鏈可完整走完並停在 **NO DISPATCH**。
-
-⚠️ 觀察期間現場自然狀態為 SOC 極低且時段為尖峰，因此**未自然出現**
-   CHARGE / DISCHARGE candidate —— 如實記為 **NOT OBSERVED**，
-   未以人工改動電表或控制設備的方式製造情境。
-
-Fail Closed 情境（電表陳舊／無效、時段 UNKNOWN、ESS 陳舊、通訊失敗、
-Safety BLOCK、Authority UNKNOWN、OWNERSHIP_PENDING、EXTERNAL_CONTROL、
-Interlock BLOCK）一律沿用既有離線 regression 驗證，**不以破壞現場設備的方式取得**。
-
-**Phase 6.9 / 6.9-A Controlled Single-Leg LIVE（OFFLINE COMPLETE / FIRST LIVE ATTEMPTED-BLOCKED）**
-
-第一次上線**不採**永久旗標，也**不直接進入無人值守自動排程**。
-
-```
-啟用方式：CLI  --live-leg charge|discharge  --confirm
-不採：config flag／環境變數／自動恢復 LIVE
-```
-
-🔴 **`--live-leg` 不代表立即動作** —— 它只代表「本 process 最多允許執行一次
-   該方向的 leg」。真正 dispatch 仍須同時滿足 Decision／Safety／Authority／
-   Interlock／fresh precheck／一次性控制授權／leg 授權，**缺一不可**。
-
-🔴 **授權不落盤**：隨 process 生命週期存在。服務重啟即消失，預設回 OBSERVE_ONLY。
-
-🔴 **人工確認不是 YES** —— 必須輸入完整語句（例：`CONFIRM CHARGE 5KW`）。
-   `--confirm` 本身只表示「願意進入確認流程」；輸入錯誤即中止，不建立任何出口。
-
-🔴 **出口建立時機**：CLI → 人工確認 → **fresh precheck（16 項，確認後重新取得）**
-   → leg 授權有效 → 才建立 executor / verifier。任一前置失敗即維持 None。
-
-🔴 **leg 授權下推到 executor 層** —— 送出前的最後一道閘。
-   若只在執行鏈跑完後才比對方向，指令**已經送出去了**；因此方向不符時
-   operator 完全不會被呼叫。
-
-🔴 **已 dispatch 後失去擁有權 → 不自動 STOP**。對 ownership 不確定的設備送 STOP
-   本身也是新的控制行為，可能中斷外部操作者。一律 `ABORTED_UNCERTAIN_OWNERSHIP`
-   → 禁止任何新指令 → STOP AND REPORT，交由人工處置。
-   只有 Authority 明確為 `OWNED_BY_PHASE6` 且 Safety 放行，才由本 leg 正常收尾。
-
-🔴 **LIVE 功率只能來自正式 ProductionConfig**（±5 kW）。
-   CLI **沒有** `--power`，授權物件也不接受任何 power 參數；
-   150 kW 仍只是 Safety Gate 上限，**不可能**成為操作目標。
-
-leg 完成後自動：授權 consumed → executor/verifier 銷毀 → 回 OBSERVE_ONLY。
-
-**6.9-A：CLI 入口接線（順序本身就是安全性質）**
-
-```
-啟動 service → 解析 --live-leg → 檢查 --confirm
-   → 人工確認（完整語句）
-   → fresh read（確認前的快照一律作廢）
-   → 自然 Decision 必須自己形成該方向
-   → fresh precheck／Safety／Authority／Interlock 全數通過
-   → 才核發 LiveLegAuthorization
-   → 才建立 executor / verifier
-   → 才進 ControlledLiveLeg
-```
-
-🔴 **`--live-leg` 是 permission，不是 decision override**。
-   自然 Decision 不是該方向（含 IDLE、反向、no_action、None）一律 NO DISPATCH。
-
-🔴 **確認之前取得的任何觀測，一律不得作為 dispatch 依據**。
-   確認失敗時連 fresh read 都不會發生。
-
-🔴 **確認階段不持有授權** —— 以「意向」物件供顯示，其 armed 恆為 False，
-   即使被誤傳進出口建構函式也只會得到 None（Fail Closed）。
-
-🔴 **process 級 one-shot**：本 process 一旦核發過 leg 授權即不再核發第二次
-   （不論同向、反向、前次成功與否）。one-shot 不只靠 process 邊界成立。
-
-🔴 **LIVE 分支不進入常駐迴圈**：一個 leg 結束就結束 process，
-   因此不存在「服務持續處於 LIVE」這種狀態，重啟自然回 OBSERVE_ONLY。
-
-🔴 **模組層永不 import operator**。控制出口只在 LIVE 路徑被明確呼叫時，
-   由單一函式延後取得；該延後 import 被回歸釘死在那一個函式內。
-
-⚠️ 本階段**僅完成離線實作與回歸**，尚未執行任何實機 LIVE。
-
-**Phase 6 技術面結案 —— 剩餘為控制權衝突，非技術缺口**
-
-```
-Phase 6.9                      OFFLINE COMPLETE / FIRST LIVE ATTEMPTED-BLOCKED
-FIRST LIVE                     NOT EXECUTED
-FIRST LIVE Safety Behavior     PASS
-Control Authority Detection    FIELD VERIFIED
-External Controller Existence  FIELD VERIFIED
-External Automation Type       SEPARATE OFF-PEAK CONTROL PROGRAM / USER CONFIRMED
-PCS OEM Built-in Automation    NOT THE SOURCE FOR THIS EVENT
-External Program Location      RESOLVED
-External Program Identity      RESOLVED
-Observed Behavior              POWER-ON → 約 20 s → CHARGE
-Manual-control API Match       CONSISTENT_WITH_MANUAL_CONTROL_API
-                               / NOT SERVER-LOG CONFIRMED
-Technical Blockers             NONE
-Operational Blocker            KNOWN COMPETING EXTERNAL CONTROLLER
-                               / PAUSE NOT YET AUTHORIZED
-FIRST LIVE RETRY               HOLD
-Production Go-Live             BLOCKED BY OWNERSHIP CONFLICT
-```
-
-**FIRST LIVE 現場實測（2026-09-01）**
-
-第一次受控上線於絕對觀測窗口 00:00:00~00:10:00 執行。四項自然條件**首度全部成立**：
-
-```
-00:00:03 ~ 00:00:48   Authority = IDLE   PCS = STOPPED
-                      TOU = OFF_PEAK     Natural Decision = CHARGE
-                      通訊健康（endpoint 失敗 0，取樣遠低於既有新鮮度契約）
-```
-
-隨後設備被 Phase 6 以外的來源接管：
-
-```
-約 00:00:55   PCS 由 STOPPED 被啟動至 STANDBY
-約 00:01:16   PCS 進入 CHARGING
-              Authority → EXTERNAL_OR_UNKNOWN
-```
-
-同一時間**併網點 import 增加約 80 kW**，與既有的 external charging event 高度一致。
-⚠️ 這是併網點量測，**不等於**「外部 command = 80 kW」。
-
-Phase 6 的 ownership observation 即時偵測到外部控制 → **ABORT → NO DISPATCH**：
-
-```
-本次 Phase 6 實機 command：CHARGE = 0 / DISCHARGE = 0 / STOP = 0
-```
-
-🔴 **這是 Fail Closed 正確動作，不是 Phase 6 技術失敗。**
-擁有權偵測依 PCS 旗標而非 AC 功率，因此在 AC 暫存器落後更新之前就已判定。
-
-Field evidence（**MUST_KEEP**，Phase 6 驗收完成前不得刪除）：
-
-```
-output\phase6_live_charge\first_live_20260831_235901.log
-output\phase6_live_charge\first_live_20260831_235901.json
-```
-
-**External Controller 已定位（2026-09-01，READ-ONLY source inspection）**
-
-```
-EXTERNAL_PROGRAM_HOST    192.168.70.201（Ubuntu 22.04.5 LTS，user etica）
-EXTERNAL_PROGRAM_NAME    /home/etica/ems/auto_control.py
-RUNTIME                  screen 1128.auto → /bin/bash → python3 auto_control.py
-SCREEN_1128_AUTO         CONFIRMED
-AUTO_CONTROL_PY          CONTROLLER CONFIRMED
-BESS_REQUEST_PY          PCS/HMI API CLIENT CONFIRMED
-CONTROL_TRIGGER          OFF-PEAK + METER + SOC + DEMAND
-PAUSE_METHOD             built-in "stop"  / CONFIRMED / NOT YET EXECUTED
-                                          / NOT YET AUTHORIZED
-RESTORE_METHOD           built-in "start" / CONFIRMED / NOT YET EXECUTED
-PAUSE_VERIFICATION       DEFINED
-RESTORE_VERIFICATION     DEFINED
-```
-
-🔴 該 controller 的 `stop` **不等於** PCS 的 STOP 指令 —— 它停的是 automation loop
-並把 active power command 收斂到 0，PCS 可能停在 STANDBY 而非 STOPPED。
-Phase 6 本來就接受兩者皆為 legal idle（precheck `pcs_idle`、Layer 1
-`DIRECTION_ISOLATED_STATES`），因此**不需要為此修改任何 production 邏輯**。
-
-⚠️ 交叉驗證：該 controller 採 `negative setpoint = CHARGE` / `positive = DISCHARGE`，
-與本專案記載的第三種 kW 語意（PCS Command）**完全一致**；其 `MIN_SOC=2 / MAX_SOC=98`
-亦與現場觀測到的 SOC 擺盪邊界吻合。兩者為獨立來源的相互佐證。
-
-**下一步不是重新排一次 FIRST LIVE。**
-
-外部控制程式若未先暫停，重排只會再次得到相同的 ABORT。順序為：
-使用者明確核准 temporary pause → fresh read-only precheck → built-in `stop`
-→ PAUSE_VERIFICATION → ownership observation → fresh Phase 6 precheck
-→ FIRST LIVE retry → 完成後 built-in `start` → RESTORE_VERIFICATION。
-
-`PAUSE_VERIFICATION` 最關鍵 —— 暫停後須持續觀測，確認 PCS 維持 legal idle、
-功率收斂至約 0、Authority 維持 IDLE、無外部 LastControl、PCS 不自行 Power-On
-或充放電、通訊健康、fault/alarm clean。
-
-**充電時間窗（HISTORICAL OBSERVATION ONLY）**
-
-2026-09-01 夜間實測：外部 controller 以約 80 kW 充電，SOC 由 2% 上升至 85%
-約耗時 2 小時 40 分（約 5% / 10 分鐘）。因此**當日**可用的 FIRST LIVE charge
-window 約為離峰開始後的前 2.5 小時。
-
-🔴 **THIS IS HISTORICAL OBSERVATION ONLY.**
-`00:00 ~ 02:40` **不是** production hard-coded window，也**不是** Safety Gate
-或 production rule。FIRST LIVE 的真正判斷條件一律使用 **fresh SOC**：
-
-```
-SOC <= 85%  → charge latch 可成立
-SOC >  85%  → natural decision 不應強制 CHARGE
-```
-
-選擇離峰開始後 00:00~00:30 只是**較佳的 operational window**（SOC 最低、餘裕最大），
-不得寫入任何判定邏輯。
-
-Non-blocking：Blocker 10（同向目標功率變更語意）、Layer 2 DEFERRED、
-`test_pcs_modes` 既有 regression debt、CHARGE/DISCHARGE candidate 自然現場觀測
-NOT OBSERVED。
-
-**Phase 6.8 已完成（Regression & Closure）**
-
-把散落在各階段的關鍵不變量收斂成**單一結案閘門**（21 條，A~U）。
-本階段**未新增任何功能**。
-
-最終閘門的核心命題：
-
-> **所有必要參數皆已就緒，但結構上仍不可能送出任何指令。**
-
-```
-dispatch_ready   = True      ← 9 項必要參數全部就緒
-dispatch_enabled = False     ← 未啟用
-mode             = OBSERVE_ONLY
-executor         = None      ← 不建立，非「有出口但被擋住」
-verifier         = None
-can_dispatch     = False
-```
-
-三者互相獨立且同時成立 —— 參數齊備**不等於**允許派工。
-非 OBSERVE_ONLY 的模式（DISPATCH / LIVE / ACTIVE）一律拒絕建立出口。
-
-**功率雙層防線**：Safety Gate 於 150.0 kW 放行、150.1 kW 起 BLOCK（充放電雙向）；
-operator 在送出前另有獨立的 0~150 kW 範圍檢查，兩層皆不可繞過。
-Production 操作功率仍為 **±5 kW**，遠低於上限。
-
-**Fail Closed 全覆蓋**：時段 UNKNOWN、電表無資料／`demand_state=fault`、
-ESS 通訊失敗／陳舊、Authority 非 IDLE/OWNED、EXTERNAL_CONTROL —— 一律未授權、0 calls。
-`OWNERSHIP_PENDING` 為獨立 runtime 狀態，不在派工集合內。
-
-**責任分離**：報告層不 import 任何控制模組、不含任何控制指令字串；
-控制層不 import 任何報告監看模組；橋接未建立第二套 report engine，
-既有 session 入口仍是唯一的一個，收尾仍由既有單一決策點負責。
-未安裝橋接時 scheduler 舊路徑**完全不退化**。
-
-**相依性稽核**：16 個 production path 模組**全部**不相依量測工具；
-5 個時段／日曆模組**全部**無網路相依；年度資料為靜態已驗收資料，
-不掃描目錄、未涵蓋年度不 fallback。
-
-🔴 **Phase 6.8 全數通過 ≠ Go-Live**。目前狀態為
-**TECHNICALLY READY FOR EXPLICIT LIVE AUTHORIZATION** ——
-`dispatch_enabled` 的切換必須是另一次獨立、明確的裁示。
-
-控制服務的例外處理原則與報告服務**相反**且不得照抄：報告監看遇到例外必須續行
-（監看不得停擺），控制 runtime 遇到未知例外一律 **Fail Closed**，不再產生任何指令。
-
-關閉語意為 **relinquish authority only**：停止軟體服務**不等於**停止 PCS，
-正常停止／系統更新重啟／人工停止一律不隱含送出停止充放電指令。
-
-稽核事實：現行 production 執行路徑（報告監看服務、自動排程監看、人工控制選單、
-既有控制程式）**沒有任何一個**在模組層或函式層 import 任何 Phase 6 模組；
-Phase 6 的決策鏈（電表 → 分類 → 決策 → 政策 → 控制整合 → 方向互鎖 → Safety Gate →
-Control Authority → Executor）目前**不存在**任何 production 呼叫端。
-Executor 亦從未在 production 被實例化，且未注入控制程式時結構上不可能接上真機。
-
-因此：各模組離線回歸全數通過**不等於** Phase 6 已可自動運轉。
-在 Production Orchestrator 完成之前，Phase 6 不得被視為具備自動控制能力。
-
-控制路徑分類（唯讀稽核，本輪未變更任何行為）：
-
-| 路徑 | 性質 | 是否經過 Phase 6 方向互鎖 / Safety Gate / Authority |
-|---|---|---|
-| 人工控制選單 → 既有控制程式 | 人工，**刻意獨立** | 否（人工逐次確認，非自動控制） |
-| Field Measurement 量測工具 | 量測 harness，非 production | 部分（有 Authority 與 Safety Gate，**無**方向互鎖） |
-| Phase 6 自動控制 | **尚未接通**（D.3-A 骨架已建立，無 dispatch 路徑） | 設計上必經，但目前無呼叫端 |
-| 報告監看 / 自動排程監看 | 純唯讀，無控制能力 | 不適用 |
-
-⚠️ Field Measurement 驗證成功**不代表** Production Path 已接通；兩者是不同路徑。
-⚠️ **既有自動報告與 Phase 6 自動控制在觸發條件上互斥**：既有自動報告要求
-   排程主開關 **ON**，而 Phase 6 自動控制的 Control Authority 要求排程主開關 **OFF**。
-   因此自動控制期間，既有的排程式自動報告永遠不會被觸發 —— 報告整合需要另一條
-   由「實際方向」驅動的觸發來源（設計中，尚未實作）。
-⚠️ 人工控制選單屬 operator 直接控制工具，與 Phase 6 自動控制刻意分離，
-   本輪未將 Phase 6 互鎖強加於人工路徑。
-
-OPEN DESIGN ITEM（尚未實作，登記備查）：`LastControlStore` 的紀錄與 Safety Gate 的
-`LastControl` 之間目前**沒有** production adapter。未來啟用時間互鎖前，必須先確認
-紀錄可用於間隔判定（同一 boot、monotonic 可比較）才可轉換；**禁止**跨 boot 的
-monotonic 相減。時間互鎖未取得正式門檻前不接線。
-
-PRE-EXISTING REGRESSION DEBT（與 Phase 6 無關，另案處理）：`test_pcs_modes.py` 的
-fixture 缺少排程開關的手動模式欄位，導致解析回「未知（狀態無法確認）」。
-不得為了讓回歸全綠而修改 production parser 或降低既有斷言。
-
-合理 SOC 的 DISCHARGE → STOP 實機驗證**已完成**（Blocker 1 因此 CLOSED）。
-目前**沒有**已核准的下一個實機控制階段；剩餘 Blocker 以唯讀分析為主。
-
-實機控制的前置條件（任一不成立即不得送出控制）：設備閒置、功率回基準、SOC 落在
-Decision Policy 允許該方向的運轉帶內、無故障與作用中告警、排程主開關 OFF、
-Control Authority 為 IDLE，且確認無其他控制來源。
-⚠️ 驗證用的 SOC 目標窗口**不是 production SOC policy**；Safety Gate 的硬限制與
-Decision Policy 的運轉帶語意不同，兩者不得混用。
-⚠️ SOC 恢復由現場既有正常作業執行，**Phase 6 不執行 SOC Recovery**。
-
-</details>
-
-<details>
-<summary><b>Phase 6.10 詳細設計紀錄（State Machine、Ownership Model、各子階段驗收、參數推導）</b></summary>
-
-#### 11. Phase 6.10 — Unattended Ownership Handoff
-
-##### 11.1 目標
-
-讓系統未來能在**無人工操作**下完成一次完整交接：
-
-```
-External Controller → safe pause → ownership release → Phase 6 takeover
-→ control → Phase 6 release → External Controller restore
-```
-
-四項核心原則：
-
-- **不允許雙重 controller** —— 任何時刻只能有一方持有控制權
-- **Fail Closed** —— 任一 Gate 不成立即停止前進，不猜、不續跑
-- **Crash 後保留 restore responsibility** —— 重開機不得讓恢復責任消失
-- **所有 handoff 留下 durable audit evidence**
-
-##### 11.2 State Machine
-
-```
-IDLE → PREFLIGHT → PAUSE_REQUESTED → PAUSE_VERIFYING → EXTERNAL_PAUSED
-     → PHASE6_ACTIVE → PHASE6_RELEASING → PHASE6_RELEASED
-     → RESTORE_REQUESTED → RESTORE_VERIFYING → RESTORED → COMPLETE
-```
-
-失敗／Critical 狀態：
-
-```
-ABORTED_PREFLIGHT              尚未動任何東西，無恢復責任
-ABORTED_PAUSE_FAILED           pause 未生效，external 仍在跑
-RESTORE_FAILED_CRITICAL        🔴 場站失去套利，需人工介入
-OWNERSHIP_CONFLICT_CRITICAL    🔴 雙方同時持有
-```
-
-轉移採**白名單**，非法轉移直接拋錯。`EXTERNAL_PAUSED` 不得直接跳 `COMPLETE` ——
-必須經過歸還。
-
-##### 11.3 Ownership Model
-
-```
-EXTERNAL / NEITHER / PHASE6 / UNKNOWN / BOTH
-```
-
-🔴 **`BOTH` 不是正常 operational state，而是 INVARIANT VIOLATION / CRITICAL。**
-它不出現在任何狀態的可接受集合中，一旦偵測到即寫入稽核並轉 critical。
-任一側無法判定 → `UNKNOWN`（Fail Closed），不猜測。
-
-##### 11.4 Phase 6.10 Core — COMPLETE
-
-已完成並離線驗證：State Machine、Crash Recovery、Watchdog、Idempotency、
-append-only JSONL Audit Log、DRY_RUN / OBSERVE / ARMED 三段模式架構。
-
-幾項語意值得記錄：
-
-- **意圖先寫、結果後寫** —— crash 落在中間時必須**以觀測驗證**，不得盲目重送
-- **Watchdog 逾時不會直接 restore** —— Phase 6 仍在 dispatch 時強行恢復
-  external 會造成雙方同時控制，因此逾時只會要求「先收斂，再歸還」
-- **恢復責任由 8 個狀態承載**，並以 durable journal + `recover()` 跨重開機保留
-
-```
-DISPATCH_ENABLED = False       MODE = DRY_RUN
-```
-
-##### 11.5 Remote Adapter — Phase 6.10-A COMPLETE
-
-remote adapter 提供三個注入點：`probe` / `pause_sender` / `restore_sender`。
-pause / restore sender **介面已備妥，但 production control 尚未啟用**
-（預設 `armed=False`，未注入 runner 即結構上送不出）。
-
-🔴 **`external_quiescent` 不得宣稱直接觀測到 `auto_control.py` 的
-`running == False`** —— 那是行程內部變數，外部讀不到。只能以外部可觀測行為
-（PCS 狀態、功率、Authority、通訊、告警、狀態穩定性）跨多筆樣本驗證。
-
-##### 11.6 Pause Verification — Phase 6.10-A1 COMPLETE
-
-兩階段：
-
-```
-SETTLING        允許正常收斂，**不判失敗**：
-                  CHARGING / DISCHARGING → STANDBY / STOPPED
-                  Authority EXTERNAL_OR_UNKNOWN → IDLE
-                  Power active → idle band
-                逾時仍未出現 candidate-idle → SETTLING_TIMEOUT
-
-STABLE_VERIFY   首次出現完整 candidate-idle 後才開始；
-                連續 fresh samples 全部成立才 external_quiescent = True
-```
-
-PCS 狀態穩定性**只在 STABLE_VERIFY window 內要求** —— SETTLING 期間的
-`CHARGING → STANDBY` 是正常收斂，不得因此判定 pause 失敗。
-
-Restore 驗證同樣兩層：runtime health（ssh / screen / pid / identity）＋
-loop activity（時間戳前進）。**不要求 PCS 一定出力**；證據不足一律
-`NEEDS_ADDITIONAL_PROBE`，不得假裝 PASS。
-
-##### 11.7 已核准 handoff 參數
-
-| 參數 | 值 |
-|---|---|
-| `idle_power_lower_kw` | −3.0 |
-| `idle_power_upper_kw` | +1.0 |
-| `pause_settling_timeout_sec` | 120.0 |
-| `stable_verify_min_samples` | 4 |
-| `stable_verify_interval_sec` | 15.0 |
-| `stable_verify_min_span_sec` | 45.0 |
-| `restore_loop_min_observations` | 3 |
-| `restore_loop_interval_sec` | 3.0 |
-| `restore_loop_min_span_sec` | 6.0 |
-
-span 一律等於 `(samples − 1) × interval`（4@15s → t=0/15/30/45 → 45 s；
-3@3s → t=0/3/6 → 6 s），並由 `validate()` 檢查一致性以防 off-by-one。
-
-🔴 **參數已寫入 ≠ 實機 unattended control 已啟用。** 仍維持
-`DISPATCH_ENABLED = False`、`MODE = DRY_RUN`。
-
-##### 11.8 Remote Guard — Phase 6.10-B1 COMPLETE
-
-```
-dedicated key   phase6_firstlive_ed25519（ED25519，專用）
-來源限制        from="192.168.128.234"
-forced command  /home/etica/ems/phase6_remote_guard.sh
-```
-
-目前 deployed allowlist：
-
-```
-ENABLED   probe | loopcheck | status
-REFUSED   pause | restore | 任意 shell | kill | screen 任意指令
-```
-
-`authorized_keys` 中該 public key **恰好 1 條** forced-command entry ——
-必須 REPLACE 而非 APPEND，否則舊的無 forced-command 條目仍在，allowlist
-就完全失去意義。
-
-guard 本身：`set -euo pipefail`、PATH 與環境淨化、絕對路徑、每個動作有 timeout、
-明確 exit code、精確比對（非前綴）、不使用 eval、不把原始 command 交給 `sh -c`、
-screen 以 **session name** 定位（不寫死 PID）且要求恰好 1 個、hardcopy 用
-`mktemp` + `trap` 清理。
-
-##### 11.9 FIRST LIVE Handoff Plan
-
-```
- 1 PRE_PAUSE_PREFLIGHT
- 2 PAUSE                    → RESTORE RESPONSIBILITY = TRUE
- 3 SETTLING                 ≤ 120 s
- 4 STABLE_VERIFY            4 samples @ 15 s，span ≥ 45 s
- 5 ownership = NEITHER
- 6 POST_PAUSE_FRESH_PRECHECK
- 7 FIRST LIVE CHARGE 5.0 kW
- 8 VERIFY                   ReadBack / LastControl / Phase 6 Authority
- 9 PHASE6 RELEASE           → idle verified → ownership = NEITHER
-10 RESTORE external
-11 RESTORE_VERIFY           3 observations @ 3 s，span ≥ 6 s
-12 COMPLETE
-```
-
-🔴 **`PRE_PAUSE_PREFLIGHT` 不要求 `Authority = IDLE`、`PCS idle`、
-`No external controller`** —— 暫停之前，external controller 本來就可能正在
-正常控制，那是預期狀態而非 failure。這三項**只有 `POST_PAUSE_FRESH_PRECHECK`
-才必須 PASS**，且不得沿用 Step 1 的資料。
-
-🔴 **RESTORE 完成後不要求 ownership 一定為 `EXTERNAL`。** 若 external policy
-此刻正確選擇 idle（`ownership = NEITHER`），仍可 `COMPLETE`，前提是：
-Phase 6 ownership released、external runtime healthy、external loop resumed、
-`ownership != BOTH`、no critical condition。
-
-##### 11.10 Network Identity Blocker — Phase 6.10-B1.6 COMPLETE / BLOCKER CONFIRMED
-
-```
-Wi-Fi MAC     04-EC-D8-6A-46-4A
-IPv4          192.168.128.234（PrefixOrigin = Dhcp）
-DHCP Server   192.168.128.16
-DHCP Reservation = NOT CONFIRMED
-```
-
-```
-UNATTENDED_NETWORK_IDENTITY_STABILITY = NOT VERIFIED
-DHCP Reservation                      = NOT CONFIRMED
-Phase 6.10-B1.7                       = DEFERRED / NOT VERIFIED
-```
-
-🔴 **`NOT VERIFIED` 不是 `PASS`。** B1.7 的欄位驗證（受控 reconnect / DHCP renew
-後重新確認 IP 與 guard）**尚未執行**，不得以「歷史 renew 都拿到 .234」推論為已驗證。
-
-⚠️ 正確描述：**DHCP 會週期性 renew，但因 reservation 尚未確認，無法保證
-reconnect / DHCP restart / lease reassignment 之後仍取得 `.234`。**
-（不可寫成「12 小時租約一定每 12 小時換 IP」。）
-
-風險路徑：external 已 pause → Windows IP 改變 → `from="192.168.128.234"`
-拒絕 SSH → restore 送不出去 → `RESTORE_FAILED_CRITICAL`。
-
-🔴 **不得**以 `from="192.168.128.0/24"` 作為解法 —— 那只是擴大 dedicated key
-的來源授權範圍，並未建立 stable network identity。unattended production 要的是
-**stable identity**，不是 **broader authorization scope**。
-
-需 IT 於 `192.168.128.16` 建立 reservation：MAC `04-EC-D8-6A-46-4A`
-→ IPv4 `192.168.128.234`（**是 DHCP Reservation，不是 Windows 端 Static IP**）。
-
-##### 11.11 Current Gate
-
-| 階段 | 狀態 |
-|---|---|
-| Phase 6.9 | FIRST LIVE RETRY HOLD |
-| Phase 6.10 Core | COMPLETE |
-| Phase 6.10-A | COMPLETE |
-| Phase 6.10-A1 | COMPLETE |
-| Phase 6.10-B1 | COMPLETE |
-| Phase 6.10-B1.5 | COMPLETE |
-| Phase 6.10-B1.6 | COMPLETE / BLOCKER CONFIRMED |
-| Phase 6.10-B1.7 | **DEFERRED / NOT VERIFIED** |
-| Phase 6.10-B2 OFFLINE | **COMPLETE** |
-| Phase 6.10-B2 LIVE | **NOT STARTED / BLOCKED** |
-| Phase 6.10-C OFFLINE | **COMPLETE** |
-| Phase 6.10-C LIVE DEPLOYMENT | **NOT STARTED / BLOCKED** |
-
-```
-Live blockers
-  NETWORK_IDENTITY_STABILITY   NOT VERIFIED
-  DHCP Reservation             NOT CONFIRMED
-  Remote deployed guard        B1（pause / restore = REFUSED）
-  retry_backoff_sec            UNRESOLVED
-  service_health_timeout_sec   UNRESOLVED
-  FIRST LIVE                   HOLD
-```
-
-FIRST LIVE / unattended live 之前，**必須**重新補做 B1.7，或以其他經驗證的
-stable network identity 方案解除此 blocker。
-
-B1.7 通過後才進 B2；即使進 B2，仍先維持 `DISPATCH_ENABLED = False` /
-`MODE = DRY_RUN`，先驗證 pause / restore 安全成立，再做 Controlled FIRST LIVE
-5 kW，之後才考慮 Phase 6.10-C Unattended Service，最後才可能
-`MODE = ARMED` / `DISPATCH_ENABLED = True`。
-
-##### 11.13 Phase 6.10-B2 — OFFLINE DEVELOPMENT / TEST ONLY
-
-B2 的程式與離線測試已完成；**實機 pause / restore 未授權，guard 亦未部署**。
-
-**HandoffRunner** —— 依 §11.9 的 12 步驅動整個交接，全部相依由注入取得：
-
-```
-1 PRE_PAUSE_PREFLIGHT   11 項；刻意**不含** authority_idle / pcs_idle /
-                        no_external_controller（以 PRE_PAUSE_MUST_NOT_REQUIRE
-                        常數固定，回歸直接驗）
-2 PAUSE                 送出後 restore_responsibility = True
-3+4 SETTLING/STABLE_VERIFY  由 PauseVerifier 以已核准參數驅動
-5 OWNERSHIP = NEITHER
-6 POST_PAUSE_PRECHECK   **這一階段才**要求那三項，且不得沿用 Step 1
-7 FIRST LIVE            受 DISPATCH_ENABLED 擋下（目前恆為 False）
-8~9 VERIFY / RELEASE
-10~12 RESTORE / RESTORE_VERIFY / COMPLETE
-```
-
-🔴 **不存在「漏歸還」的路徑** —— 只要 Step 2 曾成功，之後任一失敗都由統一的
-`_bail()` 導向歸還流程。離線測試涵蓋 Step 6 失敗、STABLE_VERIFY 期間出現
-external evidence、probe 異常三種情境，三者皆確認仍送出 restore。
-
-🔴 **restore 失敗（送不出或 loop 未恢復）→ `RESTORE_FAILED_CRITICAL`，
-且恢復責任不解除。**
-
-**Remote Guard B2** —— 已實作 `pause` / `restore` 兩個動詞，沿用 B1 全部強化，
-且兩者**皆必須先通過** `require_single_screen` 與 `require_identity`
-（B1 的 `probe` 刻意不強制，因為 probe 本就是用來診斷當下狀態；但控制動詞不同 ——
-對身分不確定的目標送控制指令不可接受）。
-
-```
-DEPLOYED_GUARD_VARIANT = "B1"    ← 遠端實際部署仍是唯讀動詞版本
-```
-
-模組中存在 `REMOTE_GUARD_B2_SH` **不代表已部署**。部署需另行授權，且必須
-REPLACE `authorized_keys` 的既有條目。
-
-##### 11.14 Phase 6.10-C — Unattended Service
-
-```
-Phase 6.10-C OFFLINE           COMPLETE
-Phase 6.10-C LIVE DEPLOYMENT   NOT STARTED / BLOCKED
-SERVICE_MAIN_LOOP              IMPLEMENTED / OFFLINE VERIFIED
-```
-
-**主迴圈**
-
-```
-BOOT → RECOVER → STARTUP GATES → OBSERVE → EVALUATE ELIGIBILITY
-     → HANDOFF RUNNER → AUDIT → LOOP
-```
-
-只有 `recovery = CLEAN` 才可進入正常 observation loop。
-
-**Startup Recovery**
-
-```
-CLEAN            → 允許正常 loop
-PENDING_RESTORE  → 禁止新 handoff，承接既有 restore responsibility
-CRITICAL         → 拒絕 live operation
-UNKNOWN          → Fail Closed
-```
-
-🔴 Windows reboot / Service restart **不得**把 ownership 或 restore
-responsibility 重設為 IDLE / NONE。
-
-**Live Gate（10 項，任一不成立即 REFUSED）**
-
-```
-MODE == ARMED                       DISPATCH_ENABLED == True
-NETWORK_IDENTITY_STABILITY == PASS  REMOTE_GUARD_VARIANT == B2
-pause capability == PASS            restore capability == PASS
-recovery == CLEAN                   local data fresh
-remote probe fresh                  FIRST LIVE prerequisite satisfied
-```
-
-現場實況：
-
-```
-DISPATCH_ENABLED           False
-MODE                       DRY_RUN
-NETWORK_IDENTITY_STABILITY NOT VERIFIED
-DEPLOYED_GUARD_VARIANT     B1
-pause_capable              False
-restore_capable            False
-FIRST LIVE                 HOLD
-→ live_handoff_allowed 必定 False
-```
-
-⚠️ `remote_pause_capable()` / `remote_restore_capable()` 依**實際部署的 guard
-版本**判定 —— 原始碼中存在 `REMOTE_GUARD_B2_SH` 不代表現場具備 B2 能力。
-
-**Single Instance**
-
-只允許單一 unattended orchestrator。判斷**不只使用 PID**，而是
-`pid` + `boot_id` + `cmdline` 三者確認，並處理四種情境：
-
-```
-stale PID              前行程已死          → 可接手
-PID reuse              PID 活著但 cmdline 不符 → 視為 stale，可接手
-peer liveness unknown  死活不可知          → 拒絕啟動（不假設已死）
-corrupt lock           lock 檔損毀         → 拒絕啟動
-```
-
-第二 instance 不得啟動，且**不寫入 `SERVICE_START`**。
-production 應改用本專案既有的 Windows Named Mutex 機制（可注入）。
-
-**Durable Journal**
-
-append-only JSONL，必要事件八種：
-
-```
-SERVICE_START / SERVICE_SHUTDOWN / RECOVERY_RESULT / ELIGIBILITY_DECISION
-HANDOFF_BEGIN / PHASE6_TAKEOVER / PHASE6_RELEASE / CRITICAL_FAILURE
-```
-
-加上既有的 pause / restore `INTENT` / `OUTCOME`。restart 不清除、seq 單調遞增、
-partial tail 可容忍，且**不得因資料不足而猜測 ownership**。
-
-**Restore Responsibility**
-
-只要 external pause **可能已發生**，責任就必須保留到 `RESTORED`。
-exception / process crash / Windows reboot / service restart / SSH failure
-都不得讓責任消失。
-
-🔴 **本輪修正的真實缺陷**
-
-crash 若發生在「PAUSE INTENT 已 durable」但「STATE 尚未寫入」之間，
-舊 `recover()` 的 `last_state()` 會回 `None` → **可能誤判 CLEAN**，
-服務照常啟動，但 external 其實可能已被暫停。
-
-已新增 `_has_unresolved_pause()`：只要存在 PAUSE `INTENT` 且其後沒有成功的
-RESTORE `OUTCOME`，即視為可能仍背負責任，再配合 remote probe 判為
-`PENDING_RESTORE` / `CLEAN` / `UNKNOWN` —— **不得直接假設 CLEAN**。
-此修正已由 crash tests 驗證（八個切點）。
-
-**Graceful Shutdown**
-
-```
-無 responsibility                        → CLEAN
-Phase6 active → release → verify idle
-  → restore external → verify loop resumed → CLEAN
-restore 送不出 / loop 未恢復              → RESTORE_FAILED_CRITICAL
-```
-
-🔴 **不得記成 clean shutdown。** DRY_RUN 下若 journal 顯示存在真實 restore
-responsibility，因禁止實機 sender，**也不得假裝已成功 restore** ——
-同樣判為 CRITICAL。
-
-**Crash Recovery**
-
-八個切點皆驗證：pause INTENT 後 / pause success 後 / SETTLING /
-STABLE_VERIFY / PHASE6_ACTIVE / PHASE6_RELEASED / restore INTENT 後 /
-restore outcome 未落盤。每一個都 boot REFUSED、承接責任，且
-**pause / restore sender 呼叫數皆為 0（不盲目重送）**。
-
-**DRY_RUN E2E**
-
-```
-boot READY → 5 loop ticks → shutdown CLEAN
-pause sender = 0 / restore sender = 0 / dispatcher = 0
-```
-
-即使 `eligibility = True`，只要 `live_handoff_allowed = False` 仍為 `NO_HANDOFF`
-—— 兩層判定彼此獨立。
-
-**Scheduling**
-
-無硬編碼 `00:05` / `00:15` / `00:30`（AST 排除 docstring 後掃 HH:MM，
-兩個模組命中皆為 0）。eligibility 一律由 Asia/Taipei TOU、fresh SOC、
-Natural Decision、Authority、PCS、Meter、fault/alarm 決定。
-**歷史 operational window 不得成為 production schedule。**
-
-**Polling / Backoff**
-
-```
-decision_interval_sec       30.0     沿用既有已核准 production 值
-retry_backoff_sec           None     RETRY_BACKOFF = UNRESOLVED
-service_health_timeout_sec  None     SERVICE_HEALTH_TIMEOUT = UNRESOLVED
-```
-
-後兩者目前沒有足夠 field evidence 支持 production 數值，因此**刻意留 None
-並列入 `missing()`**，不自行填值。它們不是 C Offline 的完成 blocker，
-但屬於 **C Live Deployment 前待定的 production parameters**。
-
-**Critical States**
-
-```
-OWNERSHIP_CONFLICT_CRITICAL / RESTORE_FAILED_CRITICAL
-RECOVERY_UNKNOWN            / REMOTE_IDENTITY_MISMATCH
-```
-
-共同規則：禁止 new handoff、禁止 blind retry control、寫 durable critical
-event、Fail Closed。
-
-**測試**
-
-| 測試 | 結果 |
-|---|---|
-| `test_phase6_610c_service.py` | 102 / 102 PASS |
-| `test_phase6_610b2_handoff_runner.py` | 77 / 77 PASS |
-| `test_phase6_610a_remote_adapter.py` | 83 / 83 PASS |
-| `test_phase6_610_handoff.py` | 145 / 145 PASS |
-| **Phase 6 full regression** | **3694 / 3694 PASS，39 檔，0 FAIL 檔** |
-
-**Live Deployment Blockers**
-
-```
-NETWORK_IDENTITY_STABILITY   NOT VERIFIED（B1.7 DEFERRED）
-DHCP Reservation             NOT CONFIRMED
-Deployed remote guard        B1 —— pause / restore = REFUSED
-retry_backoff_sec            UNRESOLVED
-service_health_timeout_sec   UNRESOLVED
-FIRST LIVE                   HOLD（外部控制程式仍在運行）
-```
-
-以上任一未解除，`live_handoff_allowed()` 即為 False。
-**不得**以「離線測試全過」為由部署為常駐服務。
-
-**本輪安全狀態**
-
-```
-DISPATCH_ENABLED   False              MODE            DRY_RUN
-Windows Task       未建立              Service / NSSM  未安裝、未啟動
-實機 Phase 6       CHARGE / DISCHARGE / STOP = 0 / 0 / 0
-External           stop / start / pause / restore = 0 / 0 / 0 / 0
-```
-
-##### 11.15 Current Safety State
-
-```
-Remote Guard          probe / loopcheck / status = ENABLED
-                      pause / restore            = REFUSED
-DISPATCH_ENABLED      False
-MODE                  DRY_RUN
-PAUSE_AUTHORIZATION   NOT GRANTED
-FIRST LIVE RETRY      HOLD
-
-實機 Phase 6          CHARGE / DISCHARGE / STOP = 0 / 0 / 0
-External              stop / start              = 0 / 0
-```
-
-</details>
+- Durable Audit 目前**無 rotation / retention**，檔案持續成長，需自行留意磁碟。

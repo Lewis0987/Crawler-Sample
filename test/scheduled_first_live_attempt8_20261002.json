@@ -1,0 +1,18 @@
+{
+  "_authorization": "使用者 2026-10-01 同意執行 Attempt #8，並確認排程參數為 2026-10-02 00:05–00:30 Asia/Taipei，唯一一次 Scheduled FIRST LIVE Attempt #8（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task、Attempt #9。",
+  "_supersedes": "Attempt #7（FIRST-LIVE-ATTEMPT7-20261001）= COMPLETED / CONSUMED / CLOSED，RESULT = PAUSE_FAILED，root cause = CROSS-ATTEMPT JOURNAL STATE LEAK（共用 handoff_journal.jsonl 使 OnceGuard 讀到 Attempt #4 的 PAUSE INTENT）。已以 ATTEMPT-SCOPED JOURNAL + PREPOPULATED STATE TEST 修正並完成 regression closure。本次使用全新 Attempt ID / config / per-attempt handoff journal / ledger / artifact / wrapper / Task XML，不沿用 Attempt #5 / #6 / #7 任何 execution artifact。",
+  "_handoff_journal": "ATTEMPT-SCOPED。路徑由 attempt_id 決定性導出 = ../output/phase6_scheduled_first_live/handoff_journal_FIRST-LIVE-ATTEMPT8-20261002.jsonl（建立 Task 當下尚未存在，由 runtime 首次寫入時建立）。舊的共用 handoff_journal.jsonl 為 LEGACY SHARED JOURNAL（含 Attempt #4 證據），immutable，不再寫入。OnceGuard 的 one-shot 語意是同一 Attempt 內 pause / restore 各最多一次，不是整個 Phase 6 歷史期間只能一次。",
+  "_pre_field_six_step": "1 Full Phase 6 regression 6797/6797 PASS 63 files 0 FAIL；2 validate-only rehearsal PASS（Phase6_FirstLive_ValidateOnly_G，LastTaskResult 0，CONFIG_OK，provider_validation 7-7，VALIDATE_ONLY_NOT_EXECUTED，field_side_effects 0，ledger/journal NOT CREATED，task 已刪除）；3 production construction smoke 60/60 PASS exit 0；4 fresh host verify PASS（AC STANDBYIDLE/HIBERNATEIDLE 皆 Never）；5 fresh external baseline BASELINE_READY / EXTERNAL_RUNNING（SSH 僅 probe 1 + loopcheck 3，唯讀）；6 fresh legacy Task scan PASS（8 個舊 Task 全 Disabled，無 future executable Task）。",
+  "_host_prerequisite": "HOST_POWERED_ON_REQUIRED = True。建立 Task 當下的 host verify 不保證 trigger 時仍成立（Attempt #5 即因此 missed）；自建立 Task 起至 2026-10-02 00:05，主機必須保持開機且 Water 登入。Task 維持 StartWhenAvailable=False / WakeToRun=False，不補跑、不自行喚醒。",
+  "_baseline": "PRODUCTION PROVIDER CONSTRUCTION = VERIFIED；FIRST LIVE FULL MOCK = PASS；CROSS-ATTEMPT ISOLATION = PASS；SAME-ATTEMPT CRASH RECOVERY = PASS；Full Phase 6 = 6797/6797 PASS / 63 files / 0 FAIL。Attempt #1~#7 皆未完成 5 kW live leg，successful real 5 kW leg 仍為 0 次。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT8-20261002",
+  "target_date": "2026-10-02",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT8-20261002.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live/attempt8_20261002"
+}

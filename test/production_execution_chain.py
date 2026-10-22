@@ -119,6 +119,9 @@ class ExecutionResult:
     readback_reason: str = None
     readback_observed_state: str = None
     readback_elapsed_sec: float = None
+    # 🔴 2026-09-24 readback closure：保留 ReadBackVerifier 的觀測樣本，
+    #    供 6.10 artifact 記錄 readback evidence。**純 additive**。
+    readback_attempts: tuple = None
     lastcontrol_outcome: str = None
     lastcontrol_reason: str = None
     lastcontrol_written: bool = False
@@ -297,6 +300,7 @@ class ProductionExecutionChain:
                       readback_reason=getattr(rb, "reason", None),
                       readback_observed_state=getattr(rb, "observed_state", None),
                       readback_elapsed_sec=getattr(rb, "elapsed_sec", None),
+                      readback_attempts=getattr(rb, "attempts", None),
                       authorization_id=az.authorization_id,
                       authorization_state=az.state, consume_reason=creason)
 

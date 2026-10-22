@@ -1,0 +1,17 @@
+{
+  "_authorization": "使用者 2026-09-30 正式授權：2026-10-01 00:05–00:30 Asia/Taipei，唯一一次 Scheduled FIRST LIVE Attempt #7（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task、Attempt #8。",
+  "_supersedes": "Attempt #6（FIRST-LIVE-ATTEMPT6-20260930）= EXCEPTION_FAIL_CLOSED，failure_stage = DISPATCHER_CONSTRUCTION，root cause = DISPATCHER FACTORY SIGNATURE DEFECT（已修正並完成 regression closure）。本次使用全新 Attempt ID / config / ledger / artifact / wrapper / Task XML，不沿用 Attempt #5 / #6 任何 execution artifact。",
+  "_pre_field_six_step": "1 Full Phase 6 regression 6728/6728 PASS；2 validate-only rehearsal PASS（field_side_effects 0）；3 production construction smoke 57/57 PASS exit 0；4 fresh host verify PASS；5 fresh external baseline BASELINE_READY / EXTERNAL_RUNNING；6 fresh legacy Task scan PASS（7 個舊 Task 全 Disabled，無 future executable Task）。",
+  "_host_prerequisite": "HOST_POWERED_ON_REQUIRED = True。建立 Task 當下的 host verify 不保證 trigger 時仍成立（Attempt #5 即因此 missed）；自建立 Task 起至 2026-10-01 00:05，主機必須保持開機且 Water 登入。Task 維持 StartWhenAvailable=False / WakeToRun=False，不補跑、不自行喚醒。",
+  "_baseline": "PRODUCTION PROVIDER CONSTRUCTION = VERIFIED；FIRST LIVE FULL MOCK = PASS；Full Phase 6 = 6728/6728 PASS / 62 files / 0 FAIL。Attempt #1~#6 皆未完成 5 kW live leg，successful real 5 kW leg 仍為 0 次。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT7-20261001",
+  "target_date": "2026-10-01",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT7-20261001.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live/attempt7_20261001"
+}

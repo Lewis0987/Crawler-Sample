@@ -1,0 +1,16 @@
+{
+  "_authorization": "使用者 2026-09-24 正式授權：2026-09-25 00:05 OFF_PEAK 窗口，唯一一次 Scheduled FIRST LIVE Attempt #5（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task、Attempt #6。",
+  "_window_note": "授權僅指明 00:05 起；window_end 沿用 Attempt #2~#4 既有慣例 00:30（25 分鐘視窗）。",
+  "_baseline": "FULL LIVE-LEG READBACK = VERIFIED；SCHEDULED LIVE-LEG AUTHORIZATION = VERIFIED；FIRST LIVE MOCK SUCCESS = PASS；Full Phase 6 = 6671/6671 PASS / 61 files / 0 FAIL。Attempt #1~#4 皆未完成 5 kW live leg，successful real 5 kW leg 仍為 0 次。",
+  "_new_since_attempt4": "FirstLiveDispatchPermit（16 項前置）＋ first_live_dispatch_scope（scoped temporary enable，finally 無條件 False）＋ ScheduledLiveLegAuthorization（非互動 structured authorization，不依賴 stdin）＋ leg_reached_complete（LEG_COMPLETE 正面證據）＋ launcher pause intent hook。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT5-20260925",
+  "target_date": "2026-09-25",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT5-20260925.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live/attempt5_20260925"
+}

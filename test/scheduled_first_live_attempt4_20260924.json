@@ -1,0 +1,15 @@
+{
+  "_authorization": "使用者 2026-09-23 正式授權：2026-09-24 唯一一次 Scheduled FIRST LIVE Attempt #4（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task、Attempt #5。",
+  "_baseline": "Attempt #2 provider GATE A defects = FIXED/VERIFIED；Attempt #3 GATE A = FIELD PASS，PRE_PAUSE_PREFLIGHT defect = FIXED/OFFLINE VERIFIED；external_behaviour_known = CONFIGURED/VERIFIED（canonical = phase6_remote_adapter.external_liveness）；Attempt #3 reconstructed PRE_PAUSE = 11/11 PASS；Full Phase 6 = 6361/6361 PASS / 58 files / 0 FAIL。成功 5 kW live leg 尚未完成。",
+  "_note": "本次為第一次真正可能觸發 external pause 的 Attempt。pause INTENT 只在 PRE_PAUSE_PREFLIGHT PASS 且即將呼叫 pause sender 的前一刻才落盤。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT4-20260924",
+  "target_date": "2026-09-24",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT4-20260924.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live/attempt4_20260924"
+}

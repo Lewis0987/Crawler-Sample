@@ -1,0 +1,13 @@
+{
+  "_authorization": "使用者 2026-09-21 正式授權：2026-09-22 唯一一次 Scheduled FIRST LIVE Attempt #2（ONE-SHOT UNATTENDED COMMISSIONING）。非 recurring，非 Unattended LIVE，非 production automatic scheduling。",
+  "_scope": "只授權 CHARGE 5.0 kW x1。未授權 DISCHARGE、retry、其他日期、recurring task。",
+  "enabled": true,
+  "attempt_id": "FIRST-LIVE-ATTEMPT2-20260922",
+  "target_date": "2026-09-22",
+  "window_start": "00:05",
+  "window_end": "00:30",
+  "timezone": "Asia/Taipei",
+  "dependency_provider": "phase6_first_live_field",
+  "ledger_path": "../output/phase6_scheduled_first_live/FIRST-LIVE-ATTEMPT2-20260922.jsonl",
+  "artifact_dir": "../output/phase6_scheduled_first_live"
+}
