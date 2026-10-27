@@ -48,7 +48,7 @@ AUTO_MONITOR_DEBUG = True
 # ======================================================================
 # 取樣與計算
 # ======================================================================
-SAMPLE_INTERVAL_SEC = 5          # 取樣間隔（秒）
+SAMPLE_INTERVAL_SEC = 10          # 取樣間隔（秒），每N秒紀錄一筆紀錄
 POWER_SOURCE = "pcs"             # 實際功率主來源：pcs=totalActivePowerOfAcBus / battery_va=V×A
 IDLE_KW = 0.1                    # |功率| ≤ 此值視為待機（沿用既有 _BATTERY_IDLE_KW）
 ENERGY_METHOD = "trapezoid"      # 電量積分法：trapezoid（梯形）/ rectangle（矩形，備用）
@@ -732,6 +732,95 @@ CELL_MODE_BAND = {
     "standby":   {"label": "Standby",   "bg": "808080", "font": "FFFFFF"},   # 灰底白字
 }
 CELL_BAND_ORDER = ["discharge", "charge", "standby"]   # 由上而下排列（無資料的區塊不產生）
+
+# ======================================================================
+# Pack Data 工作表（2026-10-27 新增；純新增功能，不影響既有 9 個工作表）
+# ----------------------------------------------------------------------
+# 單一工作表內依序呈現：Snapshot Information → Pack Navigation →
+#   （每個 Pack）摘要 → Cell Detail → 回頂端連結。
+# 🔴 Pack 數量一律由快照的 packs 實際內容決定，**不硬編 14**。
+# 🔴 內部連結用 Excel internal hyperlink（"#'Pack Data'!A<row>"）；
+#    不使用 VBA、不使用 Macro、維持 .xlsx。
+# ======================================================================
+PACK_DATA_ENABLED = True            # False → 完全不產生此工作表，輸出與新增前一致
+PACK_DATA_SHEET = "Pack Data"
+# 取哪一筆快照："last"=最後一筆有效快照（session_end，預設）；"first"=第一筆
+PACK_DATA_SNAPSHOT = "last"
+
+# Snapshot Information 區塊標籤（顯示順序即此順序）
+PACK_DATA_INFO_LABELS = [
+    ("snapshot_id", "Snapshot ID"),
+    ("snapshot_reason", "Snapshot Reason"),
+    ("timestamp", "Timestamp"),
+    ("mode", "Mode"),
+    ("soc", "SOC (%)"),
+    ("power_kw", "Power (kW)"),
+]
+
+# 每個 Pack 摘要的欄位（snapshot summary 的機器欄位 → 顯示標籤）。
+# 🔴 一律取 API 原值，不自行重算，確保與 HMI UI 一致。
+PACK_DATA_SUMMARY_FIELDS = [
+    ("packNo", "Pack No."),
+    ("totalVoltage", "Pack Voltage (V)"),
+    ("maxCellVoltage", "Max Cell Voltage (V)"), ("maxCellNo", "Max Cell Voltage — Cell No."),
+    ("minCellVoltage", "Min Cell Voltage (V)"), ("minCellNo", "Min Cell Voltage — Cell No."),
+    ("maxTemp", "Max Cell Temperature (°C)"), ("maxTempCellNo", "Max Cell Temp — Cell No."),
+    ("minTemp", "Min Cell Temperature (°C)"), ("minTempCellNo", "Min Cell Temp — Cell No."),
+    ("socMax", "Max Cell SOC (%)"), ("socMin", "Min Cell SOC (%)"),
+    ("sohMax", "Max Cell SOH (%)"), ("sohMin", "Min Cell SOH (%)"),
+]
+
+# Cell Detail 表頭（順序固定）
+PACK_DATA_CELL_HEADERS = ["Cell No.", "Voltage (V)", "Temperature (°C)",
+                          "SOC (%)", "SOH (%)", "Balance Raw", "Balance Status"]
+
+# 數值格式
+PACK_DATA_VOLT_FORMAT = "0.000"
+PACK_DATA_TEMP_FORMAT = "0"
+PACK_DATA_PCT_FORMAT = "0"
+PACK_DATA_PACK_VOLT_FORMAT = "0.000"
+
+# 缺欄位時的顯示值（schema 1.0 舊快照沒有 SOC/SOH/Balance/summary）
+PACK_DATA_NA_TEXT = "N/A"
+PACK_DATA_LEGACY_NOTE = ("此快照為 schema 1.0（SOC / SOH / 均衡狀態 / Pack 摘要未保存）"
+                         "→ 相關欄位顯示 N/A。")
+
+# 🔴 均衡狀態語意尚未經設備文件確認，顯示時必須帶註記。
+PACK_DATA_BALANCE_NOTE = "＊均衡狀態文字依目前程式對照，尚待設備文件確認。"
+
+# 版面
+PACK_DATA_NAV_PER_ROW = 10          # Pack Navigation 每列幾個連結
+PACK_DATA_BLOCK_GAP = 2             # Pack 區塊之間的空白列數
+PACK_DATA_TOP_ANCHOR_ROW = 1        # 「回頂端」要跳回的列
+PACK_DATA_BACK_TO_TOP_TEXT = "↑ 回頂端"
+PACK_DATA_HYPERLINK_FONT_COLOR = "0563C1"
+PACK_DATA_TITLE_FILL = "2E75B6"     # 區塊標題底色（藍底白字，沿用 CELL_MODE_BAND charge 色）
+PACK_DATA_TITLE_FONT = "FFFFFF"
+PACK_DATA_HEADER_FILL = "D9E2F3"    # Cell Detail 表頭底色
+PACK_DATA_COL_WIDTHS = [12, 14, 18, 10, 10, 13, 16]
+
+# 🔴 Pack Data 不使用凍結窗格。
+#    凍結第 1 列時 A1 永遠在可視區內，點「↑ 回頂端」(target=A1) Excel 判定
+#    目標已可見 → 完全不捲動下方區域，看起來像沒有反應（Excel COM 實測：
+#    視窗首列停在 542 不變）。移除凍結後同一個連結實測回到首列 = 1。
+#    此設定只作用於 Pack Data，其他工作表的 freeze_panes 不受影響。
+PACK_DATA_FREEZE = None
+
+# 🔴 Pack Navigation 連結的「目標範圍高度」（列）。
+#    Excel internal hyperlink 無法指定捲動位置，只會做「最小捲動」把目標帶進
+#    畫面 —— 往下跳時目標會落在視窗最底列（實測：37 列視窗的第 36 列）。
+#    唯一能在純 .xlsx／無 VBA 下改變它的槓桿：把 target 改成「比視窗還高的
+#    範圍」A{r}:A{r+span-1}，此時 Excel 無法用最小捲動容納整個選取範圍，
+#    會改以範圍左上角對齊視窗左上角 → Pack 摘要落在最頂列（實測 0/28 例外）。
+#    實際 span = max(該 Pack 區塊高度, 本值)。
+#    設為 0 或 None → 回到單一儲存格 target（Excel 原生最小捲動行為）。
+#    ⚠ 成立條件：span ≥ 視窗可視列數。Excel COM 實測（1080p 最大化）：
+#        縮放 100% = 38 列、70% = 55 列、55% = 70 列、40% = 96 列、30% = 128 列。
+#      span=80 時 100/70/55% 皆對齊頂端，40% 起退回最小捲動；改用 120 可再涵蓋
+#      4K 螢幕 100% 顯示（約 100 列）。視窗可視列數若仍大於本值，目標列依舊正確，
+#      只是不在最頂 —— 這是 Excel 的限制，不是程式可以控制的。
+PACK_DATA_NAV_SPAN_ROWS = 120
+
 
 # Cell 工作表版面 / 列印
 # Cell Volt./Temp. 兩表所有字體在「目前實際大小」上的加減量（pt）；正=放大、0=不變。

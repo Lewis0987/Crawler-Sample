@@ -172,7 +172,13 @@ def to_cell_csv_rows(cell_rows):
 #   create_cell_snapshot     由原始 data 建立一筆快照（不連網；含 status/hash/count）
 #   validate_cell_snapshot   驗證完整性（缺 Pack / cell 數 / 排序 / 無效值）→ warning 清單
 # ======================================================================
-CELL_SNAPSHOT_SCHEMA_VERSION = "1.0"   # 快照結構版本（未來加 Cell Resistance/Balance/Alarm 時 +1）
+CELL_SNAPSHOT_SCHEMA_VERSION = "1.1"   # 快照結構版本
+# 1.0 → 1.1（2026-10-27）：packs[] 新增 cell_soc / cell_soh / cell_balance ＋ summary。
+#   這些欄位原本就在 getPackInformation 的同一份 payload 內，只是 normalize 時被丟棄；
+#   保存它們**不新增任何 API request**。供 report 的 Pack Data 工作表使用。
+#   🔴 1.0 舊快照沒有新欄位 → 讀取端一律以 .get() 取用並顯示 N/A，不得擲例外。
+#   🔴 _cell_data_hash() 刻意**不**納入新欄位 —— 否則 snapshot dedupe 條件會變，
+#      等同偷改 snapshot 擷取 policy。
 
 
 def fetch_battery_cell_data(client):
@@ -197,24 +203,54 @@ def _cell_num(v):
 def normalize_pack_cell_data(data):
     """
     把 getPackInformation 原始 list 正規化為統一結構（重用 build_cell_rows，維持 packList 原順序）：
-      { "<packNo>": {"cell_voltage": [...], "cell_temperature": [...], "cell_no": [...]}, ... }
+      { "<packNo>": {"cell_voltage": [...], "cell_temperature": [...], "cell_no": [...],
+                     "cell_soc": [...], "cell_soh": [...], "cell_balance": [...],
+                     "summary": {...}}, ... }
     - packNo 以字串為鍵；cell 順序 = 設備 packList 原順序（與 UI 一致，不重新排序）。
     - 電壓/溫度保存原始數值（無效值存 None，計算時再排除；此處不四捨五入）。
-    - 電壓與溫度分開兩個 list，索引一一對應同一顆 cell，避免欄位錯置。
+    - 各 list 索引一一對應同一顆 cell，避免欄位錯置。
+
+    🔴 schema 1.1（2026-10-27）新增三個 cell list ＋ 每 pack 的 summary。
+       OLD : 只保留 cell_voltage / cell_temperature / cell_no，payload 內的
+             soc / soh / equilibriumState 與 pack 層 sumVoltage、max*/min* 全部丟棄。
+       NEW : 一併保存。資料來自**同一次** build_cell_rows(data) /
+             summarize_pack_summary(data)，**不新增任何 API request**。
+       WHY : report 的 Pack Data 工作表需要這些欄位；若不在此保存，就只能再打一次 API。
+       EVIDENCE : 2026-10-27 output/battery_cells.json 實測每 cell 皆含
+             soc / soh / balanceStatus；output/battery_data.json 每 pack 皆含
+             sumVoltage 與 8 組 max/min（＋全域 cell 編號 index）。
+
+    🔴 cell_balance 保存 **raw value**（不轉文字）—— 0/1 的語意尚未由設備文件確認，
+       文字對照只在顯示層用 _balance_text() 加上推定註記。
+    🔴 summary 直接採 API 原值，**不自行重算**，確保與 HMI UI 一致。
     """
     cell_rows, _per_pack = build_cell_rows(data)
     packs = {}
     for c in cell_rows:
         pk = str(c.get("packNo"))
-        d = packs.setdefault(pk, {"cell_voltage": [], "cell_temperature": [], "cell_no": []})
+        d = packs.setdefault(pk, {"cell_voltage": [], "cell_temperature": [], "cell_no": [],
+                                  "cell_soc": [], "cell_soh": [], "cell_balance": []})
         d["cell_voltage"].append(_cell_num(c.get("voltage")))
         d["cell_temperature"].append(_cell_num(c.get("temperature")))
         d["cell_no"].append(c.get("cellNo"))
+        d["cell_soc"].append(_cell_num(c.get("soc")))
+        d["cell_soh"].append(_cell_num(c.get("soh")))
+        d["cell_balance"].append(c.get("balanceStatus"))       # raw，不轉文字
+    # Pack 摘要（API 原值；同一份 data，不再打 API）
+    for ps in (summarize_pack_summary(data) or []):
+        pk = str(ps.get("packNo"))
+        if pk in packs:
+            packs[pk]["summary"] = dict(ps)
     return packs
 
 
 def _cell_data_hash(packs):
-    """Voltage+Temperature 內容雜湊（快照去重用；與 timestamp/mode/soc/power 併用判斷是否重複）。"""
+    """Voltage+Temperature 內容雜湊（快照去重用；與 timestamp/mode/soc/power 併用判斷是否重複）。
+
+    🔴 schema 1.1 新增的 cell_soc / cell_soh / cell_balance / summary **刻意不納入**。
+       納入會讓 dedupe 條件變嚴（SOC 幾乎每次取樣都不同）→ 快照數增加
+       → 等同偷改 snapshot 擷取 policy。本函式對 1.0 / 1.1 的輸出必須完全相同。
+    """
     import hashlib
     payload = []
     for pk in sorted(packs.keys(), key=lambda x: (len(x), x)):

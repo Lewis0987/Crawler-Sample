@@ -1718,6 +1718,266 @@ def create_cell_sheet(wb, sheet_name, data_type, snapshots, *, number_format, st
 _METER_EXCEL_EPOCH = datetime(1899, 12, 30)
 
 
+# ======================================================================
+# Pack Data 工作表（2026-10-27 新增）
+# ----------------------------------------------------------------------
+# 單一工作表內依序呈現：
+#   Snapshot Information → Pack Navigation → （每個 Pack）摘要 → Cell Detail
+#   → 「↑ 回頂端」
+# 🔴 Pack 數量 / Cell 數量一律由快照 packs 的實際內容決定，**不硬編 14 / 20**。
+# 🔴 Max/Min 一律取快照 summary 的 API 原值，**不自行重算**（與 HMI UI 一致）。
+# 🔴 內部連結用 Excel internal hyperlink；不使用 VBA / Macro，維持 .xlsx。
+# 🔴 schema 1.0 舊快照沒有 cell_soc / cell_soh / cell_balance / summary →
+#    一律以 .get() 取用並顯示 N/A，**不得擲例外**。
+# ======================================================================
+def _pack_sort_key(pk):
+    """Pack 鍵排序：能轉 int 的照數值排，不能的排在最後並照字串排。"""
+    try:
+        return (0, int(pk), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(pk))
+
+
+def pick_pack_data_snapshot(snapshots, which=None):
+    """
+    選出 Pack Data 要呈現的那一筆快照（方案 A：單一快照）。
+
+    which="last"（預設）→ 最後一筆**有效**快照；"first" → 第一筆有效快照。
+    有效 = cell_data_status == "ok" 且 packs 非空。全部無效時回 None。
+    🔴 這只是「渲染時選哪一筆」，**完全不改變快照擷取 policy**
+       （session_start / 方向切換 / session_end / dedupe 全部維持原設計）。
+    """
+    ok = [s for s in (snapshots or [])
+          if isinstance(s, dict) and s.get("cell_data_status") == "ok" and s.get("packs")]
+    if not ok:
+        return None
+    w = (which or getattr(CFG, "PACK_DATA_SNAPSHOT", "last") or "last").lower()
+    return ok[0] if w == "first" else ok[-1]
+
+
+def create_pack_data_sheet(wb, snapshot, sheet_name=None):
+    """
+    建立 Pack Data 工作表。回傳 (worksheet, meta_dict)；snapshot 為 None 時回 (None, {})。
+
+    meta_dict 供自測/稽核使用：pack_count / cell_count / pack_rows / legacy / nav_targets。
+    """
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    if not snapshot or not snapshot.get("packs"):
+        return None, {}
+
+    name = sheet_name or CFG.PACK_DATA_SHEET
+    ws = wb.create_sheet(name)
+    NA = CFG.PACK_DATA_NA_TEXT
+    ncol = len(CFG.PACK_DATA_CELL_HEADERS)
+
+    title_fill = PatternFill("solid", fgColor=CFG.PACK_DATA_TITLE_FILL)
+    title_font = Font(bold=True, color=CFG.PACK_DATA_TITLE_FONT)
+    hdr_fill = PatternFill("solid", fgColor=CFG.PACK_DATA_HEADER_FILL)
+    hdr_font = Font(bold=True)
+    link_font = Font(color=CFG.PACK_DATA_HYPERLINK_FONT_COLOR, underline="single")
+    border = _thin_border()
+    center = Alignment(horizontal="center", vertical="center")
+
+    def link_to(row):
+        """同檔內部連結字串；工作表名含空白，必須用單引號包起來。"""
+        return "#'%s'!A%d" % (name, row)
+
+    def link_to_block(row, height):
+        """
+        Pack Navigation 專用：目標是**一段範圍**而不是單一儲存格。
+
+        🔴 Excel internal hyperlink 不能指定捲動位置，只會「最小捲動」把目標帶進
+           畫面；往下跳時目標因此停在視窗最底列。把 target 改成比視窗更高的範圍
+           後，Excel 無法用最小捲動容納整個選取範圍，改以範圍左上角對齊視窗左上角
+           → Pack 摘要落到最頂列。span=0/None 時退回單一儲存格（原生行為）。
+        """
+        span = getattr(CFG, "PACK_DATA_NAV_SPAN_ROWS", 0) or 0
+        if span <= 0:
+            return link_to(row)
+        span = max(int(span), int(height or 1))
+        return "#'%s'!A%d:A%d" % (name, row, row + span - 1)
+
+    def block_title(row, text):
+        ws.cell(row=row, column=1, value=text)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncol)
+        for c in range(1, ncol + 1):
+            cl = ws.cell(row=row, column=c)
+            cl.fill = title_fill
+            cl.font = title_font
+            cl.alignment = Alignment(horizontal="left", vertical="center")
+
+    packs = snapshot.get("packs") or {}
+    pack_keys = sorted(packs.keys(), key=_pack_sort_key)
+    # 🔴 Pack 數量動態；不硬編
+    n_packs = len(pack_keys)
+    # schema 判定：只要任一 pack 缺新欄位就視為 legacy（顯示 N/A ＋ 註記）
+    legacy = any(("summary" not in packs[k] or "cell_soc" not in packs[k])
+                 for k in pack_keys)
+
+    r = 1
+    ws.cell(row=r, column=1, value="Pack Data")
+    ws.cell(row=r, column=1).font = Font(bold=True, size=14)
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+    r += 2
+
+    # ---------------- Snapshot Information ----------------
+    block_title(r, "【Snapshot Information】")
+    r += 1
+    for key, label in CFG.PACK_DATA_INFO_LABELS:
+        v = snapshot.get(key)
+        ws.cell(row=r, column=1, value=label).font = hdr_font
+        ws.cell(row=r, column=2, value=NA if v is None else v)
+        r += 1
+    ws.cell(row=r, column=1, value="Pack Count").font = hdr_font
+    ws.cell(row=r, column=2, value=n_packs)
+    r += 1
+    ws.cell(row=r, column=1, value="Cell Count").font = hdr_font
+    ws.cell(row=r, column=2, value=snapshot.get("cell_count"))
+    r += 1
+    ws.cell(row=r, column=1, value="Snapshot Schema").font = hdr_font
+    ws.cell(row=r, column=2, value="1.0（舊）" if legacy else "1.1")
+    r += 2
+
+    # 註記
+    ws.cell(row=r, column=1, value=CFG.PACK_DATA_BALANCE_NOTE)
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+    r += 1
+    if legacy:
+        ws.cell(row=r, column=1, value=CFG.PACK_DATA_LEGACY_NOTE)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+        r += 1
+    r += 1
+
+    # ---------------- Pack Navigation（先占位，稍後回填連結）----------------
+    block_title(r, "【Pack Navigation】")
+    r += 1
+    per = max(1, int(getattr(CFG, "PACK_DATA_NAV_PER_ROW", 10)))
+    nav_cells = []                      # [(row, col), ...] 與 pack_keys 同序
+    for i in range(n_packs):
+        nav_cells.append((r + i // per, 1 + i % per))
+    nav_rows = -(-n_packs // per) if n_packs else 0
+    r += nav_rows + 1
+
+    # ---------------- 每個 Pack ----------------
+    pack_rows = {}                      # packNo(str) -> 區塊標題列
+    pack_block_h = {}                   # packNo(str) -> 區塊高度（標題列 ~ 回頂端列）
+    for pk in pack_keys:
+        d = packs.get(pk) or {}
+        summary = d.get("summary") or {}
+        vs = d.get("cell_voltage") or []
+        ts = d.get("cell_temperature") or []
+        nos = d.get("cell_no") or []
+        socs = d.get("cell_soc") or []
+        sohs = d.get("cell_soh") or []
+        bals = d.get("cell_balance") or []
+
+        pack_rows[str(pk)] = r
+        block_title(r, "【Pack %s 摘要】" % pk)
+        r += 1
+        for key, label in CFG.PACK_DATA_SUMMARY_FIELDS:
+            ws.cell(row=r, column=1, value=label).font = hdr_font
+            if key == "packNo":
+                v = summary.get("packNo", _as_int_or(pk))
+            else:
+                v = summary.get(key, None)
+            c = ws.cell(row=r, column=2, value=NA if v is None else v)
+            if isinstance(v, (int, float)):
+                if key in ("totalVoltage",):
+                    c.number_format = CFG.PACK_DATA_PACK_VOLT_FORMAT
+                elif key in ("maxCellVoltage", "minCellVoltage"):
+                    c.number_format = CFG.PACK_DATA_VOLT_FORMAT
+                elif key in ("maxTemp", "minTemp"):
+                    c.number_format = CFG.PACK_DATA_TEMP_FORMAT
+                elif key in ("socMax", "socMin", "sohMax", "sohMin"):
+                    c.number_format = CFG.PACK_DATA_PCT_FORMAT
+            r += 1
+
+        # Cell Detail
+        block_title(r, "【Pack %s Cell Detail】" % pk)
+        r += 1
+        for i, h in enumerate(CFG.PACK_DATA_CELL_HEADERS, start=1):
+            c = ws.cell(row=r, column=i, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = center
+            c.border = border
+        r += 1
+        # 🔴 cell 數依實際資料長度，不硬編 20
+        ncell = max(len(vs), len(ts), len(nos), len(socs), len(sohs), len(bals))
+        for i in range(ncell):
+            raw_bal = bals[i] if i < len(bals) else None
+            vals = [
+                nos[i] if i < len(nos) else NA,
+                vs[i] if i < len(vs) and vs[i] is not None else NA,
+                ts[i] if i < len(ts) and ts[i] is not None else NA,
+                socs[i] if i < len(socs) and socs[i] is not None else NA,
+                sohs[i] if i < len(sohs) and sohs[i] is not None else NA,
+                NA if raw_bal is None else raw_bal,
+                _pack_balance_text(raw_bal, NA),
+            ]
+            fmts = [None, CFG.PACK_DATA_VOLT_FORMAT, CFG.PACK_DATA_TEMP_FORMAT,
+                    CFG.PACK_DATA_PCT_FORMAT, CFG.PACK_DATA_PCT_FORMAT, None, None]
+            for ci, v in enumerate(vals, start=1):
+                c = ws.cell(row=r, column=ci, value=v)
+                c.border = border
+                c.alignment = center
+                f = fmts[ci - 1]
+                if f and isinstance(v, (int, float)):
+                    c.number_format = f
+            r += 1
+
+        # 回頂端
+        c = ws.cell(row=r, column=1, value=CFG.PACK_DATA_BACK_TO_TOP_TEXT)
+        c.hyperlink = link_to(CFG.PACK_DATA_TOP_ANCHOR_ROW)
+        c.font = link_font
+        pack_block_h[str(pk)] = r - pack_rows[str(pk)] + 1
+        r += 1 + int(getattr(CFG, "PACK_DATA_BLOCK_GAP", 2))
+
+    # ---------------- 回填 Pack Navigation 連結 ----------------
+    nav_targets = {}
+    for pk, (nr, nc) in zip(pack_keys, nav_cells):
+        c = ws.cell(row=nr, column=nc, value="Pack %s" % pk)
+        c.hyperlink = link_to_block(pack_rows[str(pk)], pack_block_h.get(str(pk), 1))
+        c.font = link_font
+        c.alignment = center
+        nav_targets[str(pk)] = c.hyperlink.target
+
+    # ---------------- 版面 ----------------
+    for i, w in enumerate(CFG.PACK_DATA_COL_WIDTHS[:ncol], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    # 🔴 None → 不凍結（見 CFG.PACK_DATA_FREEZE 說明：凍結會讓「回頂端」失效）
+    ws.freeze_panes = getattr(CFG, "PACK_DATA_FREEZE", None)
+
+    return ws, {"pack_count": n_packs,
+                "cell_count": snapshot.get("cell_count"),
+                "pack_rows": pack_rows, "pack_block_h": pack_block_h,
+                "legacy": legacy, "nav_cells": nav_cells,
+                "nav_targets": nav_targets, "last_row": r}
+
+
+def _as_int_or(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def _pack_balance_text(raw, na):
+    """
+    均衡狀態文字。🔴 語意尚未由設備文件確認 —— 對照自 BDS.BALANCE_MAP，
+    非 0 的對照值一律加上 ＊ 標示為推定（見 CFG.PACK_DATA_BALANCE_NOTE）。
+    查不到對照 → 原值字串化，不臆測。
+    """
+    if raw is None:
+        return na
+    txt = BDS.BALANCE_MAP.get(raw, None)
+    if txt is None:
+        return str(raw)
+    return txt if str(raw) == "0" else txt + "＊"
+
+
 def _meter_serial(ts):
     """datetime → Excel 序列值（圖表 X 軸上下限用）。"""
     return (ts - _METER_EXCEL_EPOCH).total_seconds() / 86400.0
@@ -3573,6 +3833,23 @@ class ReportSession:
             print("  [Cell] 無 Cell 快照（此報告建立時尚未支援 Cell 快照功能）"
                   "→ 略過 Cell Volt./Cell Temp.，不產生空白工作表。")
 
+        # ================= Pack Data（Cell Temp. 之後、Raw Data 之前）=================
+        # 🔴 純新增工作表；既有 9 個工作表的內容/欄位/格式/圖表完全不受影響。
+        # 🔴 PACK_DATA_ENABLED=False → 完全不建立，輸出與新增此功能前一致。
+        if getattr(CFG, "PACK_DATA_ENABLED", True) and self.cell_snapshots:
+            _pd_snap = pick_pack_data_snapshot(self.cell_snapshots)
+            if _pd_snap is None:
+                print("  [Pack Data] 無有效 Cell 快照（全部 cell_data_status=failed）"
+                      "→ 略過 Pack Data，不產生空白工作表。")
+            else:
+                _pd_ws, _pd_meta = create_pack_data_sheet(wb, _pd_snap)
+                if _pd_ws is not None:
+                    print("  [Pack Data] %s（%s）：%d Pack / %d Cell%s"
+                          % (_pd_snap.get("snapshot_id"), _pd_snap.get("snapshot_reason"),
+                             _pd_meta.get("pack_count"), _pd_meta.get("cell_count") or 0,
+                             "｜schema 1.0 舊快照，SOC/SOH/均衡/Pack 摘要顯示 N/A"
+                             if _pd_meta.get("legacy") else ""))
+
         # Summary 頁只保留摘要與統計（不放任何圖表）。
 
         # ================= Sheet 6：Raw Data（完整欄位，不刪任何欄）=================
@@ -4886,6 +5163,9 @@ def selftest():
     # ---- Cell 快照情境驗證（read_all/_fetch_cell_packs 已還原，內部自帶 monkeypatch）----
     _selftest_cell_snapshots(check, output_root)
 
+    # ---- Pack Data 工作表驗證（純離線合成資料；不觸網、不產生正式報告）----
+    _selftest_pack_data(check)
+
     ok = all(results)
     print(f"\n== SelfTest {'PASS' if ok else 'FAIL'}（{sum(results)}/{len(results)} 檢查通過）==")
     if folder:
@@ -4895,6 +5175,231 @@ def selftest():
             p = os.path.join(folder, name)
             print(f"  {'✓' if os.path.exists(p) else '✗'} {name}")
         print(f"  資料夾：{folder}")
+
+
+def _fake_pack_summary(data):
+    """
+    selftest 專用：為 _fake_pack_data() 的合成 pack list 補上 pack 層摘要欄位
+    （sumVoltage / max*/min* / *Index），模擬 getPackInformation 的完整 payload。
+    🔴 只在測試內使用；production 一律取 API 原值，不自行計算。
+    """
+    out = []
+    for p_ in data:
+        cells = p_.get("packList") or []
+        vs = [(c.get("voltage"), c.get("sort")) for c in cells
+              if isinstance(c.get("voltage"), (int, float))
+              and c.get("voltage") == c.get("voltage")]
+        ts = [(c.get("temperature"), c.get("sort")) for c in cells
+              if isinstance(c.get("temperature"), (int, float))]
+        socs = [c.get("soc") for c in cells if isinstance(c.get("soc"), (int, float))]
+        sohs = [c.get("soh") for c in cells if isinstance(c.get("soh"), (int, float))]
+        q = dict(p_)
+        if vs:
+            q["sumVoltage"] = round(sum(v for v, _ in vs), 3)
+            q["maxVoltage"], q["maxVoltageIndex"] = max(vs)
+            q["minVoltage"], q["minVoltageIndex"] = min(vs)
+        if ts:
+            q["maxTemperature"], q["maxTemperatureIndex"] = max(ts)
+            q["minTemperature"], q["minTemperatureIndex"] = min(ts)
+        if socs:
+            q["maxSoc"], q["minSoc"] = max(socs), min(socs)
+        if sohs:
+            q["maxSoh"], q["minSoh"] = max(sohs), min(sohs)
+        out.append(q)
+    return out
+
+
+def _selftest_pack_data(check):
+    """
+    Pack Data 工作表驗證（純離線合成資料；**不觸網、不產生正式報告**）。
+    涵蓋：Pack/Cell 數量動態、摘要取 API 原值、Cell Detail 逐欄、Balance raw/status、
+          internal hyperlink（Navigation / 回頂端）、schema 1.0 相容、
+          _cell_data_hash 不變、PACK_DATA_ENABLED 開關、快照選擇。
+    """
+    import copy
+    from openpyxl import Workbook
+
+    print("\n[驗證：Pack Data 工作表]")
+    try:
+        # ---------- 合成 schema 1.1 快照（19 pack × 20 cell）----------
+        raw = _fake_pack_summary(_fake_pack_data())
+        snap = BDS.create_cell_snapshot(raw, "2026-03-12 13:00:00", "discharge",
+                                        55.0, -5.0, "session_end", snapshot_id="SNAP-002")
+        check("Pack Data：合成快照 cell_data_status=ok", snap["cell_data_status"] == "ok")
+        check("Pack Data：schema 版本為 1.1", BDS.CELL_SNAPSHOT_SCHEMA_VERSION == "1.1")
+        p1 = snap["packs"]["1"]
+        check("Pack Data：快照保存 cell_soc/cell_soh/cell_balance",
+              all(k in p1 for k in ("cell_soc", "cell_soh", "cell_balance")))
+        check("Pack Data：快照保存 pack summary", isinstance(p1.get("summary"), dict))
+
+        wb = Workbook()
+        ws, meta = create_pack_data_sheet(wb, snap)
+        check("Pack Data：工作表已建立", ws is not None and ws.title == CFG.PACK_DATA_SHEET)
+        check(f"Pack Data：Pack 數依實際資料（{meta['pack_count']}）", meta["pack_count"] == 19)
+        check(f"Pack Data：Cell 數依實際資料（{meta['cell_count']}）", meta["cell_count"] == 380)
+        check("Pack Data：非 legacy", meta["legacy"] is False)
+
+        cm = {(c.row, c.column): c.value for row in ws.iter_rows() for c in row
+              if c.value is not None}
+
+        def sval(pk, label):
+            r0 = meta["pack_rows"][str(pk)]
+            for r in range(r0 + 1, r0 + 1 + len(CFG.PACK_DATA_SUMMARY_FIELDS)):
+                if cm.get((r, 1)) == label:
+                    return cm.get((r, 2))
+            return "<missing>"
+
+        api = {p_["packNo"]: p_ for p_ in raw}
+        ok_sum = True
+        for pk in api:
+            a = api[pk]
+            ok_sum &= (sval(pk, "Pack Voltage (V)") == a["sumVoltage"]
+                       and sval(pk, "Max Cell Voltage (V)") == a["maxVoltage"]
+                       and sval(pk, "Max Cell Voltage — Cell No.") == a["maxVoltageIndex"]
+                       and sval(pk, "Min Cell Voltage (V)") == a["minVoltage"]
+                       and sval(pk, "Min Cell Voltage — Cell No.") == a["minVoltageIndex"]
+                       and sval(pk, "Max Cell Temperature (°C)") == a["maxTemperature"]
+                       and sval(pk, "Max Cell Temp — Cell No.") == a["maxTemperatureIndex"]
+                       and sval(pk, "Min Cell Temperature (°C)") == a["minTemperature"]
+                       and sval(pk, "Min Cell Temp — Cell No.") == a["minTemperatureIndex"]
+                       and sval(pk, "Max Cell SOC (%)") == a["maxSoc"]
+                       and sval(pk, "Min Cell SOC (%)") == a["minSoc"]
+                       and sval(pk, "Max Cell SOH (%)") == a["maxSoh"]
+                       and sval(pk, "Min Cell SOH (%)") == a["minSoh"])
+        check("Pack Data：全 Pack 摘要 13 項皆等於 API 原值（未重算）", ok_sum)
+
+        # ---------- Cell Detail ----------
+        HDR = CFG.PACK_DATA_CELL_HEADERS
+
+        def detail(pk):
+            r0 = meta["pack_rows"][str(pk)]
+            hr = None
+            for r in range(r0, r0 + 400):
+                if cm.get((r, 1)) == HDR[0] and cm.get((r, 2)) == HDR[1]:
+                    hr = r
+                    break
+            rows_ = []
+            r = hr + 1
+            while (cm.get((r, 2)) is not None
+                   and cm.get((r, 1)) != CFG.PACK_DATA_BACK_TO_TOP_TEXT):
+                rows_.append([cm.get((r, c)) for c in range(1, len(HDR) + 1)])
+                r += 1
+            return hr, rows_
+
+        hr1, d1 = detail(1)
+        check("Pack Data：Cell Detail 表頭 7 欄正確",
+              [cm.get((hr1, c)) for c in range(1, len(HDR) + 1)] == HDR)
+        check("Pack Data：Pack 1 有 20 列 Cell", len(d1) == 20)
+        src1 = {c["sort"]: c for c in raw[0]["packList"]}
+        ok_cell = True
+        for row in d1:
+            c0 = src1[row[0]]
+            ok_cell &= (row[1] == c0["voltage"] and row[2] == c0["temperature"]
+                        and row[3] == c0["soc"] and row[4] == c0["soh"]
+                        and row[5] == c0["equilibriumState"])
+        check("Pack Data：Cell Voltage/Temp/SOC/SOH/Balance Raw 逐欄正確", ok_cell)
+        check("Pack Data：Balance Status 文字（0→無均衡）",
+              all(r[6] == "無均衡" for r in d1))
+        _, d2 = detail(2)
+        check("Pack Data：Cell No. 為全域編號（Pack 2 = 21~40）",
+              [r[0] for r in d2] == list(range(21, 41)))
+
+        # equilibriumState=1 → 帶推定星號
+        raw_b = copy.deepcopy(raw)
+        raw_b[0]["packList"][0]["equilibriumState"] = 1
+        snap_b = BDS.create_cell_snapshot(raw_b, "t", "discharge", 1, 0, "session_end")
+        wbb = Workbook()
+        wsb, mb = create_pack_data_sheet(wbb, snap_b)
+        cmb = {(c.row, c.column): c.value for row in wsb.iter_rows() for c in row}
+        rb = mb["pack_rows"]["1"]
+        bal_txt = [cmb.get((r, 7)) for r in range(rb, rb + 60)]
+        check("Pack Data：Balance Status 1 → 均衡中＊（推定標示）", "均衡中＊" in bal_txt)
+
+        # ---------- hyperlink ----------
+        # 🔴 Navigation 的 target 是「範圍」而非單格：Excel 只做最小捲動，
+        #    單格 target 往下跳會停在視窗最底列（Excel COM 實測 37 列視窗第 36 列）；
+        #    範圍高於視窗時 Excel 改以左上角對齊 → Pack 摘要落在最頂列。
+        span_cfg = getattr(CFG, "PACK_DATA_NAV_SPAN_ROWS", 0) or 0
+        nav_ok = True
+        span_ok = True
+        for i, pk in enumerate(sorted(snap["packs"].keys(), key=_pack_sort_key)):
+            nr, nc = meta["nav_cells"][i]
+            c = ws.cell(row=nr, column=nc)
+            r0 = meta["pack_rows"][str(pk)]
+            if span_cfg > 0:
+                sp = max(int(span_cfg), int(meta["pack_block_h"][str(pk)]))
+                want = "#'%s'!A%d:A%d" % (CFG.PACK_DATA_SHEET, r0, r0 + sp - 1)
+                span_ok &= (sp >= meta["pack_block_h"][str(pk)] and sp >= span_cfg)
+            else:
+                want = "#'%s'!A%d" % (CFG.PACK_DATA_SHEET, r0)
+            got = c.hyperlink.target if c.hyperlink is not None else None
+            nav_ok &= (c.value == "Pack %s" % pk and got == want)
+        check("Pack Data：Pack Navigation internal hyperlink 全部正確", nav_ok)
+        check("Pack Data：Navigation target 範圍高度 ≥ max(區塊高度, 設定值)", span_ok)
+        check("Pack Data：Navigation target 起點 = 該 Pack 摘要標題列",
+              all(meta["nav_targets"][str(pk)].split("!A")[1].split(":")[0]
+                  == str(meta["pack_rows"][str(pk)]) for pk in meta["pack_rows"]))
+        check("Pack Data：不使用凍結窗格（否則回頂端不會捲動）",
+              ws.freeze_panes in (None, "A1"))
+        back = sum(1 for r in range(1, ws.max_row + 1)
+                   if ws.cell(row=r, column=1).value == CFG.PACK_DATA_BACK_TO_TOP_TEXT
+                   and ws.cell(row=r, column=1).hyperlink is not None
+                   and ws.cell(row=r, column=1).hyperlink.target
+                   == "#'%s'!A%d" % (CFG.PACK_DATA_SHEET, CFG.PACK_DATA_TOP_ANCHOR_ROW))
+        check(f"Pack Data：每個 Pack 皆有回頂端連結（{back}）", back == meta["pack_count"])
+        check("Pack Data：Snapshot Information 與均衡註記存在",
+              any(v == CFG.PACK_DATA_BALANCE_NOTE for v in cm.values())
+              and any(v == "Snapshot ID" for v in cm.values()))
+
+        # ---------- 動態 Pack/Cell 數 ----------
+        raw3 = _fake_pack_summary(_fake_pack_data(npacks=3, ncells=5))
+        s3 = BDS.create_cell_snapshot(raw3, "t", "charge", 1, 0, "session_start")
+        _w3, m3 = create_pack_data_sheet(Workbook(), s3)
+        check("Pack Data：Pack 數動態＝3（不硬編）", m3["pack_count"] == 3)
+        check("Pack Data：Cell 數動態＝15（不硬編）", m3["cell_count"] == 15)
+
+        # ---------- schema 1.0 相容 ----------
+        s10 = copy.deepcopy(snap)
+        for k in s10["packs"]:
+            for f in ("cell_soc", "cell_soh", "cell_balance", "summary"):
+                s10["packs"][k].pop(f, None)
+        try:
+            _w10, m10 = create_pack_data_sheet(Workbook(), s10)
+            check("Pack Data：schema 1.0 舊快照不擲例外", True)
+            check("Pack Data：schema 1.0 判定為 legacy", m10["legacy"] is True)
+            check("Pack Data：schema 1.0 Pack 數仍正確", m10["pack_count"] == 19)
+        except Exception as e:
+            check(f"Pack Data：schema 1.0 舊快照不擲例外（{e}）", False)
+
+        # ---------- dedupe hash 不變 ----------
+        p11 = snap["packs"]
+        p10 = {k: {f: v[f] for f in ("cell_voltage", "cell_temperature", "cell_no")}
+               for k, v in p11.items()}
+        check("Pack Data：_cell_data_hash(1.1) == _cell_data_hash(1.0)",
+              BDS._cell_data_hash(p11) == BDS._cell_data_hash(p10))
+        pm = copy.deepcopy(p11)
+        pm["1"]["cell_soc"][0] = 7.0
+        pm["1"]["cell_balance"][0] = 1
+        pm["1"]["summary"]["socMax"] = 7
+        check("Pack Data：改 SOC/Balance/summary 不改變 hash（dedupe policy 不變）",
+              BDS._cell_data_hash(pm) == BDS._cell_data_hash(p11))
+
+        # ---------- 快照選擇 ----------
+        check("Pack Data：預設取最後一筆有效快照",
+              pick_pack_data_snapshot([s3, snap])["snapshot_id"] == "SNAP-002")
+        check("Pack Data：which=first 取第一筆",
+              pick_pack_data_snapshot([s3, snap], "first") is s3)
+        bad = BDS.create_cell_snapshot(None, "t", "standby", 1, 0, "session_end")
+        check("Pack Data：全部 failed → None", pick_pack_data_snapshot([bad]) is None)
+        check("Pack Data：failed 快照被略過", pick_pack_data_snapshot([bad, snap]) is snap)
+
+        # ---------- 開關 ----------
+        check("Pack Data：PACK_DATA_ENABLED 存在且預設為 True",
+              getattr(CFG, "PACK_DATA_ENABLED", None) is True)
+        check("Pack Data：空快照 → 不建立工作表（不產生空白表）",
+              create_pack_data_sheet(Workbook(), None)[0] is None)
+    except Exception as e:
+        check(f"Pack Data 驗證發生例外：{type(e).__name__}: {e}", False)
 
 
 def _print_final(sess, stats):
