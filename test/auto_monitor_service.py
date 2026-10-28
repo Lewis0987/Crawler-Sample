@@ -35,6 +35,8 @@ auto_monitor_service.py — Auto Monitor Service（Phase 4.3：可獨立執行�
 執行緒
     本檔**不建立任何執行緒**。監看迴圈跑在主執行緒；唯一的背景執行緒是
     Monitor Core 的取樣執行緒（_report_bg_start），且全程最多一條。
+    P3 例外：CERT_MODE_ENABLED=True 時，cert_service 另起認證用的請求處理與取樣兩條執行緒
+    （預設關閉；關閉時本段敘述不變）。
 
 尚未涵蓋（Phase 4.4 Ownership 才處理）
     多行程並存無互斥：同時啟動兩個 Service（或 Service + Dashboard）會各自持有
@@ -257,6 +259,13 @@ def run(interval=DEFAULT_INTERVAL_SEC, stop_event=None, source=SOURCE,
     單輪內的例外一律記錄後續行 —— 監看服務不得因單次取樣失敗而整個停擺。
     """
     stop_event = stop_event or threading.Event()
+    # P3 認證測試：CERT_MODE_ENABLED=False（預設）時完全不啟動 → 行為與 P3 前相同。
+    # 必須在續接單次報告**之前**：先安裝互斥，認證進行中才不會把單次報告也續接起來。
+    try:
+        import cert_service
+        cert_service.start_if_enabled(stop_event)
+    except Exception as e:                           # noqa: BLE001
+        print(f"[{SERVICE_NAME}] 認證記錄啟動失敗（單次報告監看照常）：{type(e).__name__}: {e}")
     if resume:
         try:
             RM.report_resume_on_launch()

@@ -683,6 +683,35 @@ ORIGIN_OBSERVED = "observed"
 ORIGIN_MANUAL_MODE_CODE = "manual"
 
 
+# ======================================================================
+# P3：認證測試報告互斥（注入式，預設關閉）
+# ----------------------------------------------------------------------
+# 認證進行中，背景服務只產生認證報告 —— 單次報告的四個建立入口
+# （auto_schedule_check / _report_start_session / report_start / report_resume_on_launch）
+# 一律拒絕。提供者為 zero-arg callable → 進行中的 cert_id 或 None。
+# 🔴 _cert_active_provider = None（預設；CERT_MODE_ENABLED=False 時不安裝）→ 行為與 P3 前完全相同。
+# 🔴 提供者例外 → 視為「認證進行中」擋下單次報告（fail closed：寧可不建單次報告，也不雙寫）。
+# ======================================================================
+_cert_active_provider = None
+
+
+def set_cert_active_provider(fn):
+    global _cert_active_provider
+    _cert_active_provider = fn
+
+
+def _cert_block():
+    """認證進行中 → 回傳 cert_id（或 "unknown"）；否則 None。"""
+    fn = _cert_active_provider
+    if fn is None:
+        return None
+    try:
+        return fn()
+    except Exception as e:                                # noqa: BLE001
+        print(f"[REPORT] 認證狀態查詢例外 → 視為認證進行中（不建立單次報告）：{e}")
+        return "unknown"
+
+
 def set_control_session_provider(fn):
     """
     注入 Phase 6 控制狀態提供者。傳 None 即完全還原既有行為。
@@ -870,6 +899,10 @@ def _report_start_locked(mode_label="交流有功", setpoint=None):
     if _report["session"] is not None:
         print("已有進行中的充放電報告，請先選 17 停止並產生報告。")
         return
+    _cid = _cert_block()
+    if _cid:
+        print(f"[REPORT] 認證測試 {_cid} 進行中 → 不建立／續接單次充放電報告（兩種報告擇一）")
+        return
 
     active = CDR.find_active_session(_report_output_root())
     client = _report_client()
@@ -909,6 +942,62 @@ def _last_active_direction(sess):
         if d in ("charge", "discharge"):
             return d
     return None
+def _manual_stop_claim(sess, now=None):
+    """
+    人工停止交接（Manual Stop Claim）：本 Session 是否應以「人工停止」作為結束原因。
+
+    回傳 claim dict（可認列）或 None（不可認列）。**純讀取、無副作用**
+    —— 不寫檔、不送控制、不改 Session 狀態，判定仍留在 should_auto_end()。
+
+    背景：Menu 7 的 report_on_stop_control() 在非 Owner 時直接 return，
+    而 ESSAutoMonitor 常駐即永遠是 Owner → 人工停止意圖從未進入 report lifecycle。
+    此函式讓 Owner 改讀**控制層既有產出** output/device_control_action_result.json，
+    Observer 完全不需要寫入任何東西（不觸碰 Writer Gate）。
+
+    一律 Fail Closed，下列任一不成立即回 None：
+      ① CFG.MANUAL_STOP_CLAIM_ENABLED 為 True
+      ② 檔案存在且可解析
+      ③ action ∈ CFG.MANUAL_STOP_CLAIM_ACTIONS
+      ④ control_success **恰為 True**
+         🔴 "partial" / None / 缺欄位 / 字串 "true" 一律不算 —— 對應需求 R5（命令
+            失敗或未送出不得偽造人工停止）與 R6（結果 UNKNOWN 不得假裝成功）。
+      ⑤ dry_run 為假（模擬執行不是真的停止）
+      ⑥ timestamp 可解析，且 **Session 開始之後**（不得沿用上一份 Session 的停止）
+      ⑦ 距今不超過 CFG.MANUAL_STOP_CLAIM_MAX_AGE_SEC
+         🔴 該檔只保存「最近一次」控制結果，沒有時間窗就可能把數小時前的停止
+            誤記到後來才結束的 Session 上。
+    """
+    if not getattr(CDR_CFG, "MANUAL_STOP_CLAIM_ENABLED", False):
+        return None
+    path = os.path.join(OUTPUT_DIR,
+                        getattr(CDR_CFG, "MANUAL_STOP_CLAIM_FILE",
+                                "device_control_action_result.json"))
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        return None
+    if data.get("action") not in tuple(
+            getattr(CDR_CFG, "MANUAL_STOP_CLAIM_ACTIONS", ())):
+        return None
+    # ④ 嚴格 is True：避免 "partial" / 非空字串 / 1 被當成成功
+    if data.get("control_success") is not True:
+        return None
+    if data.get("dry_run"):
+        return None
+    ts = CDR._parse_dt(data.get("timestamp")) if CDR is not None else None
+    if ts is None:
+        return None
+    start_dt = getattr(sess, "start_dt", None)
+    if start_dt is None or ts < start_dt:
+        return None
+    now = now or datetime.now()
+    age = (now - ts).total_seconds()
+    max_age = getattr(CDR_CFG, "MANUAL_STOP_CLAIM_MAX_AGE_SEC", 0) or 0
+    if age < 0 or (max_age and age > max_age):
+        return None
+    return {"action": data.get("action"), "timestamp": data.get("timestamp"),
+            "age_sec": age, "source": os.path.basename(path)}
+
+
 def _sync_stop_pending(sess):
     """
     把 idle 累積狀態反映到 _auto（供 Dashboard 顯示）。
@@ -961,13 +1050,19 @@ def _auto_finalize_from_loop(sess, reason):
     try:
         # 正常結束（auto_stop）額外記錄 auto_charge_stop / auto_discharge_stop；
         # 故障/通訊異常沿用既有 session_end + stop_reasons，不另外加事件。
-        if reason == "auto_stop":
+        _manual_reason = getattr(CDR_CFG, "MANUAL_STOP_CLAIM_REASON", "control_stop")
+        if reason in ("auto_stop", _manual_reason):
             d = _last_active_direction(sess)
             ev = {"charge": "auto_charge_stop",
                   "discharge": "auto_discharge_stop"}.get(d, "auto_stop")
+            # 人工停止與排程自動收尾走**同一條 finalize path**（不新增第二套），
+            # 只有事件文字依實際 origin 如實標示，不再一律寫成 scheduler。
+            _o = ("origin=control｜人工停止充放電（Menu 7）"
+                  if reason == _manual_reason else
+                  "origin=scheduler｜排程結束自動收尾")
             try:
                 sess.log_event(ev, "info",
-                               f"origin=scheduler｜排程結束自動收尾｜"
+                               f"{_o}｜"
                                f"idle 持續 {sess.idle_held_seconds():.0f}s｜"
                                f"最後方向 {d or 'unknown'}")
             except Exception as e:
@@ -1065,6 +1160,33 @@ def _report_bg_start(sess):
                     # 使用者已按 Menu 7 → 尊重其結束原因，不被 auto_stop 蓋掉
                     if _report["pending_end_reason"]:
                         reason = _report["pending_end_reason"]
+                    else:
+                        # 跨行程：Menu 7 由 Observer 視窗按下時，pending_end_reason
+                        # 留在那個行程裡，本行程（Owner）看不到 → 改讀控制層既有產出。
+                        # 🔴 與上面同一個優先序位置：人工停止一旦認列，就不會被
+                        #    should_auto_end() 的 auto_stop / battery_off 覆蓋。
+                        #    設備最終狀態仍完整保留在 end_state / stop_reasons。
+                        try:
+                            _claim = _manual_stop_claim(sess)
+                        except Exception as e:
+                            _claim = None
+                            print(f"[REPORT] 人工停止交接判定例外（維持 {reason}）：{e}")
+                        if _claim:
+                            _prev = reason
+                            reason = getattr(CDR_CFG, "MANUAL_STOP_CLAIM_REASON",
+                                             "control_stop")
+                            try:
+                                sess.log_event(
+                                    "manual_stop_claim", "info",
+                                    f"origin=control｜人工停止（Menu 7）認列為結束原因"
+                                    f"｜action={_claim['action']}"
+                                    f"｜control_success=True"
+                                    f"｜控制時間 {_claim['timestamp']}"
+                                    f"（{_claim['age_sec']:.0f}s 前）"
+                                    f"｜原自動判定 {_prev} → {reason}"
+                                    f"｜來源 {_claim['source']}")
+                            except Exception as e:
+                                print(f"[REPORT] 記錄人工停止認列事件失敗：{e}")
                     if not getattr(CDR_CFG, "AUTO_STOP_ENABLED", True):
                         # 用**獨立** key：背景取樣器(5s) 與 Dashboard(15s) 是兩個節奏，
                         # 共用 last_note 會互相覆寫而讓去重失效 → 同一條件反覆洗版。
@@ -1222,6 +1344,10 @@ def _report_start_session(direction, mode_label, setpoint=None, origin="manual",
     if not is_owner():
         print("[REPORT] 非 Monitor Owner → 不建立 Session（防止產生無人擁有的資料夾）")
         return None, False
+    _cid = _cert_block()
+    if _cid:
+        print(f"[REPORT] 認證測試 {_cid} 進行中 → 不建立單次充放電報告（來源 {origin}；兩種報告擇一）")
+        return None, False
 
     zh = {"charge": "充電", "discharge": "放電"}.get(direction, direction)
     with _SESSION_LOCK:
@@ -1287,6 +1413,10 @@ def report_resume_on_launch():
         return
     if not is_owner():
         print("[REPORT] 非 Monitor Owner → 不續接未完成 Session（避免與 Owner 雙寫）")
+        return
+    _cid = _cert_block()
+    if _cid:
+        print(f"[REPORT] 認證測試 {_cid} 進行中 → 不續接單次充放電報告（保留於磁碟，認證結束後才會續接）")
         return
     active = CDR.find_active_session(_report_output_root())
     if not active:
@@ -1725,6 +1855,10 @@ def auto_schedule_check(r, client=None, source="auto"):
     #    完成 _read_device_state() 與 _monitor_status_line()。
     if not is_owner():
         return "skipped", "not_owner"
+    _cid = _cert_block()
+    if _cid:
+        _auto_note(f"[AUTO] 認證測試 {_cid} 進行中 → 不建立單次充放電報告")
+        return "skipped", "cert_active"
     if _auto["disabled"]:
         return "noop", "monitor_disabled"
     if not isinstance(r, dict):

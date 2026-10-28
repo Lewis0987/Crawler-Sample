@@ -165,7 +165,7 @@ END_REASON = {
     "completed": "正常完成",
     "manual_stop": "人工停止",
     "user_stop": "人工停止",             # 手動 Menu 17 結束
-    "control_stop": "控制停止",           # Menu 7 送出 PCS 停止充放電後結束
+    "control_stop": "停止充放電（手動停止）",   # Menu 7 送出 PCS 停止充放電後結束
     "auto_stop": "自動偵測停止",           # 背景偵測設備回停止/待機（非經 Menu 7）
     "fault_stop": "故障停止",             # 背景偵測 PCS 故障
     "direction_switch": "方向切換",        # 充↔放切換：先結束舊 Session
@@ -416,6 +416,33 @@ AUTO_END_REASON_MAP = {
     "pcs_fault": "fault_stop",
     "battery_off": "battery_off",
 }
+
+# ======================================================================
+# 人工停止（Menu 7）跨行程交接 —— Manual Stop Claim
+# ======================================================================
+# 🔴 問題：Menu 7 的 report_on_stop_control() 在「本視窗不是 Monitor Owner」時
+#    直接 return。ESSAutoMonitor 服務常駐即永遠是 Owner，因此人工停止意圖
+#    從未進入 report lifecycle，Session 最後由 idle hold 以 auto_stop 收尾，
+#    結束原因顯示「自動偵測停止」而非「停止充放電（手動停止）」。
+#    （既有的 _report["pending_end_reason"] 優先權是正確的，但只在同一行程內有效。）
+#
+# 🔴 修正：Owner 在收尾判定時讀取**控制層既有產出** output/<此檔名>，
+#    不新增任何檔案、不新增任何寫入者 —— Observer 一行都不寫，
+#    完全不觸碰 Phase 4.6-B Authoritative Writer Gate。
+#
+# 🔴 TRIGGER vs FINAL OBSERVED STATE：本機制只決定 end_reason（造成結束的 trigger）。
+#    設備最終狀態（例如電池其後真的下電）仍完整保留在 summary 的
+#    end_state 與 stop_reasons，兩者並存，不互相覆蓋、不新增 schema 欄位。
+MANUAL_STOP_CLAIM_ENABLED = True
+MANUAL_STOP_CLAIM_FILE = "device_control_action_result.json"
+# 可認列為「人工停止」的控制動作（目前只有 Menu 7 的安全停止）。
+MANUAL_STOP_CLAIM_ACTIONS = ("pcs_stop_power",)
+MANUAL_STOP_CLAIM_REASON = "control_stop"
+# 控制結果時間需落在「本 Session 之內」且距收尾判定不超過本秒數。
+# 預設 180 = AUTO_HOLD_STOP_SEC(60) + 送出停止到設備真正 idle 的裕度(120)。
+# 🔴 這個上限是必要的：該檔只保存「最近一次」控制結果，沒有時間窗就可能把
+#    幾小時前的一次停止誤記到後來才結束的 Session 上。
+MANUAL_STOP_CLAIM_MAX_AGE_SEC = 180
 
 # 連續判定為 idle / PCS 停止的取樣「次數」。
 # ⚠️ 已**不再**作為自動結束的觸發依據（改由 AUTO_HOLD_STOP_SEC 時間制判定）；

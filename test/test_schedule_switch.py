@@ -21,8 +21,11 @@ PCS 排程主開關（schedulePlanSwitch）控制 —— 離線驗證
 用法
     python test_schedule_switch.py         # exit 0 = PASS
 """
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import time
 
 try:
@@ -342,6 +345,14 @@ print("\n[排程主開關] operator 層：兩個方向皆可 execute，HOLD 機�
 
 _url_on, _body_on = [None], [None]
 
+# 🔴 operator.run() 末尾一律寫出 RESULT_PATH（含 dry-run / HOLD）。測試不得覆寫正式
+#    output\device_control_action_result.json——那是 Monitor Owner 判定
+#    人工停止（_manual_stop_claim）的 production runtime state file。
+#    故改寫到 test-only 暫存目錄，production runtime 的路徑不變。
+_RESULT_DIR = tempfile.mkdtemp(prefix="schedsw_result_")
+_TEST_RESULT_PATH = os.path.join(_RESULT_DIR, "device_control_action_result.json")
+atexit.register(shutil.rmtree, _RESULT_DIR, True)
+
 
 def run_cli(action):
     """
@@ -380,7 +391,9 @@ def run_cli(action):
             return {}
 
     _bak = OP.ApiClient
+    _bak_result = OP.RESULT_PATH
     OP.ApiClient = _Cli
+    OP.RESULT_PATH = _TEST_RESULT_PATH      # 測試專用路徑；不動正式檔
     buf = _io.StringIO()
     try:
         with _ctx.redirect_stdout(buf):
@@ -389,6 +402,7 @@ def run_cli(action):
         buf.write(f"\n[EXC] {type(e).__name__}: {e}")
     finally:
         OP.ApiClient = _bak
+        OP.RESULT_PATH = _bak_result
     return bool(sent), buf.getvalue()
 
 
@@ -416,6 +430,10 @@ try:
 finally:
     OP.ACTIONS.pop("_test_hold_only", None)
 check("測試用 action 已移除（未污染正式 ACTIONS）", "_test_hold_only" not in OP.ACTIONS)
+check("operator 結果檔寫到 test-only path（未污染正式 device_control_action_result.json）",
+      os.path.exists(_TEST_RESULT_PATH)
+      and os.path.dirname(_TEST_RESULT_PATH) == _RESULT_DIR
+      and OP.RESULT_PATH != _TEST_RESULT_PATH)
 
 ok = all(RESULTS)
 print(f"\n== PCS 排程主開關 {'PASS' if ok else 'FAIL'}"

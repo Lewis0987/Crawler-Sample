@@ -493,6 +493,13 @@ def read_all(client):
                                    if isinstance(rex, dict) else None)
     r["rack_min_temperature_c"] = (_to_float(rex.get("rackCellMinTemperature"))
                                    if isinstance(rex, dict) else None)
+    # 1b') Cell 最大/最小電壓（V）：取自**同一份** rackExtremeValueInformation 回應，不新增請求。
+    #      代表目前單一 Rack（110 號櫃）全部 Cell 的極值；不是 Rack/Pack 總電壓。
+    #      僅供認證報告使用：單次報告的 _sample_row / samples.csv 欄位不變。
+    r["rack_cell_max_voltage_v"] = (_to_float(rex.get("rackCellMaxVoltage"))
+                                    if isinstance(rex, dict) else None)
+    r["rack_cell_min_voltage_v"] = (_to_float(rex.get("rackCellMinVoltage"))
+                                    if isinstance(rex, dict) else None)
 
     # 1c) 設備今日累計充/放電量（guest；overview/rackCapacityInformation，與 Dashboard「當日」同源同值）
     #     直接取 API 值、不重新積分；僅供 Summary 對照，不進 samples.csv、不影響能量統計。

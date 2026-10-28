@@ -177,6 +177,46 @@ MENU_SECTIONS = [
     ]),
 ]
 
+# P3 認證測試（Menu 21～27）：CERT_MODE_ENABLED=False（預設）時不顯示、不處理 → 選單與 P3 前相同。
+# 選單只送請求／讀狀態，不寫認證資料、不需要 Ownership；記錄一律由背景服務負責。
+try:
+    import cert_menu as CERT_MENU
+    if CERT_MENU.enabled():
+        MENU_SECTIONS.append(CERT_MENU.menu_section())
+except Exception:                                        # noqa: BLE001
+    CERT_MENU = None
+
+
+def _cert_enabled():
+    return CERT_MENU is not None and CERT_MENU.enabled()
+
+
+def _dashboard_acquire(cert_root=None):
+    """
+    選單啟動時的 Ownership 決定。回傳 (owned, why, cert_active)。
+    P3：認證進行中 → 本視窗**不取得** Ownership，讓背景服務持有／接手記錄
+        （選單開關不得搶走或妨礙認證記錄；服務重啟期間開啟選單也不會卡住服務接手）。
+    功能關閉時與 P3 前相同：直接 acquire_ownership(role="dashboard")。
+    """
+    cert_active = None
+    if _cert_enabled():
+        try:
+            import cert_requests as _CREQ
+            cert_active = _CREQ.active_on_disk(cert_root or _CREQ.cert_root())
+        except Exception:                                # noqa: BLE001
+            cert_active = "unknown"                      # 無法判定 → 不搶 Ownership（fail closed）
+    if cert_active:
+        return False, f"cert_active:{cert_active}", cert_active
+    owned, why = RM.acquire_ownership(role="dashboard")
+    return owned, why, None
+
+
+def _cert_status_line():
+    try:
+        return CERT_MENU.status_line() if _cert_enabled() else None
+    except Exception:                                    # noqa: BLE001
+        return None
+
 # 卡片內容區顯示寬（不含左右各 1 空白與框線）；總寬 = CARD_INNER + 4 ≈ 50 字元。
 CARD_INNER = 46
 
@@ -751,9 +791,15 @@ def report_on_stop_control():
         print(f"[REPORT] 報告模組未載入：{_REPORT_IMPORT_ERR}")
         return
     # Phase 4.5：設備已停止（呼叫端完成），但 Observer 不得執行報告收尾。
+    # 🔴 本視窗為 Observer 時**不寫入任何檔案**（Writer Gate）——人工停止意圖改由
+    #    Owner 端讀取控制層既有產出 device_control_action_result.json 認列
+    #    （report_monitor._manual_stop_claim()），結束原因仍會是「停止充放電（手動停止）」。
     if not RM.is_owner():
         print("[REPORT] 設備已停止；目前本視窗為 Observer，"
               "報告收尾由 Monitor Owner 負責。")
+        print(f"[REPORT] 本次人工停止已記錄於控制結果檔，Monitor Owner 收尾時會以"
+              f"「{CDR_CFG.END_REASON.get('control_stop', 'control_stop')}」作為結束原因"
+              f"（依既有 idle hold {CDR_CFG.AUTO_HOLD_STOP_SEC}s 後收尾，不提前 finalize）。")
         return
     if RM._report["session"] is None:
         print("[REPORT] 無進行中的報告 Session（略過自動結束）")
@@ -1069,10 +1115,21 @@ def report_view_latest():
             return
         sessions.sort(key=lambda s: s["mtime"], reverse=True)     # 由新到舊
 
+        # 🔴 語意澄清：本選項顯示的是「最近一次**已完成**的報告」。
+        #    若此刻另有 recording/paused 的 Session，不先講清楚會讓人誤以為
+        #    下方那份舊報告就是剛剛停止的那一筆（實際上它尚未 finalize）。
+        active = [s for s in sessions
+                  if s["status"] in (CDR_CFG.SESSION_RECORDING, CDR_CFG.SESSION_PAUSED)]
+        if active:
+            print(f"目前記錄中的 Session：{os.path.basename(active[0]['folder'])}"
+                  f"  status={active[0]['status']}")
+            print("  （尚未 finalize，下方顯示的是上一份已完成的報告）")
+
         # 1) 優先：最近一個 status=completed 且有 summary.json
         completed = [s for s in sessions
                      if s["status"] == CDR_CFG.SESSION_COMPLETED and s["has_summary"]]
         if completed:
+            print(f"最近完成的 Session：{os.path.basename(completed[0]['folder'])}")
             _show_report_folder(completed[0]["folder"])
             return
         # 2) 無 completed：若最新為 recording/paused → 明確提示尚未完成
@@ -1342,6 +1399,11 @@ def handle_choice(choice):
     if choice in MENU_ACTIONS:
         action, label = MENU_ACTIONS[choice]
         _execute_live([OPERATOR, "--action", action, "--execute"], action, label)
+        return True
+
+    # 認證測試（Menu 21～27）：送請求給背景服務，不送任何設備控制
+    if _cert_enabled() and choice in CERT_MENU.CHOICES:
+        CERT_MENU.UI(is_owner=RM.is_owner if _REPORT_AVAILABLE else None).handle(choice)
         return True
 
     # 高風險控制（電池上下電）：先 YES 二次確認，再帶 --yes
@@ -1618,6 +1680,9 @@ def _exec_menu():
         sl = report_status_line() if _REPORT_AVAILABLE else None
         if sl:
             print(sl)
+        cl = _cert_status_line()
+        if cl:
+            print(cl)
         try:
             choice = input("請輸入選項：").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1636,8 +1701,11 @@ def main():
     # Phase 4.4：取得 Monitor Ownership 才有資格續接／建立／收尾報告。
     # 取不到不退出 —— Dashboard 仍是有用的唯讀觀察與人工控制介面（Observer）。
     # 非 Owner 時所有 Session 寫入路徑都會被 report_monitor 的 Writer Gate 擋下。
-    _owned, _why = RM.acquire_ownership(role="dashboard")
-    if _owned:
+    _owned, _why, _cert_active = _dashboard_acquire()
+    if _cert_active:
+        print(f"[OBSERVER] 認證測試 {_cert_active} 進行中 → 本視窗不取得 Monitor Ownership，"
+              "記錄由背景服務負責（關閉本視窗不影響記錄）。")
+    elif _owned:
         RM.report_resume_on_launch()  # 啟動時恢復未完成的充放電報告 Session（若有）
     else:
         print(f"[OBSERVER] Auto Monitor 由其他行程持有（{_why}）→ 本視窗為唯讀觀察模式。")
@@ -1649,6 +1717,9 @@ def main():
             sl = report_status_line() if _REPORT_AVAILABLE else None
             if sl:
                 print(f"\n{sl}")
+            cl = _cert_status_line()
+            if cl:
+                print(cl)
 
             # 等待輸入；逾時 → 自動刷新（前景、不新增 thread、離開迴圈即停止 GET）
             prompt = (f"\n[r] 重新整理　[e] 進入控制執行選單　[0] 離開"
