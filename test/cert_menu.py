@@ -42,6 +42,16 @@ def menu_section():
     return ("認證測試", [(k, v) for k, v in CHOICES.items()])
 
 
+def stage_post_stop_soc(st):
+    """
+    停止後 SOC：階段結束後首筆觀測待機（st.end_B）的實際 SOC；沒有 end_B 或該筆 SOC 無效 → None。
+    只供操作人員參考（不往後找其他筆、不依方向推測 0／100），不改變階段範圍，也不參與滿充／滿放判定。
+    階段運行範圍的 SOC 仍是 st.start → st.A（最後觀測運行）。
+    """
+    from cert_stage_engine import _num
+    return _num(st.end_B.values.get("soc")) if st.end_B is not None else None
+
+
 class UI:
     """input／print 可注入（模擬測試）。"""
 
@@ -163,30 +173,42 @@ class UI:
         return self.submit("end_cert", cert_id=cid)
 
     # ---- 23 標記／確認 ---------------------------------------------------------
+    def stage_rows(self, cid):
+        """
+        唯讀分析該認證的階段（observations／decisions／commands → 階段判定），記錄中與已結束的認證都適用。
+        與服務端 _h_stage_label 比對階段用的是同一條分析路徑（CertRuntime._offline().analysis()），
+        所以送出的 stage_start 一定是服務端認得的階段開始時間。不寫任何認證資料。
+        """
+        from cert_runtime import CertRuntime, _iso
+        from cert_stage_engine import _num, stage_names
+        folder = os.path.join(self.root, cid)
+        res = CertRuntime(self.root, reader=None, enable_shots=False, log=lambda *a: None)._offline(folder).analysis()
+        recording = (REQ.read_json(os.path.join(folder, "cert_state.json")) or {}).get("status") == "recording"
+        names = stage_names(res.stages)
+
+        def soc(v):
+            return "N/A" if v is None else f"{v:g}%"
+        rows = []
+        for st in res.stages:
+            # 記錄中且最後一個階段尚未結束（資料結束時仍運行）→ 進行中：尚未停止，不顯示停止後 SOC
+            active = recording and st is res.stages[-1] and st.end_by == "data_end"
+            rows.append({"no": st.no, "dir": st.dir, "name": names[st.no], "start": _iso(st.start.t),
+                         "t0": st.start.t, "t1": st.A.t, "label": st.label, "active": active,
+                         "soc0": soc(_num(st.start.values.get("soc"))), "soc1": soc(_num(st.A.values.get("soc"))),
+                         "soc_post": None if active else soc(stage_post_stop_soc(st))})
+        return rows
+
     def mark(self):
         cid = self.pick_cert()
         if not cid:
             return None
+        kind = self.ask("1. 階段標記（滿充／滿放／未滿／中止）　2. 不確定項目確認：", "1")
+        if kind == "1":
+            return self.mark_stage(cid)
         st = REQ.read_status(self.root) or {}
         if st.get("cert_id") != cid:
             self.out("（此認證已結束；階段清單以最新報告摘要為準，確認後請「25 重新產生認證報告」）")
-        stages = st.get("stages") if st.get("cert_id") == cid else None
         items = st.get("uncertain") if st.get("cert_id") == cid else None
-        kind = self.ask("1. 階段標記（滿充／滿放／未滿／中止）　2. 不確定項目確認：", "1")
-        if kind == "1":
-            if stages:
-                for s in stages:
-                    self.out(f"  {s['no']}. {s['name']}｜開始 {s['start']}｜目前標記 {s.get('label') or '-'}")
-                v = self.ask("階段編號：")
-                s = next((x for x in stages if str(x["no"]) == v), None)
-                key = s["start"] if s else None
-            else:
-                key = self.ask("階段開始時間（YYYY-MM-DDTHH:MM:SS）：")
-            if not key:
-                self.out("未選擇階段，已取消。")
-                return None
-            label = self.ask("標記（滿充／滿放／未滿／中止）：")
-            return self.submit("stage_label", {"stage_start": key, "label": label}, cert_id=cid)
         if items:
             for u in items:
                 self.out(f"  {u['item_id']}｜第 {u['stage_no']} 階段｜{u['A']} → {u['R']}｜已確認 {u.get('decided') or '-'}")
@@ -198,6 +220,49 @@ class UI:
             return None
         return self.submit("confirm_item", {"item_id": item, "choice": choice,
                                             "note": self.ask("備註（選填）：")}, cert_id=cid)
+
+    def mark_stage(self, cid):
+        """列出分析出的階段 → 選編號 → 依方向列出可用標記 → 送出（stage_start 由程式帶入，不需手動輸入）。"""
+        try:
+            rows = self.stage_rows(cid)
+        except Exception as e:                          # noqa: BLE001
+            self.out(f"無法分析 {cid} 的階段（{type(e).__name__}: {e}），未送出請求。")
+            return None
+        if not rows:
+            self.out(f"{cid} 目前沒有已判定的充／放電階段，未送出請求。")
+            return None
+        self.out("【請選擇階段】")
+        for r in rows:
+            end = r["t1"].strftime("%H:%M:%S" if r["t1"].date() == r["t0"].date() else "%Y-%m-%d %H:%M:%S")
+            state = "進行中" if r["active"] else (f"目前：{r['label']}" if r["label"] else "未標記")
+            self.out(f"  {r['no']}. {r['name']}" + (f"（目前：{r['label']}）" if r["label"] else ""))
+            post = "" if r["soc_post"] is None else f"｜停止後 SOC {r['soc_post']}"
+            self.out(f"     {r['t0']:%Y-%m-%d %H:%M:%S} ～ {end}｜SOC {r['soc0']} → {r['soc1']}{post}｜狀態：{state}")
+        self.out("  0. 返回")
+        v = self.ask("階段編號（0＝返回）：", "0")
+        if v == "0":
+            self.out("已返回，未送出請求。")
+            return None
+        row = next((r for r in rows if str(r["no"]) == v), None)
+        if row is None:
+            self.out(f"沒有階段編號「{v}」，未送出請求。")
+            return None
+        if row["active"]:
+            # 階段尚未結束：還不能確認是否滿充／滿放或未滿，只提供「中止」
+            labels = ["中止"]
+            self.out("此階段仍在進行中：只能標記「中止」；滿充／滿放／未滿請待階段結束後再標記。")
+        else:
+            labels = ["滿充" if row["dir"] == "C" else "滿放", "未滿", "中止"]
+        for i, w in enumerate(labels, 1):
+            self.out(f"  {i}. {w}")
+        self.out("  0. 返回")
+        v = self.ask(f"{row['name']} 標記（0＝返回）：", "0")
+        if v not in [str(i) for i in range(1, len(labels) + 1)]:
+            self.out("已返回，未送出請求。" if v == "0" else f"沒有選項「{v}」，未送出請求。")
+            return None
+        res = self.submit("stage_label", {"stage_start": row["start"], "label": labels[int(v) - 1]}, cert_id=cid)
+        self.out("（標記只影響報告標題與頁籤名稱；已產生的報告不會自動更新，請用「25 重新產生認證報告」）")
+        return res
 
     # ---- 24 補拍 --------------------------------------------------------------
     def shot(self):

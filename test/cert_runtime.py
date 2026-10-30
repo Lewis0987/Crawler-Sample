@@ -40,6 +40,8 @@ from cert_stage_engine import Obs, analyze, classify, stage_names
 
 ISO = "%Y-%m-%dT%H:%M:%S"
 LABELS = ("滿充", "滿放", "未滿", "中止")
+LABEL_WRONG_DIR = {"C": "滿放", "D": "滿充"}   # 充電階段不可標滿放、放電階段不可標滿充
+LABELS_IN_PROGRESS = ("中止",)                  # 進行中的階段只允許標記中止
 CHOICES = ("merge", "split")
 
 
@@ -92,8 +94,11 @@ def build_record(t, reading, read_err, heat, heat_err):
     """
     一次取樣 → observations.jsonl 的一筆。**原始值照存**，不沿用、不補值。
     ok：至少一個量測欄位有值（例如電流缺值但溫度有值 → 仍 ok，溫度照常進報表；方向判定由引擎標示未知）。
+        含 6161 溫度：HMI 無讀值但 6161 有值時仍 ok（6161 溫度照常保留）。
+    hmi_ok：HMI 資料是否有效（cert_stage_engine.hmi_valid，與報表共用同一定義）；
+        ok=True、hmi_ok=False ＝ 只有 6161 溫度。舊資料沒有此欄位 → 報表依數值同樣判定。
     """
-    from cert_stage_engine import _num
+    from cert_stage_engine import _num, hmi_valid
     vals, missing = {}, []
     r = reading if isinstance(reading, dict) else {}
     for k, src in FIELD_SRC.items():
@@ -115,7 +120,7 @@ def build_record(t, reading, read_err, heat, heat_err):
         reasons.append(f"6161 讀取失敗：{heat_err}")
     elif heat is not None and not h:
         reasons.append("6161 無資料（API 回傳空內容）")
-    return {"t": _iso(t), "ok": ok, "values": vals, "missing": missing,
+    return {"t": _iso(t), "ok": ok, "hmi_ok": hmi_valid(vals), "values": vals, "missing": missing,
             "fail_reason": "" if ok else ("；".join(reasons) or "所有欄位皆無有效值"),
             "notes": reasons if ok else [],
             # 設備狀態原始值（全部取自同一次 read_all，不新增請求）：
@@ -129,7 +134,7 @@ def build_record(t, reading, read_err, heat, heat_err):
 def record_to_obs(rec, n):
     return Obs(t=_parse(rec["t"]), ok=bool(rec.get("ok")), values=dict(rec.get("values") or {}),
                src=f"observations.jsonl:{n}", fail_reason=rec.get("fail_reason", ""),
-               flags=dict(rec.get("flags") or {}))
+               flags=dict(rec.get("flags") or {}), notes=list(rec.get("notes") or []))
 
 
 # =============================================================================
@@ -336,7 +341,7 @@ class CertRuntime:
             self.records.append(rec)
             self.cert["sample_count"] = len(self.records)
             self.cert["last_sample_time"] = rec["t"]
-            self.cert["last_sample_ok"] = rec["ok"]
+            self.cert["last_sample_ok"] = rec["ok"] and rec["hmi_ok"]     # 只有 6161 溫度不算取樣成功（選單 26 顯示）
             self._save_state()
             self.next_sample = now + timedelta(seconds=self.p["SAMPLE_INTERVAL_SEC"])
             try:
@@ -612,9 +617,21 @@ class CertRuntime:
         if pl.get("label") not in LABELS:
             REQ.write_result(self.root, req, "rejected", f"標記必須是 {'／'.join(LABELS)}")
             return
-        _res, keys = self._stage_keys(folder)
+        res, keys = self._stage_keys(folder)
         if pl.get("stage_start") not in keys:
             REQ.write_result(self.root, req, "rejected", f"找不到階段（開始時間 {pl.get('stage_start')}）")
+            return
+        st = keys[pl["stage_start"]]
+        wrong = LABEL_WRONG_DIR.get(st.dir)
+        if pl["label"] == wrong:                # 方向不符 → 拒絕，不改成另一個標記
+            REQ.write_result(self.root, req, "rejected", f"此階段為{st.dir_name}階段，不可標記為{wrong}")
+            return
+        # 進行中＝記錄中認證的最後階段、資料結束時仍運行（與選單 cert_menu.stage_rows 的「進行中」同一定義）：
+        # 滿充／滿放／未滿是階段完成後的結果判定 → 只允許「中止」
+        recording = (REQ.read_json(os.path.join(folder, "cert_state.json")) or {}).get("status") == "recording"
+        if (recording and st is res.stages[-1] and st.end_by == "data_end"
+                and pl["label"] not in LABELS_IN_PROGRESS):
+            REQ.write_result(self.root, req, "rejected", "此階段仍在進行中，滿充／滿放／未滿請待階段結束後再標記")
             return
         self._decide(req, folder, {"type": "stage_label", "stage_start": pl["stage_start"], "label": pl["label"],
                                    "note": pl.get("note", "")})

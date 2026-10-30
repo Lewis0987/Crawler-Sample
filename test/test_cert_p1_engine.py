@@ -23,7 +23,7 @@ except Exception:
     pass
 
 import cert_report_config as CFG
-from cert_stage_engine import (Obs, R_GAP, R_READ_FAIL, analyze, overall_minutes,
+from cert_stage_engine import (Obs, R_GAP, R_NO_HMI, R_READ_FAIL, analyze, has_hmi_values, overall_minutes,
                                rest_between, stage_minutes, stage_names)
 
 P = CFG.params()
@@ -395,6 +395,62 @@ rows = {m.T.strftime("%H:%M"): m for m in overall_minutes(r)}
 check("O3 全程曲線：真正沒有取樣的分鐘（10:06:40～10:10:00 之間的 10:08、10:09）才 N/A，不補值、不內插",
       rows["10:08"].obs is None and rows["10:09"].obs is None
       and rows["10:07"].obs is not None and rows["10:10"].obs is not None)
+
+# 實機 CERT_20261029_082805 12:00 型態：HMI 重新登入空窗 → ok=True、HMI 欄位全空、只有 6161 PCS 模組溫度
+NO_HMI = dict(soc=None, current_a=None, rack_max_c=None, rack_min_c=None, voltage_v=None, sensor_c=None,
+              pcs_module_c=80)
+obs = (seq(0, 110, "D") + [ob(113, "D"), ob(123, "D", **NO_HMI), ob(134, "D")] + seq(144, 300, "D"))
+r = run(obs)
+m = {x.T.strftime("%H:%M"): x for x in overall_minutes(r)}["10:02"]
+check("O4 整分 ±20 秒內同時有有效觀測（−7 秒）與 HMI 無讀值觀測（+3 秒）→ 整體頁選有效觀測（真實原始值，不內插）",
+      m.obs is not None and m.obs.t == BASE + timedelta(seconds=113) and has_hmi_values(m.obs))
+sm = {x.T.strftime("%H:%M"): x for x in stage_minutes(r, r.stages[0])}["10:02"]
+check("O5 階段頁同一分鐘結果不變（選 −7 秒那筆）", sm.obs is not None and sm.obs.t == m.obs.t)
+check("O6 HMI 無讀值的一筆不切斷階段（仍 1 個放電階段、未提前結束、仍建立不確定項目）",
+      len(r.stages) == 1 and r.stages[0].dir == "D" and r.stages[0].A.t == obs[-1].t
+      and r.stages[0].end_by != "idle_confirmed"
+      and any(not pz.certain and pz.A.t == BASE + timedelta(seconds=113) for pz in r.pauses))
+obs = seq(0, 90, "D") + [ob(110, "D", **NO_HMI), ob(125, "D", **NO_HMI)] + seq(150, 300, "D")
+r = run(obs)
+m = {x.T.strftime("%H:%M"): x for x in overall_minutes(r)}["10:02"]
+check("O7 ±20 秒內只有 HMI 無讀值觀測 → 退而選用（保留 6161 溫度），HMI 欄位仍為空（不捏造）",
+      m.obs is not None and not has_hmi_values(m.obs) and m.obs.values["pcs_module_c"] == 80)
+obs = seq(0, 90, "D") + [ob(110, "D", **dict(NO_HMI, pcs_module_c=None))] + seq(150, 300, "D")
+r = run(obs)
+m = {x.T.strftime("%H:%M"): x for x in overall_minutes(r)}["10:02"]
+check("O8 ±20 秒內只有完全無值的觀測 → N/A，原因寫明 HMI 無有效讀值（通訊異常或未登入）",
+      m.obs is None and R_NO_HMI in m.na_reason)
+sm8 = {x.T.strftime("%H:%M"): x for x in stage_minutes(r, r.stages[0])}["10:02"]
+check("O9 階段頁同樣不選 HMI 無值觀測；真正無候選 → N/A", sm8.obs is None)
+
+print("\n== HMI 資料有效性（Runtime 記錄 → 報表共用同一定義 hmi_valid）==")
+from cert_runtime import build_record, record_to_obs
+READING = {"soc_percent": 50.0, "battery_current_a": -140.0, "actual_active_power_kw": -120.0,
+           "rack_max_temperature_c": 40.0, "rack_min_temperature_c": 30.0, "rack_cell_max_voltage_v": 3.4,
+           "rack_cell_min_voltage_v": 3.3, "battery_voltage_v": 900.0, "_fail": []}
+HEAT = {"st": "-", "pt": {"moduleTemperature": "70"}}
+t_ = BASE
+r_full = build_record(t_, READING, "", HEAT, "")
+r_none = build_record(t_, None, "無讀值（未登入或連線失敗）", HEAT, "")          # 實機 09:58:09 型態
+r_part = build_record(t_, {k: (v if k == "rack_max_temperature_c" else None) for k, v in READING.items()}, "", HEAT, "")
+r_dead = build_record(t_, None, "無讀值（未登入或連線失敗）", None, "URLError: timeout")
+check("V1 正常完整觀測 → ok=True、hmi_ok=True", r_full["ok"] and r_full["hmi_ok"])
+check("V2 HMI 全無值＋6161 有值 → ok=True（6161 溫度保留）、hmi_ok=False，原因留在 notes",
+      r_none["ok"] and r_none["hmi_ok"] is False and r_none["values"]["pcs_module_c"] == "70"
+      and any("無讀值" in n for n in r_none["notes"]))
+check("V3 只有部分 HMI 欄位有效（Rack 最大溫度）→ hmi_ok=True（單一欄位缺值不算無效）",
+      r_part["ok"] and r_part["hmi_ok"])
+check("V4 HMI 與 6161 都沒有值 → ok=False（既有行為不變）", not r_dead["ok"] and r_dead["hmi_ok"] is False)
+old = {k: v for k, v in r_none.items() if k != "hmi_ok"}                    # 舊資料沒有 hmi_ok 欄位
+bare = {"t": "2026-01-05T10:00:00", "ok": True, "values": {"pcs_module_c": "70"}}  # 最舊格式：無 notes／flags／hmi_ok
+ob_bare = record_to_obs(bare, 1)
+check("V6 最舊格式紀錄（沒有 notes、flags、hmi_ok 欄位）→ Obs.notes=[]、flags={}，HMI 依數值判定無效（不需回填 JSON）",
+      ob_bare.notes == [] and ob_bare.flags == {} and not has_hmi_values(ob_bare))
+check("V7 Obs 只給必要欄位（離線回放 cert_report_replay 的建構方式）→ notes／flags 有預設值，不會 AttributeError",
+      Obs(t=BASE).notes == [] and Obs(t=BASE).flags == {})
+check("V5 舊資料（無 hmi_ok 欄位）依數值判定：ok 照原值、HMI 無效、notes 帶入",
+      record_to_obs(old, 1).ok and not has_hmi_values(record_to_obs(old, 1))
+      and record_to_obs(old, 1).notes == r_none["notes"] and has_hmi_values(record_to_obs(r_full, 1)))
 
 ok = all(_results)
 print(f"\n== 認證報告 P1 階段判斷 {'PASS' if ok else 'FAIL'}（{sum(_results)}/{len(_results)} 檢查通過）==")

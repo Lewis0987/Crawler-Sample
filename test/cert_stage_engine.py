@@ -25,10 +25,13 @@ from datetime import datetime, timedelta
 DIR_NAME = {"C": "充電", "D": "放電", "I": "待機"}
 VALUE_FIELDS = ["soc", "current_a", "rack_max_c", "rack_min_c", "cell_vmax_v", "cell_vmin_v", "voltage_v",
                 "sensor_c", "pcs_module_c", "power_kw"]
+# HMI（read_all）來源欄位；sensor_c／pcs_module_c 另取自 6161，與 HMI 讀取是否成功無關
+HMI_FIELDS = ["soc", "current_a", "power_kw", "rack_max_c", "rack_min_c", "cell_vmax_v", "cell_vmin_v", "voltage_v"]
 
 R_READ_FAIL = "讀取失敗"
 R_NO_DIR = "無有效方向資料"
 R_GAP = "資料間隔過長"
+R_NO_HMI = "HMI 無有效讀值（通訊異常或未登入）"
 
 
 # =============================================================================
@@ -43,6 +46,7 @@ class Obs:
     fail_reason: str = ""
     sensor_ok: object = None        # 傳感器狀態：None=未提供 / True=正常 / False=關閉或異常
     flags: dict = field(default_factory=dict)   # 設備狀態原始值（電池上下電、PCS 旗標）：只供報告顯示，不參與階段判斷
+    notes: list = field(default_factory=list)   # 取樣備註（ok=True 時的部分失敗原因）：只供 Raw Data 追溯
     # ---- 以下由引擎填寫 ----
     seq: int = -1
     direction: object = None        # "C" / "D" / "I" / None（無法判定）
@@ -591,25 +595,48 @@ def _floor_min(t):
     return t.replace(second=0, microsecond=0)
 
 
-def select_minutes(cands, all_obs, t_from, t_to, tol_sec):
+def hmi_valid(values):
+    """
+    HMI 資料有效性（Runtime、每分鐘選樣、Raw Data 共用的唯一定義）：至少一個 HMI 欄位有有效數值。
+    單一欄位缺值不算無效；HMI 欄位全部無值才無效。6161 溫度（sensor_c／pcs_module_c）不列入。
+    """
+    return any(_num((values or {}).get(k)) is not None for k in HMI_FIELDS)
+
+
+def has_hmi_values(o):
+    """觀測的 HMI 資料是否有效。ok=True 不代表有 HMI 資料（例：HMI 無讀值但 6161 溫度有值）。
+    依數值判定，舊資料（沒有 hmi_ok 欄位）同樣適用。"""
+    return hmi_valid(o.values)
+
+
+def _nearest(cands, ts, T, tol):
+    """cands 中 |t − T| ≤ tol 且最小者（同距取較早）；沒有回 None。"""
+    k = bisect.bisect_left(ts, T)
+    best = None
+    for j in (k - 1, k):
+        if 0 <= j < len(cands):
+            d = abs(ts[j] - T)
+            if d <= tol and (best is None or d < abs(best.t - T)):
+                best = cands[j]
+    return best
+
+
+def select_minutes(cands, all_obs, t_from, t_to, tol_sec, fallback=None):
     """
     cands：可選用的有效觀測（已依時間排序）。整分 T ∈ [t_from, t_to]，
-    取 |t − T| ≤ tol 且最小者（同距取較早）；沒有則 N/A 並說明原因。
+    取 |t − T| ≤ tol 且最小者（同距取較早）；沒有則改從 fallback（若有）同規則選，仍沒有則 N/A 並說明原因。
     """
     tol = timedelta(seconds=tol_sec)
     ts = [o.t for o in cands]
+    fb_ts = [o.t for o in fallback or []]
     all_ts = [o.t for o in all_obs]
     rows = []
     T = _ceil_min(t_from)
     end = _floor_min(t_to)
     while T <= end:
-        k = bisect.bisect_left(ts, T)
-        best = None
-        for j in (k - 1, k):
-            if 0 <= j < len(cands):
-                d = abs(ts[j] - T)
-                if d <= tol and (best is None or d < abs(best.t - T)):
-                    best = cands[j]
+        best = _nearest(cands, ts, T, tol)
+        if best is None and fallback:
+            best = _nearest(fallback, fb_ts, T, tol)
         if best is not None:
             rows.append(MinuteRow(T, best))
         else:
@@ -618,6 +645,8 @@ def select_minutes(cands, all_obs, t_from, t_to, tol_sec):
             near = all_obs[lo:hi]
             if any(not o.ok for o in near):
                 reason = f"±{tol_sec} 秒內讀取失敗"
+            elif any(o.ok and not has_hmi_values(o) for o in near):
+                reason = f"±{tol_sec} 秒內{R_NO_HMI}"
             elif any(o.ok and o.direction is None for o in near):
                 reason = f"±{tol_sec} 秒內無有效方向資料"
             elif near:
@@ -637,11 +666,14 @@ def stage_minutes(res, st):
 
 def overall_minutes(res):
     """整體頁：開始～結束全程，含休息；讀取成功的觀測都可選用（方向無法判定也照樣呈現溫度）。
+    優先選有 HMI 讀值的觀測；容許範圍內只有「HMI 無讀值、僅 6161 溫度」的觀測時才退而選用它。
     只有真正沒有取樣／讀取失敗時才 N/A（圖表斷線，不補值、不內插）。"""
-    cands = [o for o in res.obs if o.ok]
     if not res.obs:
         return []
-    return select_minutes(cands, res.obs, res.obs[0].t, res.obs[-1].t, res.params["MINUTE_TOL_SEC"])
+    ok = [o for o in res.obs if o.ok]
+    fallback = [o for o in ok if any(_num(o.values.get(k)) is not None for k in VALUE_FIELDS)]
+    return select_minutes([o for o in ok if has_hmi_values(o)], res.obs, res.obs[0].t, res.obs[-1].t,
+                          res.params["MINUTE_TOL_SEC"], fallback=fallback)
 
 
 # =============================================================================

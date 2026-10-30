@@ -39,7 +39,7 @@ from xml.sax.saxutils import escape
 import cert_report_config as CFG
 from cert_screenshot import caption as shot_caption, png_size, select_stage_shot, shot_flag
 from cert_controls import DIRECTION_TEXT, describe as describe_action
-from cert_stage_engine import (R_GAP, R_NO_DIR, R_READ_FAIL, command_stage, fmt_t, field_value, overall_minutes,
+from cert_stage_engine import (R_NO_HMI, _num, command_stage, fmt_t, field_value, has_hmi_values, overall_minutes,
                                rest_between, stage_minutes, stage_names)
 
 NA = CFG.NA
@@ -74,6 +74,9 @@ SUM_ARROW_DOWN_L = ((4, 347663, 21, 53816), (6, 23813, 25, 160496))     # 左欄
 # 範本箭頭為 accent6 亮度 60%（Office 2013+ 佈景主題 = 淡綠 A9D18E）；openpyxl 內建的是舊版佈景主題
 # （accent6 為橘色），所以直接寫 RGB，不用佈景主題色。
 ARROW_FILL, ARROW_LINE = "A9D18E", "548235"
+# 箭頭文字「N 分」單行粗體 14pt（約 19px 高、「120 分」約 55px 寬）：放得進最窄的向下箭頭箭身（約 71px 寬），
+# 不大於圖表標題（Excel 預設 14pt）
+ARROW_TEXT_SZ = 1400
 
 F14 = Font(size=14)
 F14B = Font(size=14, bold=True)
@@ -352,8 +355,10 @@ def _write_overview(ws, stages, names, shots=None):
     截圖右側留白放一支細長「時間序」向下箭頭：從第 1 階段截圖頂端到第 2 階段截圖底端（不遮截圖與標題）。
     """
     ws.column_dimensions["A"].width = 9.1
+    ws.sheet_view.topLeftCell = "A1"            # 切換到本頁時一律從頂端開始
+    ws.sheet_view.selection[0].activeCell = ws.sheet_view.selection[0].sqref = "A1"
     r = 1
-    spans, right = [], OV_IMG_PX            # 各區塊 (頂端, 底端)：(列 0 起算, 列內偏移 px)；right＝最寬圖片右緣
+    spans, right = [], OV_IMG_PX           # 各區塊 (頂端, 底端)：(列 0 起算, 列內偏移 px)；right＝最寬圖片右緣
     tcols = _title_cols(f"{_stage_title(names, st)}結束" for st in stages)
     for st in stages:
         title = f"{_stage_title(names, st)}結束"
@@ -436,7 +441,7 @@ def _write_summary(wb, ws, res, names, sheet_of, n_rows, meta, p):
     for r in range(1, 5):
         ws.row_dimensions[r].height = 20
     stages = res.stages
-    titles = summary_titles(stages)
+    titles = summary_titles(stages, meta)
     arrows = []
 
     def top(i):
@@ -505,22 +510,17 @@ def _with_spec(meta, title):
     return f"{spec} {title}" if spec else title
 
 
-GAP_NOTE = {R_GAP: "期間無資料", R_READ_FAIL: "期間讀取失敗", R_NO_DIR: "期間方向未知"}
-
-
 def arrow_text(res, st, nxt):
     """
-    Summary 箭頭文字：
-      - 休息時間可確認（中間連續觀測）→「休息 / N 分」（R − B）
-      - 否則 →「間隔約 / N 分 / 期間無資料…」：觀測間隔 = 下一階段首筆觀測運行 − 本階段最後觀測運行（R − A），
-        只是兩端觀測時間的差，不是已證實的待機時間；曲線不因此補值或連線。
+    Summary 箭頭文字：只顯示「N 分」（單行）。
+      - 休息時間可確認（中間連續觀測）→ R − B
+      - 否則 → 觀測間隔 R − A（下一階段首筆觀測運行 − 本階段最後觀測運行）：只是兩端觀測時間的差，
+        不是已證實的待機時間；曲線不因此補值或連線。
     """
-    sec, why = rest_between(res, st, nxt)
-    if sec is not None:
-        return ["休息", rest_minutes_text(sec)]
-    gap = (nxt.start.t - st.A.t).total_seconds()
-    notes = [v for k, v in GAP_NOTE.items() if k in why] or [why or "休息時間未確認"]
-    return ["間隔約", rest_minutes_text(gap), "／".join(notes)]      # 分三行，避免超出箭頭
+    sec, _why = rest_between(res, st, nxt)
+    if sec is None:
+        sec = (nxt.start.t - st.A.t).total_seconds()
+    return [rest_minutes_text(sec)]
 
 
 def rest_minutes_text(sec):
@@ -539,14 +539,24 @@ def _cn_num(n):
     return ("" if t == 1 else CN_DIGITS[t]) + "十" + (CN_DIGITS[u] if u else "")
 
 
-def summary_titles(stages):
-    """Summary 圖表標題：「第一次滿放」—— 有操作人員標記用標記，否則用方向；依同名稱各自計數。
-    不會自動認定滿充／滿放。"""
-    cnt, out = {}, {}
+# 滿充／滿放（V1 固定規格）：方向相符 ＋ 階段首筆有效觀測 SOC 精確等於起始值 ＋ Menu 23 人工標記，三者同時成立。
+# 完成與否以人工標記為準；起始 SOC 只是起始條件驗證。不以結束 SOC、Cell 電壓、上下電、故障、告警、idle 自動推論。
+FULL_RULE = {"C": ("滿充", 0), "D": ("滿放", 100)}
+
+
+def is_full_stage(st):
+    word, soc0 = FULL_RULE[st.dir]
+    return st.label == word and _num(st.start.values.get("soc")) == soc0
+
+
+def summary_titles(stages, meta=None):
+    """Summary 圖表標題：「250KW 第一次滿放」—— 依充／放電方向各自計數（不受標記影響）；
+    符合 is_full_stage 才稱滿充／滿放，否則稱充電／放電。電櫃規格未輸入則不加前綴。"""
+    cnt, out = {"C": 0, "D": 0}, {}
     for st in stages:
-        word = st.label or st.dir_name
-        cnt[word] = cnt.get(word, 0) + 1
-        out[st.no] = f"第{_cn_num(cnt[word])}次{word}"
+        cnt[st.dir] += 1
+        word = FULL_RULE[st.dir][0] if is_full_stage(st) else st.dir_name
+        out[st.no] = _with_spec(meta or {}, f"第{_cn_num(cnt[st.dir])}次{word}")
     return out
 
 
@@ -559,7 +569,7 @@ def _anchor(spec, r0):
 def _arrow_xml(k, prst, spec, r0, text):
     """範本樣式箭頭（淡綠填色），文字放在箭頭內。"""
     (c0, co0, a, ro0), (c1, co1, b, ro1) = spec
-    runs = "".join(f'<a:p><a:pPr algn="ctr"/><a:r><a:rPr lang="zh-TW" altLang="en-US" sz="1100" b="1">'
+    runs = "".join(f'<a:p><a:pPr algn="ctr"/><a:r><a:rPr lang="zh-TW" altLang="en-US" sz="{ARROW_TEXT_SZ}" b="1">'
                    f'<a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:rPr>'
                    f'<a:t>{escape(t)}</a:t></a:r></a:p>' for t in text)
     adj = ('<a:gd name="adj1" fmla="val 70000"/><a:gd name="adj2" fmla="val 40000"/>')
@@ -585,6 +595,7 @@ RAW_HEADERS = ["序號", "PC 取樣時間", "來源", "讀取結果", "狀態", 
                "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓",
                "傳感器溫度", "PCS 模組溫度", "功率 kW", "說明"]
 RAW_NOTE_COL = len(RAW_HEADERS)
+RAW_NO_HMI = "無有效讀值"           # 讀取結果：ok=True 但 HMI 欄位全無值（只有 6161 溫度）
 
 
 def _write_raw(ws, res, names, minute_maps, na_rows, p):
@@ -601,7 +612,8 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
             ws.cell(r, 1, o.seq + 1)
             ws.cell(r, 2, o.t).number_format = "yyyy-mm-dd hh:mm:ss"
             ws.cell(r, 3, o.src)
-            ws.cell(r, 4, "成功" if o.ok else "失敗")
+            hmi = o.ok and has_hmi_values(o)
+            ws.cell(r, 4, "成功" if hmi else ("失敗" if not o.ok else RAW_NO_HMI))
             ws.cell(r, 5, status_text(o, names))
             ws.cell(r, 6, names.get(o.stage_no, "") if o.stage_no else "")
             ws.cell(r, 7, "；".join(minute_maps.get(o.seq, [])))
@@ -611,7 +623,13 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
                 if k in LOG_FORMATS and v is not None:
                     cell.number_format = LOG_FORMATS[k]
             parts = [o.fail_reason] if not o.ok and o.fail_reason else []
-            if o.state not in ("充電", "放電"):
+            if o.ok and not hmi:
+                # 舊資料 ok=True 也依數值判定；保留原始備註（例：HMI 讀取失敗：無讀值），6161 溫度照常顯示
+                parts += [R_NO_HMI] + [n for n in o.notes if n]
+                if any(_num(o.values.get(k)) is not None for k in ("sensor_c", "pcs_module_c")):
+                    parts.append("僅 6161 溫度有效")
+                parts.append(f"分析狀態：{o.state}")
+            elif o.state not in ("充電", "放電"):
                 # 追溯用：保留內部分析狀態與電池上下電原始值（狀態欄只顯示 待機／停機／N/A）
                 parts.append(f"分析狀態：{o.state}")
                 parts.append(f"電池上下電：{(o.flags or {}).get('battery_power_status') or '未保存'}")
@@ -777,6 +795,8 @@ def build_workbook(res, meta):
     def overall_remark(mr):
         if mr.obs is None:
             return f"N/A：{mr.na_reason}"
+        if not has_hmi_values(mr.obs):          # 容許範圍內只有僅 6161 溫度的觀測
+            return f"N/A：{R_NO_HMI}，僅有 6161 溫度"
         return status_text(mr.obs, names_full)
 
     if orows:

@@ -413,6 +413,22 @@ try:
     dec = _read_jsonl(os.path.join(root, cid, "decisions.jsonl"))
     check("操作人員確認紀錄 append-only 保留（含請求 ID、時間）；原始資料不變",
           len(dec) == 2 and all(d.get("request_id") and d.get("at") for d in dec))
+    dirs = [st_.dir for st_ in res.stages]
+    ci = dirs.index("C")
+    rq_g1 = req(root, clock, "stage_label", {"stage_start": keys[0], "label": "滿充"}, cert_id=cid)
+    rq_g2 = req(root, clock, "stage_label", {"stage_start": keys[ci], "label": "滿放"}, cert_id=cid)
+    rtB.tick()
+    g1, g2 = REQ.read_result(root, rq_g1), REQ.read_result(root, rq_g2)
+    check("階段標記方向防呆：放電階段標滿充、充電階段標滿放 → 拒絕並說明，不寫入 decisions.jsonl",
+          dirs[0] == "D" and g1["status"] == "rejected" and "此階段為放電階段，不可標記為滿充" in g1["message"]
+          and g2["status"] == "rejected" and "此階段為充電階段，不可標記為滿放" in g2["message"]
+          and len(_read_jsonl(os.path.join(root, cid, "decisions.jsonl"))) == 2)
+    rq_g3 = req(root, clock, "stage_label", {"stage_start": keys[ci], "label": "滿充"}, cert_id=cid)
+    rtB.tick()
+    dec = _read_jsonl(os.path.join(root, cid, "decisions.jsonl"))
+    check("充電階段標滿充（方向相符）→ 正常寫入（放電階段標滿放已於上方寫入）",
+          REQ.read_result(root, rq_g3)["status"] == "done" and len(dec) == 3
+          and dec[-1]["label"] == "滿充" and dec[-1]["stage_start"] == keys[ci])
     rq_m = req(root, clock, "manual_shot", {"reason": "現場補拍"}, cert_id=cid)
     rtB.tick()
     check("立即截圖／手動補拍：排入背景，歸屬目前階段",

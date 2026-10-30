@@ -179,6 +179,39 @@ try:
           and wa.cell(2, COL["Cell 最大電壓"]).number_format == "0.000")
     check("整體頁含全部時間（10:00～10:45）",
           wa.cell(2, 1).value == T0 and row_of(wa, "10:45") is not None)
+    no_hmi = dict(soc=None, current_a=None, rack_max_c=None, rack_min_c=None, voltage_v=None, sensor_c=None,
+                  cell_vmax_v=None, cell_vmin_v=None, pcs_module_c=80)
+    o_nh = obs_at(110, "D", **no_hmi)                 # 舊資料型態：ok=True、沒有 hmi_ok 欄位、HMI 全無值
+    o_nh.notes = ["HMI 讀取失敗：無讀值（未登入或連線失敗）"]
+    o_part = obs_at(310, "D", soc=None, current_a=None, voltage_v=None, cell_vmax_v=None, cell_vmin_v=None)
+    nh = analyze([obs_at(s, "D") for s in range(0, 91, 10)] + [o_nh]
+                 + [obs_at(s, "D") for s in range(150, 301, 10)] + [o_part]
+                 + [obs_at(s, "D") for s in range(320, 401, 10)], p)
+    wb_nh = load_workbook(save_report(nh, META, os.path.join(tmp, "nohmi.xlsx")))
+    wn = wb_nh["整體測試"]
+    rw = wb_nh["Raw Data"]
+    RH = [c.value for c in rw[1]]
+    raw_by_t = {r_[RH.index("PC 取樣時間")]: r_ for r_ in rw.iter_rows(min_row=2, values_only=True)}
+    rn_ = raw_by_t[o_nh.t]
+    check("Raw Data：ok=True 但 HMI 全無值（舊資料，無 hmi_ok 欄位）→ 讀取結果「無有效讀值」（不是成功），"
+          "說明保留原因與原始備註，6161 PCS 模組溫度照常保留",
+          rn_[RH.index("讀取結果")] == "無有效讀值" and rn_[RH.index("SOC")] == "N/A"
+          and rn_[RH.index("PCS 模組溫度")] == 80
+          and "HMI 無有效讀值（通訊異常或未登入）" in rn_[RH.index("說明")]
+          and "HMI 讀取失敗：無讀值（未登入或連線失敗）" in rn_[RH.index("說明")]
+          and "僅 6161 溫度有效" in rn_[RH.index("說明")] and "未保存" not in rn_[RH.index("說明")])
+    rp_ = raw_by_t[o_part.t]
+    check("Raw Data：部分 HMI 欄位有效（只有 Rack 溫度）→ 仍為成功（單一／部分欄位缺值不算失敗）",
+          rp_[RH.index("讀取結果")] == "成功" and rp_[RH.index("Rack 最大溫度")] is not None
+          and rp_[RH.index("SOC")] == "N/A")
+    check("Raw Data：正常完整觀測 → 成功；觀測列數 = 全部 observations（不刪列）",
+          raw_by_t[T0][RH.index("讀取結果")] == "成功"
+          and sum(1 for r_ in rw.iter_rows(min_row=2, values_only=True)
+                  if r_[RH.index("讀取結果")] in ("成功", "失敗", "無有效讀值")) == len(nh.obs))
+    rn = row_of(wn, "10:02")
+    check("整體頁：±20 秒內只有 HMI 無讀值觀測 → HMI 欄位 N/A、保留 6161 溫度，備註寫明原因（不只寫 N/A）",
+          wn.cell(rn, COL["SOC"]).value == "N/A" and wn.cell(rn, COL["PCS 模組溫度"]).value == 80
+          and wn.cell(rn, NOTE).value == "N/A：HMI 無有效讀值（通訊異常或未登入），僅有 6161 溫度")
 
     print("\n== Summary ==")
     ss = wb["Summary"]
@@ -210,13 +243,18 @@ try:
     frames = [box(a) for a in anchors_x if "graphicFrame" in a]
     check("Summary 有真正的箭頭圖形：第1→2 向右、第2→3 向下（蛇形）",
           [s[0] for s in shapes] == ["rightArrow", "downArrow"])
-    check("箭頭內標示休息時間，由資料計算、只顯示整分鐘（R−B：300 秒 → 5 分、120 秒 → 2 分）",
-          [s[2] for s in shapes] == [["休息", "5 分"], ["休息", "2 分"]])
+    check("箭頭內只顯示「N 分」（不含休息等前後文字），由資料計算、只顯示整分鐘（R−B：300 秒 → 5 分、120 秒 → 2 分）",
+          [s[2] for s in shapes] == [["5 分"], ["2 分"]])
+    sps = [a for a in anchors_x if "prstGeom" in a]
+    rpr = [re.findall(r"<a:rPr ([^>]*)>", a) for a in sps]
+    check("箭頭文字：單行、粗體、14pt（ARROW_TEXT_SZ）、置中（水平 algn=ctr、垂直 anchor=ctr）",
+          len(rpr) == 2 and all(len(r_) == 1 and 'sz="1400"' in r_[0] and 'b="1"' in r_[0] for r_ in rpr)
+          and all('algn="ctr"' in a and 'anchor="ctr"' in a for a in sps))
     gap_obs = ([obs_at(s, "D") for s in range(0, 1201, 10)]
                + [obs_at(s, "C") for s in range(5249, 5550, 10)])      # A=10:20:00，R=11:27:29，中間無取樣
     rg = analyze(gap_obs, p)
-    check("中間無資料但兩端已知 → 「間隔約 67 分／期間無資料」（R−A=4049 秒，捨去秒數，不稱休息）",
-          arrow_text(rg, rg.stages[0], rg.stages[1]) == ["間隔約", "67 分", "期間無資料"])
+    check("中間無資料但兩端已知 → 箭頭只顯示觀測間隔「67 分」（R−A=4049 秒，捨去秒數）",
+          arrow_text(rg, rg.stages[0], rg.stages[1]) == ["67 分"])
     from cert_stage_engine import overall_minutes as _om
     gap_rows = [m for m in _om(rg) if T0 + timedelta(minutes=21) <= m.T <= T0 + timedelta(minutes=87)]
     check("同一缺口在全程資料仍為 N/A（箭頭有間隔不代表補值或連線）",
@@ -225,8 +263,8 @@ try:
               + [obs_at(1510, "X")] + [obs_at(s, "I") for s in range(1520, 1801, 10)]
               + [obs_at(s, "C") for s in range(1810, 2101, 10)])
     rr_ = analyze(rf_obs, p)
-    check("休息期間讀取失敗 → 「間隔約 10 分／期間讀取失敗」（R−A=610 秒）",
-          arrow_text(rr_, rr_.stages[0], rr_.stages[1]) == ["間隔約", "10 分", "期間讀取失敗"])
+    check("休息期間讀取失敗 → 箭頭只顯示觀測間隔「10 分」（R−A=610 秒）",
+          arrow_text(rr_, rr_.stages[0], rr_.stages[1]) == ["10 分"])
     check("分鐘無條件捨去：800 秒（13 分 20 秒）→ 13 分、59 秒 → 0 分、3599 秒 → 59 分",
           [rest_minutes_text(x) for x in (800, 59, 3599)] == ["13 分", "0 分", "59 分"])
 
@@ -236,8 +274,8 @@ try:
           all(not overlap(s[1], f) for s in shapes for f in frames))
     def title_of(ch):
         return "".join(r.t for p_ in ch.title.tx.rich.p for r in (p_.r or []))
-    check("Summary 圖表標題：第一次放電、第一次充電（未標記 → 用方向，不自動認定滿充／滿放）＋全程",
-          [title_of(c) for c in ss._charts][:2] == ["第一次放電", "第一次充電"]
+    check("Summary 圖表標題：250KW 第一次放電、250KW 第一次充電（電櫃規格前綴；未標記 → 用方向）＋全程",
+          [title_of(c) for c in ss._charts][:2] == ["250KW 第一次放電", "250KW 第一次充電"]
           and title_of(ss._charts[2]) == "【250KW】電櫃充放2個循環溫度曲線")
     check("整體溫度曲線標題：Summary 與「整體測試」頁一致＝「【250KW】電櫃充放2個循環溫度曲線」（規格取自測試資訊）",
           title_of(ss._charts[2]) == title_of(wb["整體測試"]._charts[0]) == "【250KW】電櫃充放2個循環溫度曲線")
@@ -255,16 +293,47 @@ try:
         bold_ok &= (isinstance(v, CellRichText) and str(v.__getitem__(0).text) == lab_
                     and v[0].font.b and not v[1].font.b)
     check("Summary 冷氣溫度：／硬體概述：／測試條件： 標籤粗體、內容一般字（同範本）", bold_ok)
-    lab = [{"type": "stage_label", "stage_start": st.start.t.strftime("%Y-%m-%dT%H:%M:%S"),
-            "label": w, "at": "2026-01-05 12:00:00", "by": "tester"}
-           for st, w in zip(res.stages, ["滿放", "滿充", "滿放"])]
-    check("有操作人員標記 → 標題「第一次滿放／第一次滿充／第二次滿放」（依標記各自計數）",
-          list(summary_titles(analyze(scenario(), p, lab).stages).values())
-          == ["第一次滿放", "第一次滿充", "第二次滿放"])
+    def titled(plan, meta=None):
+        """plan：[(方向, 首筆 SOC, 標記或 None)]；各階段 5 分鐘、中間待機 2 分鐘（≥ W，分成不同階段）。"""
+        obs_, lab_, t = [], [], 0
+        for k, soc0, w in plan:
+            obs_ += [obs_at(t + s, k, soc=soc0 if s == 0 else 50) for s in range(0, 301, 10)]
+            if w:
+                lab_.append({"type": "stage_label", "stage_start": (T0 + timedelta(seconds=t)).strftime(
+                    "%Y-%m-%dT%H:%M:%S"), "label": w, "at": "2026-01-05 12:00:00", "by": "tester"})
+            obs_ += [obs_at(t + s, "I") for s in range(310, 431, 10)]
+            t += 440
+        r_ = analyze(obs_, p, lab_)
+        assert [st.dir for st in r_.stages] == [k for k, _s, _w in plan]
+        return list(summary_titles(r_.stages, meta).values())
+    spec = {"cabinet_spec": "250KW"}
+    check("滿放＋滿充＋無標記＋滿充 → 250KW 第一次滿放／第一次滿充／第二次放電／第二次滿充（起始 SOC 100／0 且有人工標記）",
+          titled([("D", 100, "滿放"), ("C", 0, "滿充"), ("D", 100, None), ("C", 0, "滿充")], spec)
+          == ["250KW 第一次滿放", "250KW 第一次滿充", "250KW 第二次放電", "250KW 第二次滿充"])
+    check("電櫃規格未輸入（無欄位／None／空白）→ 不加前綴，不顯示 None、N/A",
+          all(titled([("D", 100, "滿放"), ("C", 0, None)], m_) == ["第一次滿放", "第一次充電"]
+              for m_ in (None, {}, {"cabinet_spec": None}, {"cabinet_spec": "  "})))
+    check("起始 SOC 不是精確 0／100（充電 SOC 1＋滿充、放電 SOC 99＋滿放）→ 充電／放電",
+          titled([("C", 1, "滿充"), ("D", 99, "滿放")], spec) == ["250KW 第一次充電", "250KW 第一次放電"])
+    check("首筆 SOC 缺值＋滿充／滿放標記 → 充電／放電（無法驗證起始條件）",
+          titled([("C", None, "滿充"), ("D", None, "滿放")], spec) == ["250KW 第一次充電", "250KW 第一次放電"])
+    check("無標記：起始 SOC 0／100 也不自動認定 → 充電／放電",
+          titled([("C", 0, None), ("D", 100, None)], spec) == ["250KW 第一次充電", "250KW 第一次放電"])
+    check("標記為未滿／中止 → 充電／放電",
+          titled([("C", 0, "未滿"), ("D", 100, "中止"), ("C", 0, "中止"), ("D", 100, "未滿")], spec)
+          == ["250KW 第一次充電", "250KW 第一次放電", "250KW 第二次充電", "250KW 第二次放電"])
+    check("標記方向不符（舊資料繞過防呆：放電標滿充、充電標滿放）→ 不採用，仍為放電／充電",
+          titled([("D", 100, "滿充"), ("C", 0, "滿放")], spec) == ["250KW 第一次放電", "250KW 第一次充電"])
+    check("次數依充／放電方向計數、不受標記影響：滿放／放電／滿充／滿放 → 第一次／第二次／第一次／第三次",
+          titled([("D", 100, "滿放"), ("D", 100, None), ("C", 0, "滿充"), ("D", 100, "滿放")], spec)
+          == ["250KW 第一次滿放", "250KW 第二次放電", "250KW 第一次滿充", "250KW 第三次滿放"])
     check("中文序數：1→一、10→十、11→十一、23→二十三",
           [_cn_num(n) for n in (1, 10, 11, 23)] == ["一", "十", "十一", "二十三"])
 
     print("\n== 截圖頁 ==")
+    sv = wb["數據概覽"].sheet_view
+    check("數據概覽：切換到本頁時從頂端開始（topLeftCell=A1、選取 A1）；活頁簿預設頁仍為 Summary",
+          sv.topLeftCell == "A1" and sv.selection[0].activeCell == "A1" and wb.active.title == "Summary")
     for name in ("數據概覽", "即時熱度"):
         w = wb[name]
         ph = [c.value for row in w.iter_rows() for c in row if c.value and "待截圖" in str(c.value)]
