@@ -339,8 +339,10 @@ try:
                                   and c.alignment.horizontal == "center" for c in heads)
           and any(str(m) == "A2:J2" for m in wh.merged_cells.ranges) and htp[0][1] == 2)
     od = sheet_xml("數據概覽")
-    arrs = re.findall(r'<xdr:absoluteAnchor[^>]*><xdr:pos x="(\d+)" y="(\d+)"/><xdr:ext cx="(\d+)" cy="(\d+)"/>'
-                      r'(.*?)</xdr:absoluteAnchor>', od, re.S)
+    anchors = re.findall(r'<xdr:absoluteAnchor[^>]*><xdr:pos x="(\d+)" y="(\d+)"/><xdr:ext cx="(\d+)" cy="(\d+)"/>'
+                         r'(.*?)</xdr:absoluteAnchor>', od, re.S)
+    arrs = [a_ for a_ in anchors if "擷取時間" not in a_[4]]
+    tbox = [a_ for a_ in anchors if "擷取時間" in a_[4]]
     body = arrs[0][4] if arrs else ""
     check("數據概覽：只有一支細長向下箭頭，淡藍底 8FAADC、白色粗體「時／間／序」直排",
           len(arrs) == 1 and od.count('prst="downArrow"') == 1 and 'prst="downArrow"' in body
@@ -358,6 +360,37 @@ try:
     gaps = [row_top(t) - (row_top(r0) + h) for (_c, r0, _w, h), t in zip(ovp, titles[1:])]
     check(f"各階段之間的間距一致，恢復原本 2 列空白（{gaps} px），不再為箭頭加寬",
           len(set(gaps)) == 1 and 30 <= gaps[0] <= 60)
+
+    print("\n== 數據概覽：截圖右上角擷取日期時間（PC captured_at；不使用報告產生時間）==")
+    recs = load_manifest(w.folder)
+    want_t = [datetime.fromisoformat(select_stage_shot(recs, keys[i].strftime("%Y-%m-%dT%H:%M:%S"), "overview")[1]["captured_at"])
+              .strftime("%Y-%m-%d %H:%M:%S") for i in (0, 1)]
+    got_t = [re.findall(r"<a:t>([^<]+)</a:t>", b_[4]) for b_ in tbox]
+    check(f"每張數據概覽截圖各一個時間文字框（{len(tbox)}＝圖片 {len(ovp)} 張），內容＝各自選用截圖的 captured_at：{got_t}",
+          len(tbox) == len(ovp) == 2 and got_t == [[t_] for t_ in want_t]
+          and all(re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", t_) for t_ in want_t))
+    tb_px = [tuple(int(v) // 9525 for v in b_[:4]) for b_ in tbox]
+    check(f"文字框位於各自截圖右上方標題列、「● Normal」左側（{tb_px}；圖寬 {ovp[0][2]}px）：右緣 ≤ 圖寬−90px、"
+          f"頂端在圖片頂端下 10～30px、底端不進入 SOC／SOH 框（< 圖片頂端＋65px）、無底色無框線",
+          all(x_ >= 0 and x_ + cx_ <= iw_ - 90 and 10 <= y_ - row_top(r0_) <= 30 and y_ + cy_ < row_top(r0_) + 65
+              for (x_, y_, cx_, cy_), (_c, r0_, iw_, _h) in zip(tb_px, ovp))
+          and all("<a:noFill/><a:ln><a:noFill/></a:ln>" in b_[4] and 'algn="r"' in b_[4] for b_ in tbox))
+    meta_r = dict(meta, generated_at="2099-12-31 23:59:59")
+    z_r = zipfile.ZipFile(save_report(res, meta_r, os.path.join(tmp, "r_regen.xlsx")))
+    od_r = next(z_r.read(n_).decode() for n_ in z_r.namelist()
+                if n_.startswith("xl/drawings/drawing") and "擷取時間" in z_r.read(n_).decode())
+    z_r.close()
+    check("重新產生（報告產生時間不同，模擬 Menu 25）→ 時間文字不變，不會變成產報時間",
+          re.findall(r'name="擷取時間\d"(?:(?!</xdr:sp>).)*?<a:t>([^<]+)</a:t>', od_r, re.S) == want_t
+          and "2099" not in od_r)
+    recs_na = [dict(r_, captured_at=None) if r_["type"] == "result" else r_ for r_ in recs]
+    z_n = zipfile.ZipFile(save_report(res, dict(meta, screenshots=dict(meta["screenshots"], records=recs_na)),
+                                      os.path.join(tmp, "r_na.xlsx")))
+    od_n = next(z_n.read(n_).decode() for n_ in z_n.namelist()
+                if n_.startswith("xl/drawings/drawing") and "擷取時間" in z_n.read(n_).decode())
+    z_n.close()
+    check("舊資料沒有可解析的 captured_at → 顯示 N/A（不以產報時間冒充）",
+          re.findall(r'name="擷取時間\d"(?:(?!</xdr:sp>).)*?<a:t>([^<]+)</a:t>', od_n, re.S) == ["N/A", "N/A"])
     hd = sheet_xml("即時熱度")
     check("即時熱度：已移除第 1、2 階段之間的向下箭頭（保留標題、底色、熱度圖標題與圖片）",
           'prst="downArrow"' not in hd and "absoluteAnchor" not in hd and len(htp) == 1

@@ -660,18 +660,11 @@ try:
     rtC.tick()
     rep_c = REQ.read_result(root_c, rqe)["data"]["report"]
     wbc = load_workbook(rep_c)
-    wsc = wbc["控制紀錄"]
-    crow = [[wsc.cell(r, c).value for c in range(1, 12)] for r in range(2, wsc.max_row + 1)]
-    for row_ in crow:
-        print("     ", row_[0], "|", row_[1], "|", row_[2], "|", row_[3], "|", row_[4], row_[5], "|", row_[6], "|", row_[7], row_[8], row_[9])
-    check("Excel「控制紀錄」：第1次放電＝直流恆流 100 A、第2次放電＝直流恆功率 100 kW，停止指令各自歸屬",
-          [(r_[1], r_[2], r_[3], r_[4], r_[5]) for r_ in crow]
-          == [("第1次放電", "放電", "直流恆流", 100, "A"), ("第1次放電", "停止", "停止", "N/A", "N/A"),
-              ("第2次放電", "放電", "直流恆功率", 100, "kW"), ("第2次放電", "停止", "停止", "N/A", "N/A")]
-          and all(r_[7] == "成功" and r_[8] == "成功" for r_ in crow))
-    check("頁籤：Summary／數據概覽／即時熱度 不變，控制紀錄在整體測試之後、Raw Data 之前",
+    check("頁籤：Summary／數據概覽／即時熱度 不變，整體測試之後直接是 Raw Data；報告不含「控制紀錄」頁",
           wbc.sheetnames[:3] == ["Summary", "數據概覽", "即時熱度"]
-          and wbc.sheetnames[-3:] == ["整體測試", "控制紀錄", "Raw Data"])
+          and wbc.sheetnames[-2:] == ["整體測試", "Raw Data"] and "控制紀錄" not in wbc.sheetnames)
+    check("產報後底層 commands.jsonl 仍完整保留（4 筆，不因移除頁籤而刪除）",
+          _read_jsonl(os.path.join(root_c, cid_c, "commands.jsonl")) == cmds)
 
     print("\n== 控制紀錄：舊資料相容、無法對應階段 → N/A ==")
     cd_ = os.path.join(root_c, cid_c)
@@ -688,17 +681,9 @@ try:
     rtC.tick()
     rg_ = REQ.read_result(root_c, rqg)
     check(f"舊格式 commands.jsonl（缺新欄位）→ 報告照常產生、無 Exception（{rg_['status']}）", rg_["status"] == "done")
-    wso = load_workbook(rg_["data"]["report"])["控制紀錄"]
-    orow = {(wso.cell(r, 7).value, str(wso.cell(r, 1).value)): [wso.cell(r, c).value for c in range(1, 12)]
-            for r in range(2, wso.max_row + 1)}
-    r1 = next(v for (a_, _t), v in orow.items() if a_ == "pcs_dc_current_discharge")
-    check(f"舊資料：模式／單位依 action 對照、設定值與驗證結果 N/A、備註註明（{r1[3]}，{r1[4]}，{r1[5]}，{r1[8]}）",
-          r1[1] == "第1次放電" and r1[3] == "直流恆流" and r1[4] == "N/A" and r1[5] == "A" and r1[8] == "N/A"
-          and "舊資料未保存設定值" in r1[10])
-    r2 = next(v for (a_, _t), v in orow.items() if a_ == "pcs_dc_current_charge")
-    r3 = next(v for (a_, _t), v in orow.items() if a_ == "ac_on")
-    check("沒有對應的充電階段 → 階段 N/A（不猜測）；非充放電控制 → 方向／模式 N/A",
-          r2[1] == "N/A" and "無法可靠對應階段" in r2[10] and r3[1] == "N/A" and r3[2] == "N/A" and r3[3] == "N/A")
+    check("Menu 25 重新產生的報告也不含「控制紀錄」頁；commands.jsonl 未被改寫",
+          "控制紀錄" not in load_workbook(rg_["data"]["report"]).sheetnames
+          and _read_jsonl(os.path.join(cd_, "commands.jsonl")) == old)
 
     print("\n== 控制紀錄：驗證結果顯示（verify_success 原值照實區分）==")
     import cert_report_xlsx as CRX
@@ -731,11 +716,10 @@ try:
     rtV.commands = _read_jsonl(os.path.join(root_v, cid_v, "commands.jsonl"))
     rqe_v = req(root_v, clk_v, "end_cert", cert_id=cid_v)
     rtV.tick()
-    wsv = load_workbook(REQ.read_result(root_v, rqe_v)["data"]["report"])["控制紀錄"]
-    got = [wsv.cell(r, 9).value for r in range(2, 7)]
-    check(f"報告「驗證結果」欄：True／False／partial／None／欄位不存在 → {got}",
-          got == ["成功", "失敗", "部分驗證", "N/A", "N/A"]
-          and "回讀僅部分確認" in str(wsv.cell(4, 11).value) and "回讀僅部分確認" not in str(wsv.cell(2, 11).value))
+    rv_ = REQ.read_result(root_v, rqe_v)
+    check("各種 verify_success 值 → 報告照常產生、不含「控制紀錄」頁；commands.jsonl 5 筆保留",
+          rv_["status"] == "done" and "控制紀錄" not in load_workbook(rv_["data"]["report"]).sheetnames
+          and len(_read_jsonl(os.path.join(root_v, cid_v, "commands.jsonl"))) == 5)
 
     print("\n== 實機 Field Test 資料（CERT_20261028_165847 複本，離線重產；不動原始資料）==")
     real = os.path.join(HERE, "..", "output", "cert_reports", "CERT_20261028_165847")
@@ -746,13 +730,8 @@ try:
         raw_before = open(os.path.join(real, "commands.jsonl"), encoding="utf-8").read()
         rtR2 = CertRuntime(root_r2, reader=None, enable_shots=False, clock=clk_v, log=lambda *a: None)
         ok_, msg_, path_ = rtR2.generate_report("CERT_20261028_165847")
-        wsr = load_workbook(path_)["控制紀錄"]
-        rows_r = [[wsr.cell(r, c).value for c in range(1, 12)] for r in range(2, wsr.max_row + 1)]
-        for row_ in rows_r:
-            print("     ", row_[0], "|", row_[1], "|", row_[6], "| 控制", row_[7], "| 驗證", row_[8], "| 整體", row_[9])
-        check("實機兩筆（放電 140 A、停止）驗證結果顯示「部分驗證」；控制結果／整體結果仍為成功；階段、設定值不變",
-              ok_ and [(r_[1], r_[4], r_[5], r_[7], r_[8], r_[9]) for r_ in rows_r]
-              == [("第1次放電", 140, "A", "成功", "部分驗證", "成功"), ("第1次放電", "N/A", "N/A", "成功", "部分驗證", "成功")])
+        check("實機資料重產：報告照常產生、不含「控制紀錄」頁",
+              ok_ and "控制紀錄" not in load_workbook(path_).sheetnames)
         check("原始 commands.jsonl 未被修改（仍為 \"partial\"）",
               open(os.path.join(real, "commands.jsonl"), encoding="utf-8").read() == raw_before
               and raw_before.count('"verify_success": "partial"') == 2)
@@ -826,7 +805,7 @@ try:
           and rmk.get("09:17") == "停機" and rmk.get("09:20") == "N/A" and "休息" not in rmk.values())
     rws = wbs["Raw Data"]
     rh = [c.value for c in rws[1]]
-    rrows = [[c.value for c in r_] for r_ in rws.iter_rows(min_row=2) if r_[3].value in ("成功", "失敗")]
+    rrows = [[c.value for c in r_] for r_ in rws.iter_rows(min_row=2) if r_[rh.index("讀取結果")].value in ("成功", "失敗")]
     st_set = {r_[rh.index("狀態")] for r_ in rrows}
     fault_t = {r["t"] for r in recs_s if r["flags"]["pcs_fault_flag"] is True}
     check(f"Raw Data 狀態只出現 待機／停機／第N次放電（{sorted(st_set)}；無 N/A），說明保留分析狀態與上下電原始值；"
@@ -836,13 +815,13 @@ try:
                   for r_ in rrows)
           and not any(r_[rh.index("PC 取樣時間")].strftime("%Y-%m-%dT%H:%M:%S") in fault_t for r_ in rrows)
           and len(rrows) == len(recs_s) - len(fault_t))
-    by_src = {r_[rh.index("來源")]: r_ for r_ in rrows}
-    check("Raw Data 數值（Cell 最大電壓、SOC、電流）照原始值，未被改寫（依來源列號對回）",
-          all((by_src[f"observations.jsonl:{i + 1}"][rh.index("Cell 最大電壓")],
-               by_src[f"observations.jsonl:{i + 1}"][rh.index("SOC")],
-               by_src[f"observations.jsonl:{i + 1}"][rh.index("電流")])
-              == (r["values"]["cell_vmax_v"], r["values"]["soc"], r["values"]["current_a"])
-              for i, r in enumerate(recs_s) if f"observations.jsonl:{i + 1}" in by_src))
+    by_seq = {r_[rh.index("序號")]: r_ for r_ in rrows}
+    check("Raw Data 數值（Cell 最大電壓、SOC、電流）照原始值，未被改寫（依序號＝observations.jsonl 列號對回）",
+          len(by_seq) == len(rrows) and "來源" not in rh
+          and all((by_seq[i + 1][rh.index("Cell 最大電壓")], by_seq[i + 1][rh.index("SOC")],
+                   by_seq[i + 1][rh.index("電流")], by_seq[i + 1][rh.index("PC 取樣時間")].strftime("%Y-%m-%dT%H:%M:%S"))
+                  == (r["values"]["cell_vmax_v"], r["values"]["soc"], r["values"]["current_a"], r["t"])
+                  for i, r in enumerate(recs_s) if i + 1 in by_seq))
 
     print("\n== 實機舊資料（CERT_20261028_165847，沒有保存上下電）→ 非充放電 N/A ==")
     if os.path.isdir(real):
@@ -860,7 +839,7 @@ try:
               and [k for k, v in orm if v == "第1次放電"] == ["17:06", "17:07", "17:08", "17:09", "17:10"])
         ro_ = wbo["Raw Data"]
         oh = [c.value for c in ro_[1]]
-        ost = [r_[oh.index("狀態")].value for r_ in ro_.iter_rows(min_row=2) if r_[3].value in ("成功", "失敗")]
+        ost = [r_[oh.index("狀態")].value for r_ in ro_.iter_rows(min_row=2) if r_[oh.index("讀取結果")].value in ("成功", "失敗")]
         res_o = rtO._offline(os.path.join(root_o2, "CERT_20261028_165847")).analysis()
         n_dis = sum(1 for o in res_o.obs if o.state == "放電")
         check(f"舊資料（未保存上下電）Raw Data：只輸出狀態可判定的第1次放電 {ost.count('第1次放電')} 筆（＝分析為放電的 {n_dis} 筆）；"
@@ -869,9 +848,10 @@ try:
         check("舊資料階段判定不變（第1次放電 17:05:14 開始、idle_confirmed）",
               [(st.start.t.strftime("%H:%M:%S"), st.end_by) for st in res_o.stages] == [("17:05:14", "idle_confirmed")])
         zo = zipfile.ZipFile(path_o)
-        check("舊資料：自動截圖（數據概覽／即時熱度各 1 張）、控制紀錄 2 筆仍在",
+        check("舊資料：自動截圖（數據概覽／即時熱度各 1 張）；報告不含控制紀錄頁，底層 commands.jsonl 2 筆仍在",
               sum(1 for n in zo.namelist() if n.startswith("xl/media/")) == 2
-              and wbo["控制紀錄"].max_row == 3 and wbo["控制紀錄"].cell(2, 9).value == "部分驗證")
+              and "控制紀錄" not in wbo.sheetnames
+              and len(_read_jsonl(os.path.join(root_o2, "CERT_20261028_165847", "commands.jsonl"))) == 2)
         zo.close()
 
     # 交付：模擬 Excel 副本

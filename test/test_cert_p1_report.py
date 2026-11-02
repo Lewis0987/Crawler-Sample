@@ -31,7 +31,7 @@ from openpyxl.utils import get_column_letter
 
 import cert_report_config as CFG
 from cert_stage_engine import Obs, analyze
-from cert_report_xlsx import (LOG_HEADERS, _cn_num, arrow_text, overall_title, rest_minutes_text, save_report,
+from cert_report_xlsx import (LOG_HEADERS, _cn_num, arrow_text, build_workbook, overall_title, rest_minutes_text, save_report,
                               summary_titles)
 
 _results = []
@@ -94,14 +94,13 @@ try:
           [st.dir for st in res.stages] == ["D", "C", "D"]
           and [len(st.pauses) for st in res.stages] == [1, 1, 0]
           and res.stages[0].pauses[0].certain and not res.stages[1].pauses[0].certain)
-    check("頁籤順序：Summary／數據概覽／即時熱度／各階段（動態 3 個）／整體測試／控制紀錄／Raw Data",
+    check("頁籤順序：Summary／數據概覽／即時熱度／各階段（動態 3 個）／整體測試／Raw Data（不含控制紀錄）",
           wb.sheetnames == ["Summary", "數據概覽", "即時熱度", "1.第1次放電", "2.第1次充電",
-                            "3.第2次放電", "整體測試", "控制紀錄", "Raw Data"])
-    wc = wb["控制紀錄"]
-    check("來源沒有指令紀錄（離線資料）→ 控制紀錄頁顯示「無控制紀錄」，不推定歷史控制資訊",
-          [wc.cell(1, c).value for c in range(1, 10)] == ["時間", "階段", "方向", "控制模式", "設定值", "單位",
-                                                          "Action", "控制結果", "驗證結果"]
-          and str(wc["A2"].value).startswith("無控制紀錄") and wc.max_row == 2)
+                            "3.第2次放電", "整體測試", "Raw Data"])
+    check("報告不建立「控制紀錄」頁（含 commands 有資料時）",
+          "控制紀錄" not in wb.sheetnames
+          and "控制紀錄" not in build_workbook(res, dict(META, commands=[
+              {"t": "2026-01-01T00:00:00", "action": "pcs_stop_power", "control_success": True}])).sheetnames)
 
     print("\n== 階段頁 ==")
     ws = wb["1.第1次放電"]
@@ -224,10 +223,17 @@ try:
                       for h in ("SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓",
                                 "總電壓", "PCS 模組溫度", "功率 kW")))
     seqs = [r_[RH.index("序號")] for r_ in raw_obs_rows]
-    check("17 Traceability：序號沿用原觀測 seq（跳過被排除者、不重新編號），來源欄指回原始紀錄",
+    check("17 Traceability：序號沿用原觀測 seq（跳過被排除者、不重新編號），序號＝observations.jsonl 列號（內部 src 仍保留）",
           o_nh.seq + 1 not in seqs and o_nh.seq in seqs and o_nh.seq + 2 in seqs
           and o_pcs.seq + 1 not in seqs and o_pcs.seq in seqs and o_pcs.seq + 2 in seqs
-          and all(r_[RH.index("來源")] == nh.obs[r_[0] - 1].src for r_ in raw_obs_rows))
+          and all(nh.obs[r_[0] - 1].t == r_[RH.index("PC 取樣時間")]
+                  and nh.obs[r_[0] - 1].src for r_ in raw_obs_rows))
+    check("1/3/4 Raw Data 欄位：不含「來源」，讀取結果緊接 PC 取樣時間，其後順序正確",
+          RH == ["序號", "PC 取樣時間", "讀取結果", "狀態", "所屬階段", "對應報表分鐘", "SOC", "電流",
+                 "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓", "傳感器溫度",
+                 "PCS 模組溫度", "功率 kW", "說明"])
+    check("2 Raw Data 任何儲存格都不出現 observations.jsonl:*（來源只留在程式內部）",
+          not any("observations.jsonl" in str(v) for r_ in rw.iter_rows(values_only=True) for v in r_ if v is not None))
     print("\n== Raw Data 狀態 ==")
     BP_ON = {"battery_power_status": "已上電", "pcs_fault_flag": False}
 
@@ -264,10 +270,10 @@ try:
     check("12 選用傳感器 N/A 不影響狀態：已上電 → 待機、整筆保留", stv(s_sen) == "待機"
           and st_by_t[s_sen.t][SH.index("傳感器溫度")] == "N/A")
     seq_s = [r_[0] for r_ in st_by_t.values()]
-    check("15/16 序號沿用原 seq（被排除者跳號、不重新編號），來源欄指回原觀測",
+    check("15/16 序號沿用原 seq（被排除者跳號、不重新編號），序號指回原觀測",
           all(o_.seq + 1 not in seq_s for o_ in (s_unk, s_flt, s_lag, s_zero))
           and s_sen.seq + 1 in seq_s and s_zero.seq + 2 in seq_s
-          and all(r_[SH.index("來源")] == rs.obs[r_[0] - 1].src for r_ in st_by_t.values()))
+          and all(rs.obs[r_[0] - 1].t == r_[SH.index("PC 取樣時間")] for r_ in st_by_t.values()))
     check("13 狀態欄 Filter 不改 Stage Detection（同資料去掉 flags 重新分析，階段與 state 相同）",
           [(st.start.t, st.A.t, st.end_by) for st in rs.stages]
           == [(st.start.t, st.A.t, st.end_by) for st in analyze(
@@ -480,30 +486,31 @@ try:
 
     print("\n== Raw Data 追溯 ==")
     rw = wb["Raw Data"]
-    hdr = [rw.cell(1, c).value for c in range(1, 19)]
-    rows = [[rw.cell(r, c).value for c in range(1, 19)] for r in range(2, rw.max_row + 1)]
-    check("Raw Data：Rack 最小溫度後加入 Cell 最大／最小電壓，說明欄移到最後（R）",
-          hdr[10:13] == ["Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓"] and hdr[17] == "說明"
-          and rw.auto_filter.ref.startswith("A1:R"))
-    _ok = [r for r in rows if r[3] == "成功" and r[11] not in (None, "N/A")]
-    check(f"Raw Data Cell 電壓保留原始值（{_ok[0][11] if _ok else None}）",
-          _ok and _ok[0][11] == 3.4015 and _ok[0][12] == 3.3852)
-    obs_rows = [r for r in rows if r[3] in ("成功", "失敗")]
-    na_rows = [r for r in rows if r[3] == "（無取樣）"]
+    hdr = [c.value for c in rw[1]]
+    rows = [[c.value for c in r_] for r_ in rw.iter_rows(min_row=2)]
+    H = {h: i for i, h in enumerate(hdr)}                     # 欄名 → 索引（不寫死欄號）
+    check("Raw Data：Rack 最小溫度後加入 Cell 最大／最小電壓，說明欄在最後（Q，移除來源後左移一欄）",
+          hdr[H["Rack 最小溫度"]:H["Rack 最小溫度"] + 3] == ["Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓"]
+          and hdr[-1] == "說明" and len(hdr) == 17 and rw.auto_filter.ref.startswith("A1:Q"))
+    _ok = [r for r in rows if r[H["讀取結果"]] == "成功" and r[H["Cell 最大電壓"]] not in (None, "N/A")]
+    check(f"Raw Data Cell 電壓保留原始值（{_ok[0][H['Cell 最大電壓']] if _ok else None}）",
+          _ok and _ok[0][H["Cell 最大電壓"]] == 3.4015 and _ok[0][H["Cell 最小電壓"]] == 3.3852)
+    obs_rows = [r for r in rows if r[H["讀取結果"]] in ("成功", "失敗")]
+    na_rows = [r for r in rows if r[H["讀取結果"]] == "（無取樣）"]
     from cert_report_xlsx import _stage_title, raw_rows_obs
     from cert_stage_engine import stage_names as _sn
     nf_ = {st.no: _stage_title(_sn(res.stages), st) for st in res.stages}
     check(f"Raw Data 只輸出有效報告資料：讀取失敗 5 筆、必要欄位缺值、狀態無法判定者整筆不輸出（觀測列 {len(obs_rows)}），"
           "失敗原因仍在「（無取樣）」列",
-          len(obs_rows) == len(raw_rows_obs(res, p, nf_)) and not any(r[3] == "失敗" for r in obs_rows)
+          len(obs_rows) == len(raw_rows_obs(res, p, nf_)) and not any(r[H["讀取結果"]] == "失敗" for r in obs_rows)
           and len(obs_rows) < len(res.obs) - 5)
     check("Raw Data 保留實際取樣時間（含秒）", hdr[1] == "PC 取樣時間"
-          and obs_rows[0][1] == T0)
-    m = [r for r in obs_rows if r[6] and "階段頁「1.第1次放電」 10:05（+0 秒）" in r[6]]
+          and obs_rows[0][H["PC 取樣時間"]] == T0)
+    m = [r for r in obs_rows if r[H["對應報表分鐘"]] and "階段頁「1.第1次放電」 10:05（+0 秒）" in r[H["對應報表分鐘"]]]
     check("階段頁每分鐘可對回 Raw Data 原始紀錄（10:05 → 10:05:00）",
-          len(m) == 1 and m[0][1] == T0 + timedelta(minutes=5))
+          len(m) == 1 and m[0][H["PC 取樣時間"]] == T0 + timedelta(minutes=5))
     check("N/A 分鐘在 Raw Data 有「（無取樣）」列與原因",
-          any("10:30（N/A）" in str(r[6]) and "讀取失敗" in str(r[17]) for r in na_rows))
+          any("10:30（N/A）" in str(r[H["對應報表分鐘"]]) and "讀取失敗" in str(r[H["說明"]]) for r in na_rows))
 
     print("\n== 操作人員確認與一致性 ==")
     dec = [{"item_id": item, "choice": "split", "at": "2026-01-05 12:10:00", "by": "tester"}]
@@ -586,10 +593,13 @@ try:
         check("082805：08:57:22 在 observations.jsonl（第 165 筆）存在、Raw Data 不存在；08:57:12、08:57:33 仍在",
               j165["t"].endswith("08:57:22") and "08:57:22" not in ftimes
               and {"08:57:12", "08:57:33"} <= ftimes)
-        seq_by_t = {r_[RH.index("PC 取樣時間")].strftime("%H:%M:%S"): (r_[0], r_[RH.index("來源")]) for r_ in fobs}
-        check("082805 Traceability：08:57:12 → 164／observations.jsonl:164、08:57:33 → 166／observations.jsonl:166（165 跳號）",
-              seq_by_t["08:57:12"] == (164, "observations.jsonl:164")
-              and seq_by_t["08:57:33"] == (166, "observations.jsonl:166"))
+        seq_by_t = {r_[RH.index("PC 取樣時間")].strftime("%H:%M:%S"): r_[0] for r_ in fobs}
+        check("082805 Traceability：08:57:12 → 序號 164、08:57:33 → 序號 166（165 跳號）；序號＝observations.jsonl 列號",
+              seq_by_t["08:57:12"] == 164 and seq_by_t["08:57:33"] == 166
+              and rf.obs[163].src == "observations.jsonl:164" and rf.obs[165].src == "observations.jsonl:166"
+              and rtf.records[163]["t"].endswith("08:57:12") and rtf.records[165]["t"].endswith("08:57:33"))
+        check("082805 Raw Data 不含「來源」欄、沒有 observations.jsonl:* 文字",
+              "來源" not in RH and not any("observations.jsonl" in str(v) for r_ in fobs for v in r_ if v is not None))
         check("7 observations.jsonl 未修改（SHA256 前後一致，複本 = 原始）",
               sha(src_obs) == sha0 == sha(os.path.join(froot, cid, "observations.jsonl")))
         spans = [RX.chart_span(wbf, {s_.no: n_ for s_, n_ in zip(rf.stages, [n_ for n_ in wbf.sheetnames
@@ -646,7 +656,7 @@ try:
         finally:
             RX.raw_rows_obs = _orig
         others = [n_ for n_ in wbf.sheetnames if n_ != "Raw Data"]
-        check("10/20 Raw Data Filter 不影響其他頁籤（Summary／數據概覽／即時熱度／階段頁／整體測試／控制紀錄 內容相同）",
+        check("10/20 Raw Data Filter 不影響其他頁籤（Summary／數據概覽／即時熱度／階段頁／整體測試 內容相同）",
               wbf.sheetnames == wbu.sheetnames and all(
                   [[c.value for c in row] for row in wbf[n_].iter_rows()]
                   == [[c.value for c in row] for row in wbu[n_].iter_rows()] for n_ in others)

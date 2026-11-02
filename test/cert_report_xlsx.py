@@ -314,6 +314,18 @@ def _shot_for(shots, st, target):
     return None, text, ""
 
 
+def _shot_time_text(shots, st, target):
+    """
+    截圖右上角顯示的日期時間：該階段被選用截圖的 PC 實際擷取時間（screenshots.jsonl 的 captured_at）。
+    不用報告產生／重產時間代替；紀錄沒有可解析的 captured_at → "N/A"。
+    """
+    _job, res = select_stage_shot(shots["records"], _stage_key(st), target)
+    try:
+        return datetime.fromisoformat(res["captured_at"]).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, KeyError):
+        return NA
+
+
 def _title_cols(titles):
     """
     標題底色欄數：只涵蓋標題文字＋左右留白（同一頁籤各階段統一取最長者）。
@@ -361,6 +373,7 @@ def _write_overview(ws, stages, names, shots=None):
     ws.sheet_view.selection[0].activeCell = ws.sheet_view.selection[0].sqref = "A1"
     r = 1
     spans, right = [], OV_IMG_PX           # 各區塊 (頂端, 底端)：(列 0 起算, 列內偏移 px)；right＝最寬圖片右緣
+    times = []                             # 各截圖右上角擷取時間：(圖片頂端列 0 起算, 圖片寬 px, 文字)
     tcols = _title_cols(f"{_stage_title(names, st)}結束" for st in stages)
     for st in stages:
         title = f"{_stage_title(names, st)}結束"
@@ -374,6 +387,7 @@ def _write_overview(ws, stages, names, shots=None):
             img = PngImage(path)
             img.anchor = f"A{r}"
             ws.add_image(img)
+            times.append((r - 1, img.width, _shot_time_text(shots, st, "overview")))
             spans.append(((r - 1, 0), (r - 1 + img.height // ROW_PX, img.height % ROW_PX)))
             right = max(right, img.width)
             r += -(-img.height // ROW_PX) + 2
@@ -389,6 +403,10 @@ def _write_overview(ws, stages, names, shots=None):
         first, last = spans[0][0], spans[min(1, len(spans) - 1)][1]
         heights = {i: ws.row_dimensions[i].height for i in range(1, last[0] + 2) if ws.row_dimensions[i].height}
         ws._cert_order_arrow = (first, last, right + OV_ARROW_GAP_PX, heights, OV_ARROW_W_PX)   # 存檔後寫入 drawing
+    if times:
+        heights = {i: ws.row_dimensions[i].height for i in range(1, max(t[0] for t in times) + 2)
+                   if ws.row_dimensions[i].height}
+        ws._cert_shot_times = [(row0, w, text, heights) for row0, w, text in times]           # 存檔後寫入 drawing
 
 
 def _write_heat(ws, stages, names, shots=None):
@@ -640,10 +658,13 @@ def _arrow_xml(k, prst, spec, r0, text):
 # =============================================================================
 # Raw Data
 # =============================================================================
-RAW_HEADERS = ["序號", "PC 取樣時間", "來源", "讀取結果", "狀態", "所屬階段", "對應報表分鐘",
+RAW_HEADERS = ["序號", "PC 取樣時間", "讀取結果", "狀態", "所屬階段", "對應報表分鐘",
                "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓",
                "傳感器溫度", "PCS 模組溫度", "功率 kW", "說明"]
 RAW_NOTE_COL = len(RAW_HEADERS)
+RAW_COL = {h: i for i, h in enumerate(RAW_HEADERS, 1)}     # 欄名 → 欄號（不寫死欄號）
+# 來源（observations.jsonl:N）不輸出到報告；Obs.src／seq 仍保留於程式內供追溯／重播
+RAW_WIDTHS = {"序號": 7, "PC 取樣時間": 20, "讀取結果": 9, "狀態": 11, "所屬階段": 13, "對應報表分鐘": 34, "說明": 30}
 
 
 # Raw Data 必要量測欄位：任一缺值 → 整筆不輸出。傳感器溫度（sensor_c）為選用：多功能傳感器可能關閉，缺值照常輸出。
@@ -658,7 +679,7 @@ def raw_rows_obs(res, p, names):
     且「狀態」可依現行 Authority 判定（status_text 不是 N/A：階段內充放電 → 第N次…；其餘只依電池上下電 → 待機／停機；
     PCS 故障、充放電旗標未歸零、上下電未知 → 無法判定）。不以 SOC／電流／功率推論狀態。
     讀取失敗、HMI 全無值（含僅 6161 溫度有效）、必要欄位缺值、狀態無法判定 → 整筆不輸出；observations.jsonl 原始紀錄不受影響。
-    序號維持原觀測 seq（中間跳號 = 該筆未輸出），來源欄可回查 observations.jsonl 列號。
+    序號維持原觀測 seq（中間跳號 = 該筆未輸出）；序號＝observations.jsonl 列號，可回查原始紀錄。
     """
     return [o for o in res.obs if o.ok and has_hmi_values(o)
             and all(field_value(o, k, p) is not None for k in RAW_REQUIRED)
@@ -676,14 +697,13 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
     for t, kind, x in items:
         if kind == 0:
             o = x
-            ws.cell(r, 1, o.seq + 1)
-            ws.cell(r, 2, o.t).number_format = "yyyy-mm-dd hh:mm:ss"
-            ws.cell(r, 3, o.src)
-            ws.cell(r, 4, "成功")
-            ws.cell(r, 5, status_text(o, names))
-            ws.cell(r, 6, names.get(o.stage_no, "") if o.stage_no else "")
-            ws.cell(r, 7, "；".join(minute_maps.get(o.seq, [])))
-            for c, k in enumerate(LOG_KEYS + ["power_kw"], 8):
+            ws.cell(r, RAW_COL["序號"], o.seq + 1)
+            ws.cell(r, RAW_COL["PC 取樣時間"], o.t).number_format = "yyyy-mm-dd hh:mm:ss"
+            ws.cell(r, RAW_COL["讀取結果"], "成功")
+            ws.cell(r, RAW_COL["狀態"], status_text(o, names))
+            ws.cell(r, RAW_COL["所屬階段"], names.get(o.stage_no, "") if o.stage_no else "")
+            ws.cell(r, RAW_COL["對應報表分鐘"], "；".join(minute_maps.get(o.seq, [])))
+            for c, k in enumerate(LOG_KEYS + ["power_kw"], RAW_COL["SOC"]):
                 v = field_value(o, k, p)
                 cell = ws.cell(r, c, _v(v))
                 if k in LOG_FORMATS and v is not None:
@@ -697,23 +717,25 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
                 parts.append("傳感器關閉或異常")
             ws.cell(r, RAW_NOTE_COL, "；".join(parts))
         else:
-            ws.cell(r, 2, t).number_format = "yyyy-mm-dd hh:mm:ss"
-            ws.cell(r, 4, "（無取樣）")
-            ws.cell(r, 6, x["stage"])
-            ws.cell(r, 7, "；".join(x["labels"]))
+            ws.cell(r, RAW_COL["PC 取樣時間"], t).number_format = "yyyy-mm-dd hh:mm:ss"
+            ws.cell(r, RAW_COL["讀取結果"], "（無取樣）")
+            ws.cell(r, RAW_COL["所屬階段"], x["stage"])
+            ws.cell(r, RAW_COL["對應報表分鐘"], "；".join(x["labels"]))
             ws.cell(r, RAW_NOTE_COL, x["reason"])
             for c in range(1, RAW_NOTE_COL + 1):
                 ws.cell(r, c).fill = WARN_FILL
         r += 1
-    widths = [7, 20, 26, 9, 11, 13, 34, 7, 9, 13, 13, 13, 13, 9, 11, 13, 9, 30]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+    num_w = [7, 9, 13, 13, 13, 13, 9, 11, 13, 9]                  # SOC～功率（與原寬度相同）
+    widths = dict(RAW_WIDTHS, **dict(zip(RAW_HEADERS[RAW_COL["SOC"] - 1:RAW_NOTE_COL - 1], num_w)))
+    for h, i in RAW_COL.items():
+        ws.column_dimensions[get_column_letter(i)].width = widths[h]
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(RAW_NOTE_COL)}{r - 1}"
 
 
 # =============================================================================
 # 控制紀錄（Menu 4～7 指令；階段於產報時依指令時間與最終階段分析對應）
+# 註：報告已不建立「控制紀錄」頁（build_workbook 不呼叫 _write_commands）；保留函式供測試／日後需要
 # =============================================================================
 CMD_HEADERS = ["時間", "階段", "方向", "控制模式", "設定值", "單位", "Action", "控制結果", "驗證結果", "整體結果", "備註"]
 CMD_WIDTHS = [20, 22, 7, 14, 9, 6, 26, 11, 11, 11, 48]
@@ -869,7 +891,7 @@ def build_workbook(res, meta):
     _write_overview(ws_ov, res.stages, names, shots)
     _write_heat(ws_heat, res.stages, names, shots)
     _write_summary(wb, ws_sum, res, names_full, sheet_of, n_rows, meta, p)
-    _write_commands(wb.create_sheet("控制紀錄"), res, meta.get("commands"), names_full, p)
+    # 「控制紀錄」頁已自報告移除；commands.jsonl 仍由 cert_runtime 照常記錄（不影響控制流程／稽核）
     _write_raw(wb.create_sheet("Raw Data"), res, names_full, minute_maps, na_rows, p)
     return wb
 
@@ -890,7 +912,39 @@ def save_report(res, meta, path):
     order = getattr(wb["數據概覽"], "_cert_order_arrow", None)
     if order:
         _inject_shapes(path, "數據概覽", _order_arrow_xml(*order))
+    times = getattr(wb["數據概覽"], "_cert_shot_times", None)
+    if times:
+        _inject_shapes(path, "數據概覽", "".join(_shot_time_xml(k, *t) for k, t in enumerate(times, 1)))
     return path
+
+
+SHOT_TIME_RIGHT_PX = 100     # 文字框右緣距圖片右緣（卡片右上「● Normal」約佔最右 90px，留白不遮）
+SHOT_TIME_TOP_PX = 18        # 與卡片標題「Battery Overview」同一列（SOC／SOH 框約從 70px 開始）
+SHOT_TIME_W_PX, SHOT_TIME_H_PX = 220, 28
+
+
+def _row_top_emu(row0, heights):
+    return sum(round((heights.get(i) or 15) * 12700) for i in range(1, row0 + 1))
+
+
+def _shot_time_xml(k, row0, img_w, text, heights):
+    """
+    數據概覽：截圖右上方空白處（「● Normal」左側）的擷取日期時間文字框（無底色、無框線、靠右）。
+    只是 Excel 上的文字物件，不修改原始截圖檔；位置用絕對座標（同時間序箭頭）。
+    """
+    x0 = (img_w - SHOT_TIME_RIGHT_PX - SHOT_TIME_W_PX) * EMU_PX
+    y0 = _row_top_emu(row0, heights) + SHOT_TIME_TOP_PX * EMU_PX
+    cx, cy = SHOT_TIME_W_PX * EMU_PX, SHOT_TIME_H_PX * EMU_PX
+    return (
+        f'<xdr:absoluteAnchor><xdr:pos x="{x0}" y="{y0}"/><xdr:ext cx="{cx}" cy="{cy}"/>'
+        f'<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="{2100 + k}" name="擷取時間{k}"/>'
+        f'<xdr:cNvSpPr txBox="1"/></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x="{x0}" y="{y0}"/>'
+        f'<a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        f'<a:noFill/><a:ln><a:noFill/></a:ln></xdr:spPr>'
+        f'<xdr:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" rtlCol="0" anchor="ctr"/>'
+        f'<a:lstStyle/><a:p><a:pPr algn="r"/><a:r><a:rPr lang="en-US" sz="1200" b="1">'
+        f'<a:solidFill><a:srgbClr val="333333"/></a:solidFill></a:rPr><a:t>{escape(text)}</a:t></a:r></a:p>'
+        f'</xdr:txBody></xdr:sp><xdr:clientData/></xdr:absoluteAnchor>')
 
 
 def _order_arrow_xml(first, last, x_px, heights, w_px):
