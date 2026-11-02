@@ -23,8 +23,10 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.chart.series import SeriesLabel
-from openpyxl.chart.data_source import StrRef
+from openpyxl.chart.data_source import AxDataSource, StrData, StrRef, StrVal
 from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.text import RichText
+from openpyxl.drawing.text import CharacterProperties, Paragraph, ParagraphProperties, RichTextProperties
 from openpyxl.drawing.colors import ColorChoice, SchemeColor
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.line import LineProperties
@@ -40,7 +42,7 @@ import cert_report_config as CFG
 from cert_screenshot import caption as shot_caption, png_size, select_stage_shot, shot_flag
 from cert_controls import DIRECTION_TEXT, describe as describe_action
 from cert_stage_engine import (R_NO_HMI, _num, command_stage, fmt_t, field_value, has_hmi_values, overall_minutes,
-                               rest_between, stage_minutes, stage_names)
+                               stage_minutes, stage_names)
 
 NA = CFG.NA
 LOG_HEADERS = ["時間", "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓",
@@ -455,13 +457,15 @@ def _write_summary(wb, ws, res, names, sheet_of, n_rows, meta, p):
         r0, right = top(i)
         if n_rows[st.no]:
             ch = _make_chart(wb[sheet_of[st.no]], n_rows[st.no], titles[st.no])
+            _summary_axis_labels(ch, wb[sheet_of[st.no]], n_rows[st.no])
             ws.add_chart(ch, _anchor(SUM_CHART_R if right else SUM_CHART_L, r0))
         else:
             c0 = 14 if right else 1
             _placeholder(ws, r0 + 1, c0, r0 + 4, c0 + 10,
                          f"{titles[st.no]}：不足一分鐘，無整分鐘 Log，不繪製圖表")
         if i + 1 < len(stages):
-            text = arrow_text(res, st, stages[i + 1])
+            text = arrow_text(chart_span(wb, sheet_of, n_rows, st),
+                              chart_span(wb, sheet_of, n_rows, stages[i + 1]))
             n0, n_right = top(i + 1)
             if n0 == r0:
                 arrows.append(("rightArrow" if n_right else "leftArrow", SUM_ARROW_H, r0, text))
@@ -469,7 +473,7 @@ def _write_summary(wb, ws, res, names, sheet_of, n_rows, meta, p):
                 arrows.append(("downArrow", SUM_ARROW_DOWN_R if right else SUM_ARROW_DOWN_L, r0, text))
     orow = 4 + SUMMARY_PITCH * ((len(stages) + 1) // 2)
     if n_rows.get("overall"):
-        ch = _make_chart(wb["整體測試"], n_rows["overall"], overall_title(meta))
+        ch = _make_chart(wb["整體測試"], n_rows["overall"], overall_title(meta))   # X 軸文字方向／間隔交給 Excel（直式）
         ws.add_chart(ch, _anchor(SUM_CHART_L, orow))
     if ws._charts:
         wb._cert_summary_arrows = arrows            # 存檔後寫入 Summary 的 drawing（真正的箭頭圖形）
@@ -510,21 +514,66 @@ def _with_spec(meta, title):
     return f"{spec} {title}" if spec else title
 
 
-def arrow_text(res, st, nxt):
+def chart_span(wb, sheet_of, n_rows, st):
+    """Summary 圖表實際使用的 Category 範圍（＝階段頁 A 欄第 2～n+1 列的整分時間，與 _make_chart 同一來源）。
+    回傳 (第一個 Category, 最後一個 Category)；沒有圖表（不足一分鐘）→ None。"""
+    n = n_rows.get(st.no)
+    if not n:
+        return None
+    ws = wb[sheet_of[st.no]]
+    return ws.cell(2, 1).value, ws.cell(n + 1, 1).value
+
+
+SUM_LABEL_MAX = 32          # 階段圖寬度下直式 10pt 標籤約容納數；= Excel 在階段頁同尺寸圖表自動省略的結果（123→每 4、76→每 3）
+SUM_LABEL_ROT = -5400000    # Summary 階段圖 X 軸標籤固定直式（-90°，同階段頁 Excel 自動呈現）；1/60000 度
+
+
+def summary_axis_labels(times):
+    """
+    階段圖（Summary＋階段頁）X 軸標籤（與 chart_span／箭頭同一組 Category 時間，不增減資料點）：
+    模擬階段頁 Excel 自動省略的密度 —— 自第一個 Category 起每 k 個顯示一個，k = ceil(n / SUM_LABEL_MAX)；
+    另外最後一個 Category 一定顯示（Excel 自動間隔做不到），離最後一個不到 k 的中間標籤留空避免重疊。
+    """
+    n = len(times)
+    k = max(1, -(-n // SUM_LABEL_MAX))
+    return [f"{t:%H:%M}" if i == n - 1 or (i % k == 0 and n - 1 - i >= k) else "" for i, t in enumerate(times)]
+
+
+def _summary_axis_labels(ch, ws, n):
+    """Summary 階段圖與階段頁圖表共用：類別改為上列標籤文字（同一組階段頁 A 欄時間），每個標籤都顯示（tickLblSkip=1）。
+    溫度系列（數值參照）不變；整體圖（Summary 與「整體測試」頁）不套用。"""
+    labels = summary_axis_labels([ws.cell(r, 1).value for r in range(2, n + 2)])
+    for s in ch.series:
+        s.cat = AxDataSource(strLit=StrData(ptCount=n, pt=[StrVal(idx=i, v=v) for i, v in enumerate(labels)]))
+    ch.x_axis.tickLblSkip = 1
+    _summary_axis_style(ch)
+
+
+def _summary_axis_style(ch):
+    """階段圖（Summary＋階段頁）同一 X 軸文字樣式：固定直式、緊鄰座標軸、10pt（同 Excel 預設字級），
+    避免 Excel 依標籤數各自改成橫／斜／直式。只改文字樣式，不動類別資料與標籤間隔。整體圖不套用（維持 Excel 自動）。"""
+    ch.x_axis.tickLblPos = "nextTo"
+    ch.x_axis.txPr = RichText(bodyPr=RichTextProperties(rot=SUM_LABEL_ROT, vert="horz"),
+                              p=[Paragraph(pPr=ParagraphProperties(defRPr=CharacterProperties(sz=1000)),
+                                           endParaRPr=CharacterProperties())])
+
+
+def arrow_text(prev_span, next_span):
     """
     Summary 箭頭文字：只顯示「N 分」（單行）。
-      - 休息時間可確認（中間連續觀測）→ R − B
-      - 否則 → 觀測間隔 R − A（下一階段首筆觀測運行 − 本階段最後觀測運行）：只是兩端觀測時間的差，
-        不是已證實的待機時間；曲線不因此補值或連線。
+    = 下一張圖第一個 Category − 上一張圖最後一個 Category（與圖表同一資料時間基準，非 Excel 自動省略後的可見標籤，
+      也不用 Stage Engine 的 end_B／A）；任一張沒有圖表 → N/A。
     """
-    sec, _why = rest_between(res, st, nxt)
-    if sec is None:
-        sec = (nxt.start.t - st.A.t).total_seconds()
-    return [rest_minutes_text(sec)]
+    if prev_span is None or next_span is None:
+        return [rest_minutes_text(None)]
+    return [rest_minutes_text((next_span[0] - prev_span[1]).total_seconds())]
 
 
 def rest_minutes_text(sec):
-    """Summary 箭頭只顯示整分鐘，秒數無條件捨去（13 分 20 秒 → 「13 分」）；底層資料保留原始精度。"""
+    """秒數 → 「N 分」（Category 為整分時間，差值本來就是整分；保留捨去以防萬一）。
+    無法計算或為負（時間異常）→ 「N/A」，不猜時間。"""
+    if sec is None or sec < 0:
+        return "N/A"
     return f"{int(sec // 60)} 分"
 
 
@@ -595,7 +644,25 @@ RAW_HEADERS = ["序號", "PC 取樣時間", "來源", "讀取結果", "狀態", 
                "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓",
                "傳感器溫度", "PCS 模組溫度", "功率 kW", "說明"]
 RAW_NOTE_COL = len(RAW_HEADERS)
-RAW_NO_HMI = "無有效讀值"           # 讀取結果：ok=True 但 HMI 欄位全無值（只有 6161 溫度）
+
+
+# Raw Data 必要量測欄位：任一缺值 → 整筆不輸出。傳感器溫度（sensor_c）為選用：多功能傳感器可能關閉，缺值照常輸出。
+RAW_REQUIRED = ["soc", "current_a", "rack_max_c", "rack_min_c", "cell_vmax_v", "cell_vmin_v", "voltage_v",
+                "pcs_module_c", "power_kw"]
+
+
+def raw_rows_obs(res, p, names):
+    """
+    Raw Data 只輸出有效報告資料：HMI 有效（ok 且 has_hmi_values；與 Runtime、每分鐘選樣同一定義）
+    且 RAW_REQUIRED 全部有有效數值（field_value；不補值、不沿用鄰近值）
+    且「狀態」可依現行 Authority 判定（status_text 不是 N/A：階段內充放電 → 第N次…；其餘只依電池上下電 → 待機／停機；
+    PCS 故障、充放電旗標未歸零、上下電未知 → 無法判定）。不以 SOC／電流／功率推論狀態。
+    讀取失敗、HMI 全無值（含僅 6161 溫度有效）、必要欄位缺值、狀態無法判定 → 整筆不輸出；observations.jsonl 原始紀錄不受影響。
+    序號維持原觀測 seq（中間跳號 = 該筆未輸出），來源欄可回查 observations.jsonl 列號。
+    """
+    return [o for o in res.obs if o.ok and has_hmi_values(o)
+            and all(field_value(o, k, p) is not None for k in RAW_REQUIRED)
+            and status_text(o, names) != NA]
 
 
 def _write_raw(ws, res, names, minute_maps, na_rows, p):
@@ -603,7 +670,7 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
         cell = ws.cell(1, c, h)
         cell.font = FB
         cell.fill = HDR_FILL
-    items = [(o.t, 0, o) for o in res.obs] + [(T, 1, info) for T, info in na_rows.items()]
+    items = [(o.t, 0, o) for o in raw_rows_obs(res, p, names)] + [(T, 1, info) for T, info in na_rows.items()]
     items.sort(key=lambda x: (x[0], x[1]))
     r = 2
     for t, kind, x in items:
@@ -612,8 +679,7 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
             ws.cell(r, 1, o.seq + 1)
             ws.cell(r, 2, o.t).number_format = "yyyy-mm-dd hh:mm:ss"
             ws.cell(r, 3, o.src)
-            hmi = o.ok and has_hmi_values(o)
-            ws.cell(r, 4, "成功" if hmi else ("失敗" if not o.ok else RAW_NO_HMI))
+            ws.cell(r, 4, "成功")
             ws.cell(r, 5, status_text(o, names))
             ws.cell(r, 6, names.get(o.stage_no, "") if o.stage_no else "")
             ws.cell(r, 7, "；".join(minute_maps.get(o.seq, [])))
@@ -622,19 +688,11 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
                 cell = ws.cell(r, c, _v(v))
                 if k in LOG_FORMATS and v is not None:
                     cell.number_format = LOG_FORMATS[k]
-            parts = [o.fail_reason] if not o.ok and o.fail_reason else []
-            if o.ok and not hmi:
-                # 舊資料 ok=True 也依數值判定；保留原始備註（例：HMI 讀取失敗：無讀值），6161 溫度照常顯示
-                parts += [R_NO_HMI] + [n for n in o.notes if n]
-                if any(_num(o.values.get(k)) is not None for k in ("sensor_c", "pcs_module_c")):
-                    parts.append("僅 6161 溫度有效")
-                parts.append(f"分析狀態：{o.state}")
-            elif o.state not in ("充電", "放電"):
-                # 追溯用：保留內部分析狀態與電池上下電原始值（狀態欄只顯示 待機／停機／N/A）
+            parts = []
+            if o.state not in ("充電", "放電"):
+                # 追溯用：保留內部分析狀態與電池上下電原始值（狀態欄只顯示 待機／停機；無法判定者不輸出）
                 parts.append(f"分析狀態：{o.state}")
                 parts.append(f"電池上下電：{(o.flags or {}).get('battery_power_status') or '未保存'}")
-                if (o.flags or {}).get("pcs_fault_flag") is True:
-                    parts.append("PCS 故障")
             if o.sensor_ok is False:
                 parts.append("傳感器關閉或異常")
             ws.cell(r, RAW_NOTE_COL, "；".join(parts))
@@ -783,7 +841,9 @@ def build_workbook(res, meta):
         n_rows[("na", st.no)] = sum(1 for m in rows if m.obs is None)
         if rows:
             _write_log_sheet(ws, rows, _stage_remark, p, f"T_stage{i}")
-            ws.add_chart(_make_chart(ws, len(rows), _with_spec(meta, names_full[st.no])), CHART_ANCHOR)
+            ch = _make_chart(ws, len(rows), _with_spec(meta, names_full[st.no]))
+            _summary_axis_labels(ch, ws, len(rows))          # 與 Summary 階段圖同一 X 軸規則（首尾時間一定顯示）
+            ws.add_chart(ch, CHART_ANCHOR)
         else:
             _write_short_stage(ws, st, p)
         track(f"階段頁「{ws.title}」", rows, names_full[st.no])

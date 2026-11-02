@@ -828,14 +828,21 @@ try:
     rh = [c.value for c in rws[1]]
     rrows = [[c.value for c in r_] for r_ in rws.iter_rows(min_row=2) if r_[3].value in ("成功", "失敗")]
     st_set = {r_[rh.index("狀態")] for r_ in rrows}
-    check(f"Raw Data 狀態只出現 待機／停機／N/A／第N次放電（{sorted(st_set)}），說明保留分析狀態與上下電原始值",
-          st_set == {"待機", "第1次放電", "停機", "N/A"}
+    fault_t = {r["t"] for r in recs_s if r["flags"]["pcs_fault_flag"] is True}
+    check(f"Raw Data 狀態只出現 待機／停機／第N次放電（{sorted(st_set)}；無 N/A），說明保留分析狀態與上下電原始值；"
+          f"PCS 故障（上下電未知）{len(fault_t)} 筆狀態無法判定 → 整筆不輸出",
+          st_set == {"待機", "第1次放電", "停機"} and fault_t
           and any("分析狀態：休息" in str(r_[rh.index("說明")]) and "電池上下電：已上電" in str(r_[rh.index("說明")])
                   for r_ in rrows)
-          and any("PCS 故障" in str(r_[rh.index("說明")]) for r_ in rrows))
-    raw_vals = [(r_[rh.index("Cell 最大電壓")], r_[rh.index("SOC")], r_[rh.index("電流")]) for r_ in rrows]
-    check("Raw Data 數值（Cell 最大電壓、SOC、電流）照原始值，未被改寫",
-          raw_vals == [(r["values"]["cell_vmax_v"], r["values"]["soc"], r["values"]["current_a"]) for r in recs_s])
+          and not any(r_[rh.index("PC 取樣時間")].strftime("%Y-%m-%dT%H:%M:%S") in fault_t for r_ in rrows)
+          and len(rrows) == len(recs_s) - len(fault_t))
+    by_src = {r_[rh.index("來源")]: r_ for r_ in rrows}
+    check("Raw Data 數值（Cell 最大電壓、SOC、電流）照原始值，未被改寫（依來源列號對回）",
+          all((by_src[f"observations.jsonl:{i + 1}"][rh.index("Cell 最大電壓")],
+               by_src[f"observations.jsonl:{i + 1}"][rh.index("SOC")],
+               by_src[f"observations.jsonl:{i + 1}"][rh.index("電流")])
+              == (r["values"]["cell_vmax_v"], r["values"]["soc"], r["values"]["current_a"])
+              for i, r in enumerate(recs_s) if f"observations.jsonl:{i + 1}" in by_src))
 
     print("\n== 實機舊資料（CERT_20261028_165847，沒有保存上下電）→ 非充放電 N/A ==")
     if os.path.isdir(real):
@@ -856,8 +863,9 @@ try:
         ost = [r_[oh.index("狀態")].value for r_ in ro_.iter_rows(min_row=2) if r_[3].value in ("成功", "失敗")]
         res_o = rtO._offline(os.path.join(root_o2, "CERT_20261028_165847")).analysis()
         n_dis = sum(1 for o in res_o.obs if o.state == "放電")
-        check(f"舊資料 Raw Data 狀態：第1次放電 {ost.count('第1次放電')} 筆（＝分析為放電的 {n_dis} 筆）、N/A {ost.count('N/A')} 筆（共 {len(ost)}）",
-              len(ost) == 84 and ost.count("第1次放電") + ost.count("N/A") == 84 and ost.count("第1次放電") == n_dis)
+        check(f"舊資料（未保存上下電）Raw Data：只輸出狀態可判定的第1次放電 {ost.count('第1次放電')} 筆（＝分析為放電的 {n_dis} 筆）；"
+              f"非充放電 {84 - len(ost)} 筆狀態無法判定 → 不輸出（不推測待機）",
+              len(ost) == n_dis and set(ost) == {"第1次放電"} and len(res_o.obs) == 84)
         check("舊資料階段判定不變（第1次放電 17:05:14 開始、idle_confirmed）",
               [(st.start.t.strftime("%H:%M:%S"), st.end_by) for st in res_o.stages] == [("17:05:14", "idle_confirmed")])
         zo = zipfile.ZipFile(path_o)
