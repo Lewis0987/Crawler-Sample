@@ -32,6 +32,7 @@ R_READ_FAIL = "讀取失敗"
 R_NO_DIR = "無有效方向資料"
 R_GAP = "資料間隔過長"
 R_NO_HMI = "HMI 無有效讀值（通訊異常或未登入）"
+R_NO_VALID = "無完整有效取樣（必要欄位缺值或狀態無法判定）"
 
 
 # =============================================================================
@@ -621,15 +622,17 @@ def _nearest(cands, ts, T, tol):
     return best
 
 
-def select_minutes(cands, all_obs, t_from, t_to, tol_sec, fallback=None):
+def select_minutes(cands, all_obs, t_from, t_to, tol_sec, fallback=None, rejected=None):
     """
     cands：可選用的有效觀測（已依時間排序）。整分 T ∈ [t_from, t_to]，
     取 |t − T| ≤ tol 且最小者（同距取較早）；沒有則改從 fallback（若有）同規則選，仍沒有則 N/A 並說明原因。
+    rejected：因不符合正式報表有效判定而排除的候選（只用於 N/A 原因，不會被選用）。
     """
     tol = timedelta(seconds=tol_sec)
     ts = [o.t for o in cands]
     fb_ts = [o.t for o in fallback or []]
     all_ts = [o.t for o in all_obs]
+    rej = {id(o) for o in rejected or []}
     rows = []
     T = _ceil_min(t_from)
     end = _floor_min(t_to)
@@ -649,6 +652,8 @@ def select_minutes(cands, all_obs, t_from, t_to, tol_sec, fallback=None):
                 reason = f"±{tol_sec} 秒內{R_NO_HMI}"
             elif any(o.ok and o.direction is None for o in near):
                 reason = f"±{tol_sec} 秒內無有效方向資料"
+            elif any(id(o) in rej for o in near):
+                reason = f"±{tol_sec} 秒內{R_NO_VALID}"
             elif near:
                 reason = f"±{tol_sec} 秒內僅有其他階段或休息資料"
             else:
@@ -658,22 +663,48 @@ def select_minutes(cands, all_obs, t_from, t_to, tol_sec, fallback=None):
     return rows
 
 
-def stage_minutes(res, st):
-    """階段頁：只用該階段範圍內的有效觀測（運行與停頓），整分 T 落在首筆～最後運行觀測之間。"""
+def stage_minutes(res, st, valid=None):
+    """階段頁：只用該階段範圍內的有效觀測（運行與停頓），整分 T 落在首筆～最後運行觀測之間。
+    valid：正式報表有效判定（cert_report_xlsx.is_report_valid，與 Raw Data 同一個 predicate）。
+    給定時只從符合者選樣（整列同一筆觀測，不補值、不擴大容許範圍）；候選全被排除的分鐘 N/A 並註明原因。"""
     cands = [o for o in res.obs if o.stage_no == st.no and o.ok and o.direction is not None]
-    return select_minutes(cands, res.obs, st.start.t, st.A.t, res.params["MINUTE_TOL_SEC"])
+    rejected = []
+    if valid is not None:
+        rejected = [o for o in cands if not valid(o)]
+        cands = [o for o in cands if valid(o)]
+    return select_minutes(cands, res.obs, st.start.t, st.A.t, res.params["MINUTE_TOL_SEC"], rejected=rejected)
 
 
-def overall_minutes(res):
+def overall_minutes(res, valid=None, phase=None):
     """整體頁：開始～結束全程，含休息；讀取成功的觀測都可選用（方向無法判定也照樣呈現溫度）。
     優先選有 HMI 讀值的觀測；容許範圍內只有「HMI 無讀值、僅 6161 溫度」的觀測時才退而選用它。
-    只有真正沒有取樣／讀取失敗時才 N/A（圖表斷線，不補值、不內插）。"""
+    只有真正沒有取樣／讀取失敗時才 N/A（圖表斷線，不補值、不內插）。
+    valid／phase（Policy：report-valid preferred → legacy fallback）：
+    原規則選到的觀測不符合 valid（cert_report_xlsx.is_report_valid，與 Raw Data／階段頁同一 predicate）時，
+    改選 ±tol 內 phase 相同（同階段／方向／狀態語意）且 valid 的最近觀測（同距取較早），整列換成該筆；
+    沒有符合者 → 保留原規則選到的觀測（故障、下電、狀態未知、僅 6161 溫度等照常呈現，不會因此變成 N/A）。"""
     if not res.obs:
         return []
     ok = [o for o in res.obs if o.ok]
     fallback = [o for o in ok if any(_num(o.values.get(k)) is not None for k in VALUE_FIELDS)]
-    return select_minutes([o for o in ok if has_hmi_values(o)], res.obs, res.obs[0].t, res.obs[-1].t,
+    rows = select_minutes([o for o in ok if has_hmi_values(o)], res.obs, res.obs[0].t, res.obs[-1].t,
                           res.params["MINUTE_TOL_SEC"], fallback=fallback)
+    if valid is None:
+        return rows
+    tol = timedelta(seconds=res.params["MINUTE_TOL_SEC"])
+    good = [o for o in ok if valid(o)]
+    ts = [o.t for o in good]
+    out = []
+    for mr in rows:
+        o = mr.obs
+        if o is not None and not valid(o):
+            k = phase(o)
+            same = [c for c in good[bisect.bisect_left(ts, mr.T - tol):bisect.bisect_right(ts, mr.T + tol)]
+                    if phase(c) == k]
+            if same:
+                mr = MinuteRow(mr.T, min(same, key=lambda c: (abs(c.t - mr.T), c.t)))
+        out.append(mr)
+    return out
 
 
 # =============================================================================

@@ -245,7 +245,8 @@ try:
     def ob(sec, k):
         return Obs(t=T0 + timedelta(seconds=sec), src=f"syn:{sec}",
                    values={"soc": 50, "current_a": CUR[k], "rack_max_c": 40, "rack_min_c": 30,
-                           "voltage_v": 1200.0, "sensor_c": 25.0, "pcs_module_c": None, "power_kw": None})
+                           "voltage_v": 1200.0, "sensor_c": 25.0, "cell_vmax_v": 3.40, "cell_vmin_v": 3.38,
+                           "pcs_module_c": 60.0, "power_kw": CUR[k] * 1.2})   # 必要欄位齊全 → 正式報表有效（階段頁可選用）
     obs = ([ob(s, "D") for s in range(0, 1201, 10)] + [ob(s, "I") for s in range(1210, 1501, 10)]
            + [ob(s, "C") for s in range(1510, 2401, 10)] + [ob(s, "I") for s in range(2410, 2521, 10)]
            + [ob(s, "D") for s in range(2530, 2571, 10)] + [ob(s, "I") for s in range(2580, 2701, 10)])

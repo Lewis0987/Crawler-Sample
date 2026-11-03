@@ -681,9 +681,21 @@ def raw_rows_obs(res, p, names):
     讀取失敗、HMI 全無值（含僅 6161 溫度有效）、必要欄位缺值、狀態無法判定 → 整筆不輸出；observations.jsonl 原始紀錄不受影響。
     序號維持原觀測 seq（中間跳號 = 該筆未輸出）；序號＝observations.jsonl 列號，可回查原始紀錄。
     """
-    return [o for o in res.obs if o.ok and has_hmi_values(o)
+    return [o for o in res.obs if is_report_valid(o, p, names)]
+
+
+def overall_phase(o, names):
+    """整體頁改選時的語意範圍：所屬階段、方向、分析狀態（運行／停頓／休息…）、設備狀態文字（第N次… / 待機 / 停機 / N/A）。
+    只用既有欄位，不另做狀態推論；改選的觀測必須與原選用觀測完全相同，避免休息分鐘改選成階段運行、故障／下電被正常資料取代。"""
+    return o.stage_no, o.direction, o.state, status_text(o, names)
+
+
+def is_report_valid(o, p, names):
+    """正式報表有效觀測（Raw Data 與 4 張階段頁每分鐘選樣共用的唯一定義；條件見 raw_rows_obs）。
+    必要欄位規則修改只改這裡，兩邊不會再出現「Raw Data 排除、階段頁仍選用」的情況。"""
+    return (o.ok and has_hmi_values(o)
             and all(field_value(o, k, p) is not None for k in RAW_REQUIRED)
-            and status_text(o, names) != NA]
+            and status_text(o, names) != NA)
 
 
 def _write_raw(ws, res, names, minute_maps, na_rows, p):
@@ -858,7 +870,7 @@ def build_workbook(res, meta):
     for i, st in enumerate(res.stages, 1):
         ws = wb.create_sheet(_sheet_name(i, names, st))
         sheet_of[st.no] = ws.title
-        rows = stage_minutes(res, st)
+        rows = stage_minutes(res, st, valid=lambda o: is_report_valid(o, p, names_full))   # 與 Raw Data 同一有效判定
         n_rows[st.no] = len(rows)
         n_rows[("na", st.no)] = sum(1 for m in rows if m.obs is None)
         if rows:
@@ -871,7 +883,8 @@ def build_workbook(res, meta):
         track(f"階段頁「{ws.title}」", rows, names_full[st.no])
 
     ws_all = wb.create_sheet("整體測試")
-    orows = overall_minutes(res)
+    orows = overall_minutes(res, valid=lambda o: is_report_valid(o, p, names_full),          # 有效觀測優先（同一判定）
+                            phase=lambda o: overall_phase(o, names_full))                     # 不跨語意；沒有 → 原規則
     n_rows["overall"] = len(orows)
 
     def overall_remark(mr):
