@@ -335,8 +335,8 @@ try:
           len(set(ov_fill + ht_fill)) == 1 and ov_fill[0] * 58 < 1088 / 2 and ov_fill[0] * 58 >= longest * 19
           and all(c.alignment.indent >= 1 for c in orange))
     heads = [c for c in wh[2] if c.value]
-    check("即時熱度：每階段圖片上方都有粗體置中「獨立櫃Pack 即時熱度圖」，合併寬度＝圖片欄寬",
-          len(heads) == 3 and all(c.value == "獨立櫃Pack 即時熱度圖" and c.font.b
+    check("即時熱度：每階段＋「認證結束（最後狀態）」上方都有粗體置中「獨立櫃Pack 即時熱度圖」，合併寬度＝圖片欄寬",
+          len(heads) == 4 and all(c.value == "獨立櫃Pack 即時熱度圖" and c.font.b
                                   and c.alignment.horizontal == "center" for c in heads)
           and any(str(m) == "A2:J2" for m in wh.merged_cells.ranges) and htp[0][1] == 2)
     od = sheet_xml("數據概覽")
@@ -395,7 +395,7 @@ try:
     hd = sheet_xml("即時熱度")
     check("即時熱度：已移除第 1、2 階段之間的向下箭頭（保留標題、底色、熱度圖標題與圖片）",
           'prst="downArrow"' not in hd and "absoluteAnchor" not in hd and len(htp) == 1
-          and len([c for c in wh[2] if c.value == "獨立櫃Pack 即時熱度圖"]) == 3)
+          and len([c for c in wh[2] if c.value == "獨立櫃Pack 即時熱度圖"]) == 4)
     cx = {}
     for n_ in sorted(x for x in z.namelist() if re.match(r"xl/charts/chart\d+\.xml$", x)):
         c_ = z.read(n_).decode()
@@ -423,9 +423,9 @@ try:
     check("階段3 沒有截圖紀錄 → 顯示「尚未截圖」，不使用範本",
           texts["數據概覽"].count("【尚未截圖】") == 1 and texts["即時熱度"].count("【尚未截圖】") == 1)
     sd = sheet_xml("Summary")
-    check("Summary 箭頭圖形、圖表仍在（P2 不影響已確認的 Summary）",
+    check("Summary 箭頭圖形、圖表仍在（P2 不影響已確認的 Summary；不足一分鐘的第 3 階段也有所在分鐘一列 → 3 階段圖＋整體 = 4）",
           sd.count('prst="rightArrow"') == 1 and sd.count('prst="downArrow"') == 1
-          and len(re.findall(r"<(?:xdr:)?graphicFrame[ >]", sd)) == 3)
+          and len(re.findall(r"<(?:xdr:)?graphicFrame[ >]", sd)) == 4)
 
     def emu_box(xml, prst):                         # Summary 箭頭外框（px）：A 欄 83px、其他欄 63px、列 17.4pt
         m = re.search(r"<xdr:from><xdr:col>(\d+)</xdr:col><xdr:colOff>(\d+)</xdr:colOff><xdr:row>(\d+)</xdr:row>"

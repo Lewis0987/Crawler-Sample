@@ -15,7 +15,7 @@
 W_PAUSE_SEC = 60            # 停頓判斷時間：B 起 ≤ 60 秒恢復同向 → 合併（剛好 60 秒算在內）
 TCONF_SEC = 15              # 階段開始／恢復確認門檻：同方向連續觀測達此秒數才算成立
 GAP_G_SEC = 30              # G：相鄰兩筆有效取樣（中間無失敗紀錄）允許的最大間隔
-SAMPLE_INTERVAL_SEC = 10    # 認證取樣週期（P1 離線回放沿用來源資料的實際間隔，此值僅供文件與合成測試）
+SAMPLE_INTERVAL_SEC = 5     # 認證取樣週期：正式設定 5 秒（2026-11-03 Phase 1 實機驗證 PASS，取代原 10 秒）；P1 離線回放沿用來源資料的實際間隔
 
 STOP_WARN_SEC = 30          # 停止指令被接受後仍未觀測到待機的提示時間（只提示，不重送指令）
 CMD_STAGE_MATCH_SEC = 120   # 控制紀錄對應階段：充／放電指令最多早於階段首筆觀測幾秒；停止指令最多晚於階段結束幾秒
@@ -41,6 +41,7 @@ SHOT_SETTLE_SEC = 2.0           # 區塊就緒後再等一下（等數值／動�
 SHOT_ATTEMPTS = 3               # 每個目標最多嘗試次數（含第一次）
 SHOT_RETRY_DELAY_SEC = 5        # 失敗後到下一次嘗試的間隔
 SHOT_ATTEMPT_HARD_TIMEOUT_SEC = 60  # 單次嘗試的外部看門狗（超過即判逾時、強制結束 Chrome）
+CERT_FINAL_SHOT_WAIT_SEC = 120      # Menu 22 結束認證：等「認證結束（最後狀態）」截圖完成的上限；逾時照常產報（截圖區塊顯示尚未完成），可 Menu 25 重產
 SHOT_STALE_SEC = 60             # 頁面「更新時間」落後 PC 擷取時間超過此秒數 → 資料未更新
                                 # （即時熱度頁的更新時間是瀏覽器時間，重新開頁時幾乎等於擷取時間，
                                 #   無法代表設備資料新舊；資料有效性改由區塊內容驗證）
@@ -81,7 +82,7 @@ PARAM_STATUS = {
     "W_PAUSE_SEC": "confirmed",
     "TCONF_SEC": "provisional",
     "GAP_G_SEC": "provisional",
-    "SAMPLE_INTERVAL_SEC": "provisional",
+    "SAMPLE_INTERVAL_SEC": "confirmed",
     "STOP_WARN_SEC": "provisional",
     "CMD_STAGE_MATCH_SEC": "provisional",
     "MINUTE_TOL_SEC": "provisional",

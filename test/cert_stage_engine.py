@@ -583,8 +583,41 @@ def stage_names(stages):
 @dataclass
 class MinuteRow:
     T: datetime
-    obs: object                     # 選用的 Obs；None = N/A
+    obs: object                     # 選用的 Obs（Calendar Minute：該分鐘最後一筆有效觀測，一般欄位全部取自它）；None = N/A
     na_reason: str = ""
+    ext: dict = None                # Calendar Minute 極值 {欄位: (值, 來源 Obs)}；None = 舊規則（±tol 單筆，極值也取自 obs）
+
+
+# 本身具有 Max／Min 語意的欄位：整分鐘取真正 MAX／MIN（其餘欄位一律取該分鐘最後一筆有效觀測）
+EXTREME_FIELDS = {"rack_max_c": max, "rack_min_c": min, "cell_vmax_v": max, "cell_vmin_v": min}
+MINUTE = timedelta(minutes=1)
+
+
+def minute_aggregate(gen, ext, p):
+    """
+    Calendar Minute 彙整（Stage／Overall 共用）。gen、ext 已由呼叫端限定在同一分鐘、同一語意範圍且依時間排序。
+    gen：可作一般欄位的觀測 → 取最後一筆（SOC／電流／電壓／功率／PCS／傳感器全部來自同一筆）。
+    ext：可參與極值的觀測 → 各極值欄位只要該欄位本身有效即可參與（不要求其他欄位齊全）；同值取較早；保留來源觀測供追溯。
+    """
+    extremes = {}
+    for k, fn in EXTREME_FIELDS.items():
+        c = [(field_value(o, k, p), o) for o in ext]
+        c = [x for x in c if x[0] is not None]
+        if c:
+            v = fn(x[0] for x in c)
+            extremes[k] = (v, next(o for x, o in c if x == v))
+    return (gen[-1] if gen else None), extremes
+
+
+def minute_value(mr, key, p):
+    """分鐘列的報表值：極值欄位取 Calendar Minute 極值；其餘取選用觀測（舊規則列沒有 ext → 一律取選用觀測）。"""
+    if mr.ext is not None and key in EXTREME_FIELDS:
+        return mr.ext[key][0] if key in mr.ext else None
+    return field_value(mr.obs, key, p) if mr.obs is not None else None
+
+
+def _in_minute(obs, ts, M):
+    return obs[bisect.bisect_left(ts, M):bisect.bisect_left(ts, M + MINUTE)]
 
 
 def _ceil_min(t):
@@ -645,66 +678,103 @@ def select_minutes(cands, all_obs, t_from, t_to, tol_sec, fallback=None, rejecte
         else:
             lo = bisect.bisect_left(all_ts, T - tol)
             hi = bisect.bisect_right(all_ts, T + tol)
-            near = all_obs[lo:hi]
-            if any(not o.ok for o in near):
-                reason = f"±{tol_sec} 秒內讀取失敗"
-            elif any(o.ok and not has_hmi_values(o) for o in near):
-                reason = f"±{tol_sec} 秒內{R_NO_HMI}"
-            elif any(o.ok and o.direction is None for o in near):
-                reason = f"±{tol_sec} 秒內無有效方向資料"
-            elif any(id(o) in rej for o in near):
-                reason = f"±{tol_sec} 秒內{R_NO_VALID}"
-            elif near:
-                reason = f"±{tol_sec} 秒內僅有其他階段或休息資料"
-            else:
-                reason = f"±{tol_sec} 秒內無取樣"
-            rows.append(MinuteRow(T, None, reason))
+            rows.append(MinuteRow(T, None, _na_reason(all_obs[lo:hi], f"±{tol_sec} 秒內", rej)))
         T += timedelta(minutes=1)
     return rows
 
 
-def stage_minutes(res, st, valid=None):
-    """階段頁：只用該階段範圍內的有效觀測（運行與停頓），整分 T 落在首筆～最後運行觀測之間。
-    valid：正式報表有效判定（cert_report_xlsx.is_report_valid，與 Raw Data 同一個 predicate）。
-    給定時只從符合者選樣（整列同一筆觀測，不補值、不擴大容許範圍）；候選全被排除的分鐘 N/A 並註明原因。"""
-    cands = [o for o in res.obs if o.stage_no == st.no and o.ok and o.direction is not None]
-    rejected = []
-    if valid is not None:
-        rejected = [o for o in cands if not valid(o)]
-        cands = [o for o in cands if valid(o)]
-    return select_minutes(cands, res.obs, st.start.t, st.A.t, res.params["MINUTE_TOL_SEC"], rejected=rejected)
+def _na_reason(near, where, rej=()):
+    """分鐘 N/A 的原因（依 near＝該時間範圍內全部觀測判斷）。"""
+    if any(not o.ok for o in near):
+        return f"{where}讀取失敗"
+    if any(o.ok and not has_hmi_values(o) for o in near):
+        return f"{where}{R_NO_HMI}"
+    if any(o.ok and o.direction is None for o in near):
+        return f"{where}無有效方向資料"
+    if any(id(o) in rej for o in near):
+        return f"{where}{R_NO_VALID}"
+    if near:
+        return f"{where}僅有其他階段或休息資料"
+    return f"{where}無取樣"
 
 
-def overall_minutes(res, valid=None, phase=None):
-    """整體頁：開始～結束全程，含休息；讀取成功的觀測都可選用（方向無法判定也照樣呈現溫度）。
-    優先選有 HMI 讀值的觀測；容許範圍內只有「HMI 無讀值、僅 6161 溫度」的觀測時才退而選用它。
-    只有真正沒有取樣／讀取失敗時才 N/A（圖表斷線，不補值、不內插）。
-    valid／phase（Policy：report-valid preferred → legacy fallback）：
-    原規則選到的觀測不符合 valid（cert_report_xlsx.is_report_valid，與 Raw Data／階段頁同一 predicate）時，
-    改選 ±tol 內 phase 相同（同階段／方向／狀態語意）且 valid 的最近觀測（同距取較早），整列換成該筆；
-    沒有符合者 → 保留原規則選到的觀測（故障、下電、狀態未知、僅 6161 溫度等照常呈現，不會因此變成 N/A）。"""
+def _minute_pool(res):
+    """完整日曆分鐘候選（整體頁／階段頁極值共用）：該分鐘內有 HMI 讀值的觀測；沒有才退用僅 6161 溫度的觀測。回傳 M → list。"""
+    ok = [o for o in res.obs if o.ok]
+    hmi = [o for o in ok if has_hmi_values(o)]
+    fb = [o for o in ok if any(_num(o.values.get(k)) is not None for k in VALUE_FIELDS)]
+    h_ts, f_ts = [o.t for o in hmi], [o.t for o in fb]
+    return lambda M: _in_minute(hmi, h_ts, M) or _in_minute(fb, f_ts, M)
+
+
+OPPOSITE = {"C": "D", "D": "C"}
+
+
+def stage_minutes(res, st, valid=None, ext_scope="stage"):
+    """
+    階段頁（Calendar Minute）：分鐘列 = 階段首筆觀測所在分鐘 ～ 最後運行觀測（A）所在分鐘（分鐘範圍不因極值規則擴張）。
+    一般欄位：每分鐘只用 [HH:MM:00, 下一分鐘) 內、屬於本階段（stage_no 相同、首筆～A 之間）、方向為本階段方向或停頓（I）的觀測，
+    不跨階段、不跨方向、不納入階段外的休息資料；= 該分鐘最後一筆 valid 觀測（valid：cert_report_xlsx.is_report_valid，
+    與 Raw Data 同一 predicate；None = 不過濾）。
+    極值欄位（ext_scope；該欄位本身有效即可，不要求其他欄位齊全）：
+      "stage"  = 同一般欄位那批本階段觀測（預設，舊行為）；
+      "minute" = 該分鐘完整日曆分鐘候選（_minute_pool：含階段前後同分鐘的待機／休息／停止後過渡／方向未明），
+                 但排除可明確判定為反方向的觀測（direction ＝ 本階段相反方向；沿用引擎 classify 的方向）（正式階段頁）。
+    沒有可用觀測 → 一般欄位 N/A 並註明原因（極值仍照實呈現）；不補值、不跨分鐘。
+    """
+    p = res.params
+    cands = [o for o in res.obs if o.stage_no == st.no and o.ok and o.direction in (st.dir, "I")
+             and st.start.t <= o.t <= st.A.t]
+    ts = [o.t for o in cands]
+    all_ts = [o.t for o in res.obs]
+    pool_of = _minute_pool(res) if ext_scope == "minute" else None
+    rows = []
+    M = _floor_min(st.start.t)
+    while M <= _floor_min(st.A.t):
+        mm = _in_minute(cands, ts, M)
+        gen = [o for o in mm if valid is None or valid(o)]
+        ext_src = mm if pool_of is None else [o for o in pool_of(M) if o.direction != OPPOSITE[st.dir]]
+        last, ext = minute_aggregate(gen, ext_src, p)
+        reason = ""
+        if last is None:
+            near = [o for o in _in_minute(res.obs, all_ts, M) if o.stage_no in (None, st.no) or not o.ok]
+            reason = _na_reason(near, "該分鐘內", {id(o) for o in mm})
+        rows.append(MinuteRow(M, last, reason, ext))
+        M += MINUTE
+    return rows
+
+
+def overall_minutes(res, valid=None, phase=None, ext_scope="phase"):
+    """
+    整體頁（Calendar Minute）：開始～結束全程（首筆觀測所在分鐘 ～ 最後觀測所在分鐘），含休息。
+    每分鐘先依原整體頁規則決定候選：該分鐘內有 HMI 讀值的觀測；沒有才退用僅 6161 溫度的觀測。
+    該分鐘由「最後一筆候選」所屬語意範圍（phase：同階段／方向／狀態語意）代表，只聚合同一語意範圍的觀測（不混合運行與休息）：
+    一般欄位 = 該範圍內最後一筆 valid 觀測；沒有 → 該範圍最後一筆（原規則 fallback：故障、下電、狀態未知、僅 6161 照常呈現）。
+    極值欄位（ext_scope）：
+      "phase"  = 該語意範圍內該欄位本身有效者的 MAX／MIN（預設，舊行為）；
+      "minute" = 該分鐘全部候選（不分語意：待機／運行／休息／故障／停機）中該欄位本身有效者的 MAX／MIN（正式整體頁）。
+    該分鐘沒有可用觀測 → N/A 並註明原因（不跨分鐘、不補值）。
+    """
     if not res.obs:
         return []
-    ok = [o for o in res.obs if o.ok]
-    fallback = [o for o in ok if any(_num(o.values.get(k)) is not None for k in VALUE_FIELDS)]
-    rows = select_minutes([o for o in ok if has_hmi_values(o)], res.obs, res.obs[0].t, res.obs[-1].t,
-                          res.params["MINUTE_TOL_SEC"], fallback=fallback)
-    if valid is None:
-        return rows
-    tol = timedelta(seconds=res.params["MINUTE_TOL_SEC"])
-    good = [o for o in ok if valid(o)]
-    ts = [o.t for o in good]
-    out = []
-    for mr in rows:
-        o = mr.obs
-        if o is not None and not valid(o):
-            k = phase(o)
-            same = [c for c in good[bisect.bisect_left(ts, mr.T - tol):bisect.bisect_right(ts, mr.T + tol)]
-                    if phase(c) == k]
-            if same:
-                mr = MinuteRow(mr.T, min(same, key=lambda c: (abs(c.t - mr.T), c.t)))
-        out.append(mr)
-    return out
+    p = res.params
+    pool_of = _minute_pool(res)
+    all_ts = [o.t for o in res.obs]
+    ph = phase or (lambda o: (o.stage_no, o.direction, o.state))
+    rows = []
+    M = _floor_min(res.obs[0].t)
+    while M <= _floor_min(res.obs[-1].t):
+        pool = pool_of(M)
+        if not pool:
+            rows.append(MinuteRow(M, None, _na_reason(_in_minute(res.obs, all_ts, M), "該分鐘內"), {}))
+        else:
+            k = ph(pool[-1])
+            same = [o for o in pool if ph(o) == k]
+            vv = [o for o in same if valid is None or valid(o)]
+            last, ext = minute_aggregate(vv or same, pool if ext_scope == "minute" else same, p)
+            rows.append(MinuteRow(M, last, "", ext))
+        M += MINUTE
+    return rows
 
 
 # =============================================================================

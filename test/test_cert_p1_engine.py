@@ -306,29 +306,29 @@ obs = [ob(t, "D", soc=50) for t in range(13, 310, 10)] + [ob(t, "I") for t in ra
 r = run(obs)
 st = r.stages[0]
 rows = stage_minutes(r, st)
-check("M1 階段頁只含首筆～最後觀測運行之間的整分（10:01～10:05）",
-      [m.T.strftime("%H:%M") for m in rows] == ["10:01", "10:02", "10:03", "10:04", "10:05"])
-check("M1 每列取最接近的一筆（10:01 → 10:01:03，差 +3 秒）",
-      rows[0].obs.t == base2 + timedelta(seconds=63))
+check("M1 階段頁 = 首筆所在分鐘～最後觀測運行所在分鐘（Calendar Minute：10:00 起始不完整分鐘也納入，10:00～10:05）",
+      [m.T.strftime("%H:%M") for m in rows] == ["10:00", "10:01", "10:02", "10:03", "10:04", "10:05"])
+check("M1 每列取該分鐘最後一筆（10:00 → 10:00:53、10:01 → 10:01:53；10:00 只含 10:00:13 起的階段觀測）",
+      rows[0].obs.t == base2 + timedelta(seconds=53) and rows[1].obs.t == base2 + timedelta(seconds=113))
 check("M2 階段頁不使用休息資料（最後一列 10:05 取 10:05:03 放電觀測）",
       rows[-1].obs.state == "放電")
 ov = overall_minutes(r)
 check("M2 整體頁 10:06 取休息資料並標示休息",
       [m for m in ov if m.T.strftime("%H:%M") == "10:06"][0].obs.state == "休息")
 
-obs = [ob(t, "D") for t in range(0, 600, 10) if not (160 <= t <= 200)]   # 10:03 前後 ±30 秒無取樣
+obs = [ob(t, "D") for t in range(0, 600, 10) if not (180 <= t <= 239)]   # 10:03:00～10:03:59 整分鐘無取樣
 r = run(obs)
 rows = stage_minutes(r, r.stages[0])
 m3 = [m for m in rows if m.T.strftime("%H:%M") == "10:03"][0]
-check("M3 ±20 秒內沒有取樣 → N/A 並說明原因（不補值）",
-      m3.obs is None and "無取樣" in m3.na_reason)
+check("M3 該分鐘內沒有取樣 → N/A 並說明原因（不補值、不跨分鐘取 10:02:50／10:04:00）",
+      m3.obs is None and "該分鐘內無取樣" in m3.na_reason and not m3.ext)
 obs = [ob(t, "D") for t in range(0, 600, 10)]
-# 10:03 前後 ±20 秒內只有讀取失敗
-obs = [o if not (160 <= (o.t - BASE).seconds <= 200) else
+# 10:03:00～10:03:59 只有讀取失敗
+obs = [o if not (180 <= (o.t - BASE).seconds <= 239) else
        Obs(t=o.t, ok=False, fail_reason="x", src="x") for o in obs]
 r = run(obs)
 m3 = [m for m in stage_minutes(r, r.stages[0]) if m.T.strftime("%H:%M") == "10:03"][0]
-check("M3b ±20 秒內只有讀取失敗 → N/A，原因為讀取失敗", m3.obs is None and "讀取失敗" in m3.na_reason)
+check("M3b 該分鐘內只有讀取失敗 → N/A，原因為讀取失敗", m3.obs is None and "該分鐘內讀取失敗" in m3.na_reason)
 
 obs = [ob(t, "D", soc=0, sensor_c=None) for t in range(0, 200, 10)]
 r = run(obs)
@@ -347,14 +347,16 @@ obs = [ob(t, "D", base=datetime(2026, 1, 5, 23, 57, 30)) for t in range(0, 400, 
       [ob(t, "I", base=datetime(2026, 1, 5, 23, 57, 30)) for t in range(410, 500, 10)]
 r = run(obs)
 rows = stage_minutes(r, r.stages[0])
-check("M5 跨午夜：23:58～00:04 依時間遞增、不重排",
-      [m.T.strftime("%H:%M") for m in rows][:3] == ["23:58", "23:59", "00:00"]
+check("M5 跨午夜：23:57～00:04 依時間遞增、不重排（23:57:30 開始 → 起始分鐘 23:57）",
+      [m.T.strftime("%H:%M") for m in rows][:4] == ["23:57", "23:58", "23:59", "00:00"]
       and all(a.T < b.T for a, b in zip(rows, rows[1:])))
 
 obs = [ob(t, "D") for t in range(10, 51, 10)] + [ob(t, "I") for t in range(60, 140, 10)]
 r = run(obs)
-check("M6 短階段（10:00:10～10:00:50，沒有整分）→ 階段保留但無整分列",
-      len(r.stages) == 1 and stage_minutes(r, r.stages[0]) == [])
+_m6 = stage_minutes(r, r.stages[0])
+check("M6 短階段（10:00:10～10:00:50，不足一分鐘）→ 階段保留，只有所在分鐘 10:00 一列（取 10:00:50）",
+      len(r.stages) == 1 and [m.T.strftime("%H:%M") for m in _m6] == ["10:00"]
+      and _m6[0].obs.t == BASE + timedelta(seconds=50))
 
 obs = []
 for k, d in enumerate("DCDCD"):
@@ -384,7 +386,7 @@ check("R3 休息期間取樣間隔超過 G → 休息時間未知", sec is None 
 obs = seq(0, 300, "D") + [ob(t, "I", current_a=None) for t in range(310, 400, 10)] + seq(410, 700, "I")
 r = run(obs)
 rows = {m.T.strftime("%H:%M:%S"): m for m in overall_minutes(r)}
-m = rows["10:06:00"]
+m = rows["10:05:00"]                      # 10:05:10～10:05:50 電流缺值（10:05 最後一筆屬此語意）
 check("O1 全程曲線：電流缺值（方向無法判定）但溫度有效 → 仍呈現溫度，不是 N/A",
       m.obs is not None and m.obs.direction is None and m.obs.values["rack_max_c"] == 40)
 check("O2 全程曲線：休息但有資料的每一分鐘都有值（不因階段結束而斷線）",
@@ -392,9 +394,10 @@ check("O2 全程曲線：休息但有資料的每一分鐘都有值（不因階�
 obs = seq(0, 300, "D") + seq(310, 400, "I") + seq(600, 900, "I")
 r = run(obs)
 rows = {m.T.strftime("%H:%M"): m for m in overall_minutes(r)}
-check("O3 全程曲線：真正沒有取樣的分鐘（10:06:40～10:10:00 之間的 10:08、10:09）才 N/A，不補值、不內插",
-      rows["10:08"].obs is None and rows["10:09"].obs is None
-      and rows["10:07"].obs is not None and rows["10:10"].obs is not None)
+check("O3 全程曲線：真正沒有取樣的分鐘（10:06:40～10:10:00 之間的 10:07、10:08、10:09）才 N/A，不補值、不跨分鐘",
+      rows["10:07"].obs is None and rows["10:08"].obs is None and rows["10:09"].obs is None
+      and "該分鐘內無取樣" in rows["10:07"].na_reason
+      and rows["10:06"].obs is not None and rows["10:10"].obs is not None)
 
 # 實機 CERT_20261029_082805 12:00 型態：HMI 重新登入空窗 → ok=True、HMI 欄位全空、只有 6161 PCS 模組溫度
 NO_HMI = dict(soc=None, current_a=None, rack_max_c=None, rack_min_c=None, voltage_v=None, sensor_c=None,
@@ -402,23 +405,24 @@ NO_HMI = dict(soc=None, current_a=None, rack_max_c=None, rack_min_c=None, voltag
 obs = (seq(0, 110, "D") + [ob(113, "D"), ob(123, "D", **NO_HMI), ob(134, "D")] + seq(144, 300, "D"))
 r = run(obs)
 m = {x.T.strftime("%H:%M"): x for x in overall_minutes(r)}["10:02"]
-check("O4 整分 ±20 秒內同時有有效觀測（−7 秒）與 HMI 無讀值觀測（+3 秒）→ 整體頁選有效觀測（真實原始值，不內插）",
-      m.obs is not None and m.obs.t == BASE + timedelta(seconds=113) and has_hmi_values(m.obs))
+check("O4 同一分鐘同時有 HMI 有效觀測與 HMI 無讀值觀測（10:02:03）→ 整體頁取該分鐘最後一筆 HMI 有效觀測 10:02:54",
+      m.obs is not None and m.obs.t == BASE + timedelta(seconds=174) and has_hmi_values(m.obs)
+      and all(v[1].t != BASE + timedelta(seconds=123) for v in m.ext.values()))
 sm = {x.T.strftime("%H:%M"): x for x in stage_minutes(r, r.stages[0])}["10:02"]
-check("O5 階段頁同一分鐘結果不變（選 −7 秒那筆）", sm.obs is not None and sm.obs.t == m.obs.t)
+check("O5 階段頁同一分鐘結果相同（10:02:54）", sm.obs is not None and sm.obs.t == m.obs.t)
 check("O6 HMI 無讀值的一筆不切斷階段（仍 1 個放電階段、未提前結束、仍建立不確定項目）",
       len(r.stages) == 1 and r.stages[0].dir == "D" and r.stages[0].A.t == obs[-1].t
       and r.stages[0].end_by != "idle_confirmed"
       and any(not pz.certain and pz.A.t == BASE + timedelta(seconds=113) for pz in r.pauses))
-obs = seq(0, 90, "D") + [ob(110, "D", **NO_HMI), ob(125, "D", **NO_HMI)] + seq(150, 300, "D")
+obs = seq(0, 110, "D") + [ob(t, "D", **NO_HMI) for t in range(120, 171, 10)] + seq(180, 300, "D")
 r = run(obs)
 m = {x.T.strftime("%H:%M"): x for x in overall_minutes(r)}["10:02"]
-check("O7 ±20 秒內只有 HMI 無讀值觀測 → 退而選用（保留 6161 溫度），HMI 欄位仍為空（不捏造）",
+check("O7 該分鐘內只有 HMI 無讀值觀測 → 退而選用（保留 6161 溫度），HMI 欄位仍為空（不捏造）",
       m.obs is not None and not has_hmi_values(m.obs) and m.obs.values["pcs_module_c"] == 80)
-obs = seq(0, 90, "D") + [ob(110, "D", **dict(NO_HMI, pcs_module_c=None))] + seq(150, 300, "D")
+obs = seq(0, 110, "D") + [ob(t, "D", **dict(NO_HMI, pcs_module_c=None)) for t in range(120, 171, 10)] + seq(180, 300, "D")
 r = run(obs)
 m = {x.T.strftime("%H:%M"): x for x in overall_minutes(r)}["10:02"]
-check("O8 ±20 秒內只有完全無值的觀測 → N/A，原因寫明 HMI 無有效讀值（通訊異常或未登入）",
+check("O8 該分鐘內只有完全無值的觀測 → N/A，原因寫明 HMI 無有效讀值（通訊異常或未登入）",
       m.obs is None and R_NO_HMI in m.na_reason)
 sm8 = {x.T.strftime("%H:%M"): x for x in stage_minutes(r, r.stages[0])}["10:02"]
 check("O9 階段頁同樣不選 HMI 無值觀測；真正無候選 → N/A", sm8.obs is None)

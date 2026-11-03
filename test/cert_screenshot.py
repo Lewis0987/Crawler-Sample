@@ -46,7 +46,7 @@ from datetime import datetime
 import cert_report_config as CFG
 
 KIND_TEXT = {"candidate": "候選截圖", "stage_end": "階段結束截圖", "pause": "停頓點截圖",
-             "manual": "手動補拍", "delayed": "延遲補拍"}
+             "manual": "手動補拍", "delayed": "延遲補拍", "cert_final": "認證結束（最後狀態）"}
 STATUS_TEXT = {"ok": "成功", "stale": "資料未更新", "failed": "失敗"}
 
 CHROME_CANDIDATES = [
@@ -626,6 +626,19 @@ def select_stage_shot(records, stage_start, target):
     pending = [j for j in jobs if j["effective_kind"] in SLOT_PRIORITY + ("candidate",)
                and target not in j["results"]]
     return (pending[-1], None) if pending else (None, None)
+
+
+def select_final_shot(records, target):
+    """
+    報告用：整份認證的「認證結束（最後狀態）」截圖（Menu 22 結束認證時擷取）。
+    與階段截圖分開：cert_final 不屬於任何階段（stage_start 為 None），不會被選入階段位置；階段截圖也不會被當成結束截圖。
+    回傳 (job, result)：最後一次結束截圖工作及其結果（成功／資料未更新／失敗原因）；result 為 None = 尚未完成。
+    """
+    jobs = [j for j in effective_jobs(records).values() if j["kind"] == "cert_final" and target in j["targets"]]
+    if not jobs:
+        return None, None
+    j = max(jobs, key=lambda j_: j_["requested_at"])
+    return j, j["results"].get(target)
 
 
 def _fmt(t):

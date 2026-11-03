@@ -13,6 +13,7 @@
 
 import json
 import os
+import time
 import urllib.request
 
 import cert_report_config as CFG
@@ -26,9 +27,23 @@ def _reader():
     import charge_discharge_report as CDR
     client = RM._report.get("client")
     if client is None:
+        _READ_TIMING.clear()
         return None
+    t0 = time.perf_counter()
     with RM._CLIENT_LOCK:
-        return CDR.read_all(client)
+        t1 = time.perf_counter()
+        try:
+            return CDR.read_all(client)
+        finally:
+            try:                                        # 量測用（cert_timing.jsonl）；Fail Open
+                t2 = time.perf_counter()
+                _READ_TIMING.clear()
+                _READ_TIMING.update(lock_wait_ms=round((t1 - t0) * 1000, 1), read_ms=round((t2 - t1) * 1000, 1))
+            except Exception:                           # noqa: BLE001
+                pass
+
+
+_READ_TIMING = {}       # 最近一次 HMI 讀取：等 _CLIENT_LOCK 毫秒、read_all 毫秒（perf_counter）
 
 
 def _heat_reader():
@@ -63,7 +78,8 @@ def start_if_enabled(stop_event, log=print):
     from cert_runtime import CertRuntime
     root = REQ.cert_root(RM.OUTPUT_DIR)
     rt = CertRuntime(root, reader=_reader, heat_reader=_heat_reader, single_state=single_report_state,
-                     cmd_file=os.path.join(RM.OUTPUT_DIR, "device_control_action_result.json"), log=log)
+                     cmd_file=os.path.join(RM.OUTPUT_DIR, "device_control_action_result.json"), log=log,
+                     read_timing=lambda: dict(_READ_TIMING))
     # 認證進行中 → 單次報告所有建立入口一律拒絕；記憶體狀態之外再看磁碟（續接失敗時也不會誤建單次報告）
     RM.set_cert_active_provider(lambda: rt.active_id() or REQ.active_on_disk(root))
     try:

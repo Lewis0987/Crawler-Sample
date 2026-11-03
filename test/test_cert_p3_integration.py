@@ -470,10 +470,11 @@ try:
     rest_vals = [val(f"09:{m:02d}") for m in range(31, 36)]
     check(f"「整體測試」休息期間每分鐘都有溫度（09:31～09:35：{rest_vals}）",
           all(isinstance(v, (int, float)) for v in rest_vals))
-    # 失敗 09:50:00～09:52:00：09:50 取 ±20 秒內的 09:49:50（有效讀值，依規則）；09:51 前後 20 秒全是失敗 → N/A
-    fail_vals = [val("09:51")]
-    check(f"通訊失敗分鐘（09:51，±20 秒內無有效讀值）為 N/A、曲線斷線（{fail_vals}），不補值",
-          all(v in (None, "N/A") for v in fail_vals) and isinstance(val("09:50"), (int, float)))
+    # 失敗 09:50:00～09:52:00：Calendar Minute 09:50、09:51 整分鐘都是失敗 → N/A（不跨分鐘取 09:49:50／09:52:00）
+    fail_vals = [val("09:50"), val("09:51")]
+    check(f"通訊失敗分鐘（09:50、09:51 整分鐘無有效讀值）為 N/A、曲線斷線（{fail_vals}），不補值；09:49／09:52 照常",
+          all(v in (None, "N/A") for v in fail_vals)
+          and isinstance(val("09:49"), (int, float)) and isinstance(val("09:52"), (int, float)))
     gap_vals = [val("10:21"), val("10:22")]
     check(f"服務停機期間（10:20～10:23）為 N/A（{gap_vals}）", all(v in (None, "N/A") for v in gap_vals))
     check(f"報告「整體測試」Cell 最大／最小電壓（F／G）：{val('09:10', 6)}／{val('09:10', 7)}，格式 0.000",
@@ -490,8 +491,9 @@ try:
     desc = wb.properties.description or ""
     check("報告標題用輸入的電櫃規格與循環數（【340KW】電櫃充放2個循環溫度曲線）",
           "【340KW】電櫃充放2個循環溫度曲線" in titles_)
-    check("來源說明（暫用參數、指令快照限制、服務中斷期間）寫入活頁簿屬性，不改動已確認版面",
-          "暫用測試值" in desc and "只保留最近一次" in desc and "服務中斷" in desc and "Summary" in wb.sheetnames[0])
+    check("來源說明（取樣週期 5 秒＝正式設定、其他暫用參數、指令快照限制、服務中斷期間）寫入活頁簿屬性，不改動已確認版面",
+          "取樣週期 5 秒為正式設定" in desc and "其他參數（G、確認門檻" in desc and "暫用測試值" in desc
+          and "參數（取樣週期" not in desc and "只保留最近一次" in desc and "服務中斷" in desc and "Summary" in wb.sheetnames[0])
     check("階段頁籤依操作人員標記命名（1.第1次放電(滿放)）", any(n.startswith("1.第1次放電(滿放)") for n in wb.sheetnames))
     z.close()
 
@@ -756,8 +758,11 @@ try:
         ("battery_power_status=切換中 → N/A", stt(mk(battery_power_status="切換中"), nm), "N/A"),
         ("讀取失敗（communication failure）→ N/A", stt(mk(ok=False, state="讀取失敗", direction=None,
                                                       battery_power_status="已上電"), nm), "N/A"),
-        ("pcs_fault=True（即使已上電）→ N/A", stt(mk(battery_power_status="已上電", pcs_fault_flag=True), nm), "N/A"),
-        ("本次實機異常：fault=True＋上下電未知 → N/A", stt(mk(battery_power_status="未知", pcs_fault_flag=True), nm), "N/A"),
+        ("pcs_fault=True（即使已上電）→ 故障（設備明確回報）", stt(mk(battery_power_status="已上電", pcs_fault_flag=True), nm),
+         "故障"),
+        ("本次實機異常：fault=True＋上下電未知 → 故障（明確故障優先；不是 Unknown）",
+         stt(mk(battery_power_status="未知", pcs_fault_flag=True), nm), "故障"),
+        ("fault=True＋已下電 → 故障（不是停機）", stt(mk(battery_power_status="已下電", pcs_fault_flag=True), nm), "故障"),
         ("充電階段 → 第N次充電", stt(mk(state="充電", direction="C", stage_no=1, battery_power_status="已上電"), nm),
          "第1次充電"),
         ("放電階段 → 第N次放電", stt(mk(state="放電", direction="D", stage_no=2, battery_power_status="已上電"), nm),
@@ -796,30 +801,35 @@ try:
     rq_es = req(root_s, clk_s, "end_cert", cert_id=cid_s)
     rtS2.tick()
     wbs = load_workbook(REQ.read_result(root_s, rq_es)["data"]["report"])
+    n_before_end = len(recs_s)
+    recs_s = _read_jsonl(os.path.join(root_s, cid_s, "observations.jsonl"))   # Menu 22 會再取最後一筆（Final Poll）
+    check(f"Menu 22 結束前再取一筆正常 observation（{n_before_end} → {len(recs_s)}），schema 相同",
+          len(recs_s) == n_before_end + 1 and set(recs_s[-1]) == set(recs_s[0]))
     wa_ = wbs["整體測試"]
     rmk = {c.value.strftime("%H:%M"): wa_.cell(r_, 11).value for r_, c in enumerate(wa_["A"][1:], 2)
            if hasattr(c.value, "strftime")}
     print("     整體測試備註：", {k: rmk[k] for k in ("09:01", "09:05", "09:12", "09:17", "09:20") if k in rmk})
-    check("整體測試備註：待機（已上電）／第1次放電／待機／停機（已下電）／N/A（故障）",
+    check("整體測試備註：待機（已上電）／第1次放電／待機／停機（已下電）／故障（PCS 故障旗標）",
           rmk.get("09:01") == "待機" and rmk.get("09:05") == "第1次放電" and rmk.get("09:12") == "待機"
-          and rmk.get("09:17") == "停機" and rmk.get("09:20") == "N/A" and "休息" not in rmk.values())
+          and rmk.get("09:17") == "停機" and rmk.get("09:20") == "故障" and "休息" not in rmk.values())
     rws = wbs["Raw Data"]
     rh = [c.value for c in rws[1]]
-    rrows = [[c.value for c in r_] for r_ in rws.iter_rows(min_row=2) if r_[rh.index("讀取結果")].value in ("成功", "失敗")]
+    rrows = [[c.value for c in r_] for r_ in rws.iter_rows(min_row=2) if r_[rh.index("序號")].value is not None]
     st_set = {r_[rh.index("狀態")] for r_ in rrows}
     fault_t = {r["t"] for r in recs_s if r["flags"]["pcs_fault_flag"] is True}
-    check(f"Raw Data 狀態只出現 待機／停機／第N次放電（{sorted(st_set)}；無 N/A），說明保留分析狀態與上下電原始值；"
-          f"PCS 故障（上下電未知）{len(fault_t)} 筆狀態無法判定 → 整筆不輸出",
-          st_set == {"待機", "第1次放電", "停機"} and fault_t
+    fault_rows = [r_ for r_ in rrows if r_[rh.index("時間")].strftime("%Y-%m-%dT%H:%M:%S") in fault_t]
+    check(f"Raw Data 狀態只出現 待機／停機／第N次放電／故障（{sorted(st_set)}；無 N/A），說明保留分析狀態與上下電原始值；"
+          f"PCS 故障（上下電未知）{len(fault_t)} 筆 → 狀態「故障」照常輸出",
+          st_set == {"待機", "第1次放電", "停機", "故障"} and fault_t
           and any("分析狀態：休息" in str(r_[rh.index("說明")]) and "電池上下電：已上電" in str(r_[rh.index("說明")])
                   for r_ in rrows)
-          and not any(r_[rh.index("PC 取樣時間")].strftime("%Y-%m-%dT%H:%M:%S") in fault_t for r_ in rrows)
-          and len(rrows) == len(recs_s) - len(fault_t))
+          and len(fault_rows) == sum(1 for r in recs_s if r["flags"]["pcs_fault_flag"] is True) and all(r_[rh.index("狀態")] == "故障" for r_ in fault_rows)
+          and len(rrows) == len(recs_s))
     by_seq = {r_[rh.index("序號")]: r_ for r_ in rrows}
     check("Raw Data 數值（Cell 最大電壓、SOC、電流）照原始值，未被改寫（依序號＝observations.jsonl 列號對回）",
           len(by_seq) == len(rrows) and "來源" not in rh
           and all((by_seq[i + 1][rh.index("Cell 最大電壓")], by_seq[i + 1][rh.index("SOC")],
-                   by_seq[i + 1][rh.index("電流")], by_seq[i + 1][rh.index("PC 取樣時間")].strftime("%Y-%m-%dT%H:%M:%S"))
+                   by_seq[i + 1][rh.index("電流")], by_seq[i + 1][rh.index("時間")].strftime("%Y-%m-%dT%H:%M:%S"))
                   == (r["values"]["cell_vmax_v"], r["values"]["soc"], r["values"]["current_a"], r["t"])
                   for i, r in enumerate(recs_s) if i + 1 in by_seq))
 
@@ -834,12 +844,13 @@ try:
         orm = [(c.value.strftime("%H:%M"), wo_.cell(r_, 11).value) for r_, c in enumerate(wo_["A"][1:], 2)
                if hasattr(c.value, "strftime")]
         print("     ", orm)
-        check("舊資料：放電分鐘 → 第1次放電；其他分鐘 → N/A（不回填、不推測待機）",
+        check("舊資料：放電分鐘 → 第1次放電；其他分鐘 → N/A（不回填、不推測待機）；"
+              "Calendar Minute 由該分鐘最後一筆的語意代表（17:05 最後已放電、17:10 最後已休息）",
               ok_o and {v for _k, v in orm} == {"第1次放電", "N/A"}
-              and [k for k, v in orm if v == "第1次放電"] == ["17:06", "17:07", "17:08", "17:09", "17:10"])
+              and [k for k, v in orm if v == "第1次放電"] == ["17:05", "17:06", "17:07", "17:08", "17:09"])
         ro_ = wbo["Raw Data"]
         oh = [c.value for c in ro_[1]]
-        ost = [r_[oh.index("狀態")].value for r_ in ro_.iter_rows(min_row=2) if r_[oh.index("讀取結果")].value in ("成功", "失敗")]
+        ost = [r_[oh.index("狀態")].value for r_ in ro_.iter_rows(min_row=2) if r_[oh.index("序號")].value is not None]
         res_o = rtO._offline(os.path.join(root_o2, "CERT_20261028_165847")).analysis()
         n_dis = sum(1 for o in res_o.obs if o.state == "放電")
         check(f"舊資料（未保存上下電）Raw Data：只輸出狀態可判定的第1次放電 {ost.count('第1次放電')} 筆（＝分析為放電的 {n_dis} 筆）；"
@@ -855,6 +866,232 @@ try:
         zo.close()
 
     # 交付：模擬 Excel 副本
+    print("\n== 取樣計時 cert_timing.jsonl（診斷用；Fail Open；observation／cert_state schema 不變）==")
+    t0_t = datetime(2026, 10, 27, 9, 0, 0)
+    clk_t = Clock(t0_t)
+    root_t = os.path.join(TMP, "cert_timing")
+    plant_t = Plant(clk_t, t0_t, [(30, 200, "D"), (300, 330, "FAIL")])
+    rtT = CertRuntime(root_t, reader=plant_t.read, heat_reader=plant_t.heat, enable_shots=False, clock=clk_t,
+                      log=lambda *a: None, read_timing=lambda: {"lock_wait_ms": 1.5, "read_ms": 12.0})
+    req(root_t, clk_t, "start_cert", {"cabinet_spec": "250KW"})
+    rtT.tick()
+    cid_t = rtT.active_id()
+    run_until(rtT, clk_t, 400, t0_t)
+    fold_t = os.path.join(root_t, cid_t)
+    rd = lambda n_: [json.loads(l_) for l_ in open(os.path.join(fold_t, n_), encoding="utf-8")]
+    obs_t, tim_t = rd("observations.jsonl"), rd("cert_timing.jsonl")
+    check(f"T1 每個寫入 observation 的 Cycle 各一筆計時（{len(tim_t)} = {len(obs_t)}），obs_t 逐筆對應",
+          len(obs_t) > 30 and [x["obs_t"] for x in tim_t if x["written"]] == [o["t"] for o in obs_t])
+    num = lambda v: isinstance(v, (int, float))
+    need = ("cycle_ms", "hmi_ms", "heat_ms", "rt_lock_wait_ms", "obs_write_ms", "state_write_ms", "after_sample_ms")
+    check("T2 計時欄位齊全且為毫秒數值（perf_counter）；Cycle ≥ HMI＋6161；第一筆沒有間隔、之後有；"
+          "截圖關閉時每次取樣不跑 analysis() → analysis_ms 為 None（不捏造）",
+          all(num(x[k]) and x[k] >= 0 for x in tim_t for k in need) and all(x["analysis_ms"] is None for x in tim_t)
+          and all(x["cycle_ms"] + 0.5 >= x["hmi_ms"] + x["heat_ms"] for x in tim_t)
+          and tim_t[0]["interval_ms"] is None and all(num(x["interval_ms"]) for x in tim_t[1:])
+          and all(len(x["wall_start"]) == 23 for x in tim_t))
+    check("T3 reader 計時（等 _CLIENT_LOCK／read_all 毫秒）併入；status.json 的 analysis 耗時與呼叫間隔併入",
+          all(x["reader"] == {"lock_wait_ms": 1.5, "read_ms": 12.0} for x in tim_t)
+          and all(x["status_writes"] >= 1 and num(x["status_analysis_ms_max"]) for x in tim_t[1:]))
+    tim_a = [json.loads(l_) for l_ in open(os.path.join(root, cid, "cert_timing.jsonl"), encoding="utf-8")]
+    check(f"T2b 截圖開啟（正式預設）的 runtime：每次取樣後 analysis() 耗時都有記錄（{len(tim_a)} 筆）",
+          tim_a and all(num(x["analysis_ms"]) for x in tim_a if x["written"]))
+    fl_t = [x for x in tim_t if x["read_err"]]
+    check(f"T4 失敗 Cycle 照實記錄（HMI 無讀值＋6161 例外 {len(fl_t)} 筆；observation 同樣寫入 ok=False）",
+          fl_t and all(x["heat_err"] and x["ok"] is False for x in fl_t)
+          and all(x["hmi_fail"] == [] for x in tim_t if x["ok"] and not x["read_err"]))
+    check("T5 observations.jsonl schema 不變（與既有 Historical Evidence 相同欄位，不含任何計時欄位）",
+          all(set(o) == {"t", "ok", "hmi_ok", "values", "missing", "flags", "notes", "fail_reason"} for o in obs_t))
+    st_t = json.load(open(os.path.join(fold_t, "cert_state.json"), encoding="utf-8"))
+    check("T5b cert_state.json schema 不變（不含計時欄位；sample_count = observation 筆數）",
+          not any("timing" in k or k.endswith("_ms") for k in st_t) and st_t["sample_count"] == len(obs_t))
+    n_before = len(obs_t)
+    os.remove(os.path.join(fold_t, "cert_timing.jsonl"))
+    os.makedirs(os.path.join(fold_t, "cert_timing.jsonl"))               # 計時檔無法寫入（同名資料夾）
+    rtT.read_timing = lambda: 1 / 0                                     # reader 計時也丟例外
+    try:
+        run_until(rtT, clk_t, 500, t0_t)
+        raised = None
+    except Exception as e:                                              # noqa: BLE001
+        raised = e
+    obs_t2 = rd("observations.jsonl")
+    check(f"T6 Fail Open：計時檔寫入失敗＋計時來源例外 → 取樣照常（observation {n_before} → {len(obs_t2)}）、"
+          f"不丟例外、只計數（timing_errors={rtT.timing_errors}）、認證仍在記錄",
+          raised is None and len(obs_t2) >= n_before + 9 and rtT.timing_errors >= 9 and rtT.is_active()
+          and json.load(open(os.path.join(fold_t, "cert_state.json"), encoding="utf-8"))["sample_count"] == len(obs_t2))
+    import charge_discharge_report as _CDR
+    _bak_c, _bak_r = RM._report.get("client"), _CDR.read_all
+    try:
+        RM._report["client"] = object()
+        _CDR.read_all = lambda c_: {"_fail": [], "soc_percent": 50}
+        r_ok = cert_service._reader()
+        tm_ok = dict(cert_service._READ_TIMING)
+        _CDR.read_all = lambda c_: 1 / 0
+        try:
+            cert_service._reader()
+            raised_r = False
+        except ZeroDivisionError:
+            raised_r = True
+        tm_err = dict(cert_service._READ_TIMING)
+        RM._report["client"] = None
+        r_none = cert_service._reader()
+        tm_none = dict(cert_service._READ_TIMING)
+    finally:
+        RM._report["client"], _CDR.read_all = _bak_c, _bak_r
+    check("T8 服務 reader 計時：等 _CLIENT_LOCK 與 read_all 毫秒（perf_counter）；read_all 例外照原本行為往外丟、仍記錄計時；"
+          "沒有 client → None（不留舊計時）",
+          r_ok == {"_fail": [], "soc_percent": 50} and set(tm_ok) == {"lock_wait_ms", "read_ms"}
+          and raised_r and set(tm_err) == {"lock_wait_ms", "read_ms"} and r_none is None and tm_none == {})
+    # 2026-11-03 正式需求由 10 秒改為 5 秒（Phase 1 實機 PASS）→ 期待值依新需求更新（舊 10 秒期待已過時）
+    check("T7 取樣間隔＝正式設定：SAMPLE_INTERVAL_SEC = 5，下一次取樣 = 寫入時間 + 5 秒",
+          CFG.SAMPLE_INTERVAL_SEC == 5 and rtT.next_sample == datetime.strptime(obs_t2[-1]["t"], "%Y-%m-%dT%H:%M:%S")
+          + timedelta(seconds=5))
+
+    print("\n== Idle-only 認證／Menu 22 最後取樣／認證結束（最後狀態）截圖 ==")
+    import threading
+    from cert_screenshot import select_final_shot
+
+    def pics(xlsx, sheet):
+        """該頁實際插入的圖片數（讀 drawing XML 的 pic 元素）。"""
+        with zipfile.ZipFile(xlsx) as z_:
+            wbx = z_.read("xl/workbook.xml").decode()
+            rid = re.search(rf'<sheet [^>]*name="{sheet}"[^>]*r:id="(\w+)"', wbx).group(1)
+            rels = z_.read("xl/_rels/workbook.xml.rels").decode()
+            tgt = re.search(rf'<Relationship[^>]*Id="{rid}"[^>]*/>', rels).group(0)
+            sh = "xl/" + re.search(r'Target="/?(?:xl/)?([^"]+)"', tgt).group(1)
+            srel = sh.replace("worksheets/", "worksheets/_rels/") + ".rels"
+            if srel not in z_.namelist():
+                return 0
+            m = re.search(r'Target="[^"]*drawings/(drawing\d+\.xml)"', z_.read(srel).decode())
+            return len(re.findall(r"<(?:xdr:)?pic>", z_.read(f"xl/drawings/{m.group(1)}").decode())) if m else 0
+
+    def texts(xlsx, sheet):
+        return " ".join(str(c.value) for row in load_workbook(xlsx)[sheet].iter_rows() for c in row if c.value)
+
+    def raw_col(xlsx):
+        """Raw Data 欄名 → 0 起索引（依該份報告實際表頭，不寫死欄位位置）。"""
+        return {c.value: i for i, c in enumerate(load_workbook(xlsx)["Raw Data"][1])}
+
+    def idle_cert(name, plan, shots, until=600, reader=None):
+        t0_ = datetime(2026, 10, 27, 10, 0, 0)
+        clk_ = Clock(t0_)
+        root_ = os.path.join(TMP, name)
+        pl_ = Plant(clk_, t0_, plan)
+        rt_ = runtime(root_, clk_, pl_, shots=shots)
+        if reader is not None:
+            rt_.reader = reader(pl_.read)
+        req(root_, clk_, "start_cert", {"cabinet_spec": "250KW"})
+        rt_.tick()
+        cid_ = rt_.active_id()
+        run_until(rt_, clk_, until, t0_)
+        n_obs_ = len(rt_.records)
+        rt_._pre_end = _read_jsonl(os.path.join(root_, cid_, "observations.jsonl"))   # 結束前快照（驗證不改前一筆）
+        rq_ = req(root_, clk_, "end_cert", cert_id=cid_)
+        rt_.tick()
+        return rt_, root_, cid_, pl_, n_obs_, REQ.read_result(root_, rq_), clk_
+
+    shI = FakeShot()
+    rtI, rootI, cidI, plI, nI, resI, clkI = idle_cert("idle_only", [], shI)
+    obsI = _read_jsonl(os.path.join(rootI, cidI, "observations.jsonl"))
+    repI = resI["data"]["report"]
+    wbI = load_workbook(repI)
+    rawI = [r_ for r_ in wbI["Raw Data"].iter_rows(min_row=2, values_only=True) if r_[0] is not None]
+    ovI = [r_ for r_ in wbI["整體測試"].iter_rows(min_row=2, values_only=True) if r_[0] is not None]
+    cI = raw_col(repI)
+    check(f"F1 Idle + 已上電 → 待機；Idle-only 10 分鐘：Stage 0、Raw Data {len(rawI)} 筆 = 全部 observation、"
+          f"整體頁 {len(ovI)} 列（Calendar Minute）",
+          resI["status"] == "done" and not [n_ for n_ in wbI.sheetnames if re.match(r"\d+\.", n_)]
+          and len(rawI) == len(obsI) and {r_[cI["狀態"]] for r_ in rawI} == {"待機"} and len(ovI) == 11
+          and ovI[0][0] == datetime(2026, 10, 27, 10, 0) and ovI[-1][0] == datetime(2026, 10, 27, 10, 10))
+    check(f"F2 Menu 22 最後取樣：結束前再寫一筆正常 observation（{nI} → {len(obsI)}），schema 與其他筆相同",
+          len(obsI) == nI + 1 and set(obsI[-1]) == set(obsI[0])
+          and obsI[-1]["t"] == rawI[-1][cI["時間"]].strftime("%Y-%m-%dT%H:%M:%S"))
+    recI = load_manifest(os.path.join(rootI, cidI))
+    fin = {t_: select_final_shot(recI, t_) for t_ in ("overview", "heat")}
+    check("F3 Stage 0 仍有兩張「認證結束（最後狀態）」截圖（數據概覽、即時熱度各 1 張，類型 cert_final、成功）",
+          all(j_ and j_["kind"] == "cert_final" and r_ and r_["status"] == "ok" for j_, r_ in fin.values())
+          and pics(repI, "數據概覽") == 1 and pics(repI, "即時熱度") == 1
+          and "認證結束（最後狀態）" in texts(repI, "數據概覽") and "認證結束（最後狀態）" in texts(repI, "即時熱度"))
+    check("F4 時序：最後取樣先於結束截圖（截圖觸發時間 ≥ 最後一筆 observation 時間）",
+          fin["overview"][0]["trigger_time"] >= obsI[-1]["t"])
+
+    shS = FakeShot()
+    rtS3, rootS3, cidS3, _p, _n, resS3, _c = idle_cert("stage_final", [(30, 400, "D")], shS, until=700)
+    repS3 = resS3["data"]["report"]
+    recS3 = load_manifest(os.path.join(rootS3, cidS3))
+    keyS3 = rtS3._offline(os.path.join(rootS3, cidS3)).analysis().stages[0].start.t.strftime("%Y-%m-%dT%H:%M:%S")
+    jS, _r = select_stage_shot(recS3, keyS3, "overview")
+    check("F5 有 Stage 的認證：保留階段截圖＋認證結束截圖（數據概覽、即時熱度各 2 張）；階段位置不會選到 cert_final",
+          pics(repS3, "數據概覽") == 2 and pics(repS3, "即時熱度") == 2 and jS and jS["kind"] != "cert_final"
+          and select_final_shot(recS3, "overview")[0]["kind"] == "cert_final")
+
+    rtF, rootF, cidF, _p, nF, resF, _c = idle_cert("final_poll_fail", [(590, 9999, "FAIL")], FakeShot())
+    obsF = _read_jsonl(os.path.join(rootF, cidF, "observations.jsonl"))
+    check("F6 Menu 22 最後取樣失敗 → 照一般失敗規則寫入（ok=False），不改前一筆、不阻擋結束、照常產報",
+          resF["status"] == "done" and resF["data"]["report_ok"] and len(obsF) == nF + 1 and obsF[-1]["ok"] is False
+          and obsF[:-1] == rtF._pre_end and not rtF.is_active())
+
+    rtX, rootX, cidX, _p, _n, resX, _c = idle_cert("final_shot_fail", [], FakeShot(fail_calls=(1,)))
+    repX = resX["data"]["report"]
+    check("F7 結束截圖失敗 → 不阻擋結束、照常產報；數據概覽「認證結束（最後狀態）」區塊如實顯示失敗原因（不假裝成功）",
+          resX["status"] == "done" and resX["data"]["report_ok"] and pics(repX, "數據概覽") == 0
+          and "【截圖失敗】" in texts(repX, "數據概覽") and "ERR_CONNECTION_TIMED_OUT" in texts(repX, "數據概覽")
+          and pics(repX, "即時熱度") == 1)
+
+    class Conc:
+        """包住 reader：記錄同時進行中的讀取數（> 1 即為併發）。"""
+        def __init__(self, inner):
+            self.inner, self.n, self.max, self.calls, self.lk = inner, 0, 0, 0, threading.Lock()
+
+        def __call__(self):
+            with self.lk:
+                self.n += 1
+                self.max = max(self.max, self.n)
+                self.calls += 1
+            try:
+                time.sleep(0.05)
+                return self.inner()
+            finally:
+                with self.lk:
+                    self.n -= 1
+    t0c = datetime(2026, 10, 27, 11, 0, 0)
+    clkC = Clock(t0c)
+    rootC = os.path.join(TMP, "final_conc")
+    plC = Plant(clkC, t0c, [])
+    rtC = runtime(rootC, clkC, plC)
+    rtC.reader = Conc(plC.read)
+    req(rootC, clkC, "start_cert", {"cabinet_spec": "250KW"})
+    rtC.tick()
+    cidC = rtC.active_id()
+    run_until(rtC, clkC, 60, t0c)
+    stop_c = threading.Event()
+
+    def bg():
+        while not stop_c.is_set():
+            rtC.sample_once()                      # 背景取樣不停嘗試（模擬剛好與 Menu 22 同時到期）
+    th = threading.Thread(target=bg)
+    th.start()
+    time.sleep(0.2)
+    rq_c = req(rootC, clkC, "end_cert", cert_id=cidC)
+    rtC.process_requests()
+    time.sleep(0.3)
+    stop_c.set()
+    th.join(5)
+    n_c = len(_read_jsonl(os.path.join(rootC, cidC, "observations.jsonl")))
+    rtC.sample_once()
+    check(f"F8 Menu 22 最後取樣與背景取樣不會同時讀取（最大同時讀取數 {rtC.reader.max}）；結束後背景取樣不再寫入",
+          REQ.read_result(rootC, rq_c)["status"] == "done" and rtC.reader.max == 1
+          and len(_read_jsonl(os.path.join(rootC, cidC, "observations.jsonl"))) == n_c)
+
+    calls_before = (dict(shI.calls), plI.calls)
+    rq_g = req(rootI, clkI, "regenerate", cert_id=cidI)
+    rtI.tick()
+    rg = REQ.read_result(rootI, rq_g)
+    check("F9 Menu 25 重產：不重新截圖、不重新讀設備；沿用歷史截圖紀錄（認證結束截圖仍在）",
+          rg["status"] == "done" and (dict(shI.calls), plI.calls) == calls_before
+          and pics(rg["data"]["report"], "數據概覽") == 1 and pics(rg["data"]["report"], "即時熱度") == 1
+          and len(load_manifest(os.path.join(rootI, cidI))) == len(recI))
+
     if OUT_COPY:
         os.makedirs(OUT_COPY, exist_ok=True)
         for src_, name in ((reps[-1], "P3_模擬_連續記錄_含休息與重啟.xlsx"), (rr["data"]["report"], "P3_模擬_結束時仍運行_未完成.xlsx"),

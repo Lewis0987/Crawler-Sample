@@ -252,17 +252,24 @@ try:
                   "10:39:05 ～ 12:42:57｜SOC 0% → 99%｜停止後 SOC 100%｜",
                   "14:39:01 ～ 16:45:17｜SOC 100% → 1%｜停止後 SOC 0%｜",
                   "16:49:07 ～ 18:05:07｜SOC 0% → 65%｜停止後 SOC 65%｜")))
+        from datetime import timedelta as _td
         from cert_stage_engine import stage_minutes
-        resf = CertRuntime(root_f, reader=None, enable_shots=False, log=lambda *a: None)._offline(
+        resf =CertRuntime(root_f, reader=None, enable_shots=False, log=lambda *a: None)._offline(
             os.path.join(root_f, "CERT_20261029_082805")).analysis()
         hm = lambda t: t.strftime("%H:%M:%S")
         check("082805 階段邊界不變：最後觀測運行 A／結束後首筆待機 end_B／end_by",
               [(hm(s.A.t), hm(s.end_B.t), s.end_by) for s in resf.stages]
               == [("10:37:28", "10:37:39", "idle_confirmed"), ("12:42:57", "12:43:07", "idle_confirmed"),
                   ("16:45:17", "16:45:28", "idle_confirmed"), ("18:05:07", "18:05:29", "idle_confirmed")])
-        lm = stage_minutes(resf, resf.stages[0])[-1]
-        check("082805 階段頁資料範圍不變：第1次放電最後一列 10:37（取 10:36:56、SOC 1），不延伸到待機",
-              lm.T.strftime("%H:%M") == "10:37" and hm(lm.obs.t) == "10:36:56" and lm.obs.values["soc"] == 1.0)
+        # 2026-11-03 正式需求：階段頁四個極值＝階段所涵蓋分鐘的完整日曆分鐘（A 之後同分鐘的待機可納入，排除明確反方向）
+        lm = stage_minutes(resf, resf.stages[0], ext_scope="minute")[-1]
+        _A = resf.stages[0].A.t
+        check("082805 階段頁資料範圍：第1次放電最後一列 10:37（一般欄位＝A 點 10:37:28，不延伸到待機 10:37:39 起）；"
+              "極值來源可在 A 之後但仍在 10:37 同一日曆分鐘、不來自下一分鐘、不是反方向（充電）",
+              lm.T.strftime("%H:%M") == "10:37" and lm.obs is resf.stages[0].A and hm(lm.obs.t) == "10:37:28"
+              and all(lm.T <= v[1].t < lm.T + _td(minutes=1) and v[1].direction != "C"
+                      for v in lm.ext.values())
+              and stage_minutes(resf, resf.stages[0])[-1].T == lm.T)
         outs = run_ui(root_f, ["1", "1", "3", "1"])    # 選認證 → 階段標記 → 階段 3 → 滿放
         rtf = CertRuntime(root_f, reader=None, enable_shots=False, log=lambda *a: None)
         rtf.process_requests()

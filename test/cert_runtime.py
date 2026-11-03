@@ -24,6 +24,7 @@
   events.jsonl         開始、續接（含中斷期間）、結束、報告產生／失敗等事件（append-only）
   screenshots.jsonl、screenshots/   P2 截圖紀錄
   reports/             認證測試報告（每次新檔：認證測試報告_<cert_id>_NN.xlsx）
+  cert_timing.jsonl    取樣 Cycle 計時（診斷／量測用，不是 Historical Evidence；寫入失敗不影響取樣 → Fail Open）
 """
 
 import json
@@ -56,6 +57,34 @@ def _parse(s):
 def _append_jsonl(path, rec):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+
+TIMING_FILE = "cert_timing.jsonl"
+
+
+def params_note(params):
+    """參數狀態說明（cert_state.json params_note 與報告來源說明共用）。
+    取樣週期已正式確認（CFG.SAMPLE_INTERVAL_SEC）；其餘列出者仍為暫用值。
+    params＝該認證開始時記錄的參數：與目前正式設定不同（例：舊認證 10 秒）→ 照實寫出本次實際值，不改寫成正式值。"""
+    cur = CFG.SAMPLE_INTERVAL_SEC
+    n = (params or {}).get("SAMPLE_INTERVAL_SEC")
+    iv = (f"取樣週期 {cur} 秒為正式設定" if n in (None, cur)
+          else f"取樣週期 {n} 秒（本次認證開始時的設定；目前正式設定 {cur} 秒）")
+    return f"{iv}；其他參數（G、確認門檻、待機電流門檻、每分鐘容許範圍、截圖等待／重試）為暫用測試值，非現場正式值"
+
+
+def _ms(a, b):
+    """兩個 time.perf_counter() 讀值的差（毫秒）；耗時一律以單調時鐘計算，不用 datetime。"""
+    return round((b - a) * 1000.0, 1)
+
+
+def _wall_ms():
+    return datetime.now().isoformat(timespec="milliseconds")      # 只供人工對照，不用來算耗時
+
+
+def _new_status_stat():
+    return {"n": 0, "analysis_ms_max": 0.0, "analysis_ms_sum": 0.0, "interval_ms_max": 0.0,
+            "cache_hits": 0, "cache_misses": 0}
 
 
 def _read_jsonl(path):
@@ -148,11 +177,12 @@ class CertRuntime:
     cmd_file        → 控制結果檔路徑（快照 Tc 用；None = 不讀）
     capturer        → P2 截圖函式（測試注入假的）；enable_shots=False 不截圖
     clock           → 現在時間（模擬測試注入）
+    read_timing()   → reader 最近一次的計時 dict（例：等鎖／讀取毫秒）；只寫入 cert_timing.jsonl，None = 不提供
     """
 
     def __init__(self, root, reader, heat_reader=None, single_state=None, cmd_file=None,
                  params=None, shot_params=None, capturer=None, enable_shots=None, clock=datetime.now,
-                 log=print):
+                 log=print, read_timing=None):
         self.root = root
         self.reader = reader
         self.heat_reader = heat_reader
@@ -164,9 +194,19 @@ class CertRuntime:
         self.enable_shots = CFG.CERT_SCREENSHOT_ENABLED if enable_shots is None else enable_shots
         self.clock = clock
         self.log = log
+        self.read_timing = read_timing
+        self.timing_errors = 0      # cert_timing.jsonl 寫入／計算失敗次數（Fail Open，只計數）
+        self._last_cycle_end = None
+        self._last_analysis_ms = None
+        self._last_analysis_hit = None
+        self._analysis_cache = None         # 上一次 analysis() 的輸入版本與結果（只存記憶體；重啟後重建）
+        self.analysis_cache_enabled = True  # False＝每次重算（測試比對 Cache ON／OFF 用）
+        self._status_stat = _new_status_stat()
+        self._last_status_pc = None
         self.extra_notes = []       # 模擬／示範用的報告附註（正式執行為空）
         self.shot_note = ""         # 截圖頁附註（正式執行為空）
         self._lock = threading.RLock()
+        self._sample_lock = threading.Lock()   # 一次只跑一個取樣 Cycle（背景取樣與 Menu 22 最後取樣互斥，不會同時讀 HMI）
         self._reset()
         os.makedirs(root, exist_ok=True)
 
@@ -319,42 +359,126 @@ class CertRuntime:
         return True
 
     def sample_once(self):
-        """取樣（網路讀取不持鎖）→ 寫一筆 → 分析與截圖事件。"""
+        """取樣（網路讀取不持 runtime 鎖）→ 寫一筆 → 分析與截圖事件。計時另寫 cert_timing.jsonl（Fail Open）。"""
+        with self._sample_lock:
+            return self._sample_cycle("schedule")
+
+    def _sample_cycle(self, trigger):
+        """一個正常取樣 Cycle（呼叫端須持 _sample_lock）。trigger 只寫入計時檔：schedule＝背景排程、cert_end＝Menu 22 最後取樣。"""
         reading, rerr, heat, herr = None, "", None, ""
+        pc = {"start": time.perf_counter()}
+        wall = _wall_ms()
         try:
             reading = self.reader()
             if reading is None:
                 rerr = "無讀值（未登入或連線失敗）"
         except Exception as e:                          # noqa: BLE001
             rerr = f"{type(e).__name__}: {e}"
+        pc["hmi"] = time.perf_counter()
         if self.heat_reader is not None:
             try:
                 heat = self.heat_reader()
             except Exception as e:                      # noqa: BLE001
                 herr = f"{type(e).__name__}: {e}"
+        pc["heat"] = time.perf_counter()
         with self._lock:
+            pc["lock"] = time.perf_counter()
             if not self.is_active():
+                self._write_timing(wall, pc, None, reading, rerr, herr, trigger)
                 return None
             now = self.clock()
             rec = build_record(now, reading, rerr, heat, herr)
             _append_jsonl(self._f("observations.jsonl"), rec)
+            pc["obs"] = time.perf_counter()
             self.records.append(rec)
             self.cert["sample_count"] = len(self.records)
             self.cert["last_sample_time"] = rec["t"]
             self.cert["last_sample_ok"] = rec["ok"] and rec["hmi_ok"]     # 只有 6161 溫度不算取樣成功（選單 26 顯示）
             self._save_state()
+            pc["state"] = time.perf_counter()
             self.next_sample = now + timedelta(seconds=self.p["SAMPLE_INTERVAL_SEC"])
+            self._last_analysis_ms = self._last_analysis_hit = None
             try:
                 self._after_sample(now)
             except Exception as e:                      # noqa: BLE001
                 self._event("analysis_error", f"{type(e).__name__}: {e}", now)
+            pc["after"] = time.perf_counter()
+            self._write_timing(wall, pc, rec, reading, rerr, herr, trigger)
             return rec
 
+    def _write_timing(self, wall, pc, rec, reading, rerr, herr, trigger="schedule"):
+        """一個 Cycle 一筆計時（診斷用）。任何錯誤只計數，不丟例外、不影響 observation 與後續流程（Fail Open）。"""
+        try:
+            end = pc.get("after") or pc.get("lock") or time.perf_counter()
+            st, self._status_stat = self._status_stat, _new_status_stat()
+            t = {"wall_start": wall, "wall_end": _wall_ms(), "trigger": trigger, "obs_t": rec["t"] if rec else None,
+                 "written": rec is not None, "n_obs": len(self.records),
+                 "cycle_ms": _ms(pc["start"], end),
+                 "interval_ms": _ms(self._last_cycle_end, end) if self._last_cycle_end is not None else None,
+                 "hmi_ms": _ms(pc["start"], pc["hmi"]), "heat_ms": _ms(pc["hmi"], pc["heat"]),
+                 "rt_lock_wait_ms": _ms(pc["heat"], pc["lock"]),
+                 "obs_write_ms": _ms(pc["lock"], pc["obs"]) if "obs" in pc else None,
+                 "state_write_ms": _ms(pc["obs"], pc["state"]) if "state" in pc else None,
+                 "after_sample_ms": _ms(pc["state"], pc["after"]) if "after" in pc else None,
+                 "analysis_ms": self._last_analysis_ms if rec is not None else None,
+                 "analysis_cache_hit": self._last_analysis_hit if rec is not None else None,
+                 "ok": rec["ok"] if rec else None, "hmi_ok": rec["hmi_ok"] if rec else None,
+                 "pcs_missing": (rec["values"].get("pcs_module_c") in (None, "", "-")) if rec else None,
+                 "hmi_fail": list(reading.get("_fail") or [])[:20] if isinstance(reading, dict) else None,
+                 "read_err": rerr[:120] or None, "heat_err": herr[:120] or None,
+                 "status_writes": st["n"], "status_analysis_ms_max": round(st["analysis_ms_max"], 1),
+                 "status_analysis_ms_avg": round(st["analysis_ms_sum"] / st["n"], 1) if st["n"] else None,
+                 "status_interval_ms_max": round(st["interval_ms_max"], 1),
+                 "status_cache_hits": st["cache_hits"], "status_cache_misses": st["cache_misses"],
+                 "timing_errors": self.timing_errors}
+            if self.read_timing is not None:
+                t["reader"] = dict(self.read_timing() or {})
+            self._last_cycle_end = end
+            _append_jsonl(self._f(TIMING_FILE), t)
+        except Exception:                               # noqa: BLE001
+            self.timing_errors += 1
+
+    def _note_status(self, a0, a1, hit=None):
+        """write_status 的 analysis() 耗時、Cache 命中與呼叫間隔（併入下一筆 Cycle 計時）；Fail Open。"""
+        try:
+            s = self._status_stat
+            s["n"] += 1
+            s["analysis_ms_max"] = max(s["analysis_ms_max"], _ms(a0, a1))
+            s["analysis_ms_sum"] += _ms(a0, a1)
+            if hit is not None:
+                s["cache_hits" if hit else "cache_misses"] += 1
+            if self._last_status_pc is not None:
+                s["interval_ms_max"] = max(s["interval_ms_max"], _ms(self._last_status_pc, a0))
+            self._last_status_pc = a0
+        except Exception:                               # noqa: BLE001
+            self.timing_errors += 1
+
     def analysis(self):
-        obs = [record_to_obs(r, i + 1) for i, r in enumerate(self.records)]
-        cmds = [{"t": _parse(c["t"]), "cmd": c["cmd"]} for c in self.commands
-                if c.get("cmd") and c.get("control_success") is True]
-        return analyze(obs, self.p, self.decisions, cmds)
+        """
+        Analysis Cache：輸入（records／decisions／commands／參數）沒變 → 直接回傳上一次結果，不重算。
+          版本＝三個 list 物件本身＋筆數：三者只會 append（取樣／選單決策／指令快照），或在 _reset／_load 整個換新
+          （換新＝不同物件 → 失效）；Cache 持有舊 list 參照，不會因物件 id 重用而誤判。參數另比內容。
+          回傳的 Result 由所有呼叫端共用 → 呼叫端只能讀，不可修改。
+        全程持 runtime 鎖（RLock，與 append 同一把）：讀版本、重算、寫 Cache 為同一步，不會讀到舊結果或半成品。
+        """
+        with self._lock:
+            a0 = time.perf_counter()
+            key = (self.records, len(self.records), self.decisions, len(self.decisions),
+                   self.commands, len(self.commands))
+            c = self._analysis_cache
+            hit = (self.analysis_cache_enabled and c is not None and c[2] == self.p
+                   and all(x is y if isinstance(x, list) else x == y for x, y in zip(c[0], key)))
+            if hit:
+                res = c[1]
+            else:
+                obs = [record_to_obs(r, i + 1) for i, r in enumerate(self.records)]
+                cmds = [{"t": _parse(c_["t"]), "cmd": c_["cmd"]} for c_ in self.commands
+                        if c_.get("cmd") and c_.get("control_success") is True]
+                res = analyze(obs, self.p, self.decisions, cmds)
+                self._analysis_cache = (key, res, dict(self.p)) if self.analysis_cache_enabled else None
+            self._last_analysis_hit = hit
+            self._last_analysis_ms = _ms(a0, time.perf_counter())     # 量測用（cert_timing.jsonl）
+            return res
 
     # ---- 截圖事件（方案 B v3 → P2）--------------------------------------------
     def _after_sample(self, now):
@@ -527,7 +651,7 @@ class CertRuntime:
                 "sample_count": 0, "last_sample_time": None, "incomplete": None, "interruptions": [],
                 "reports": [], "last_report_error": None,
                 "params": {k2: self.p[k2] for k2 in self.p},
-                "params_note": "取樣週期、G、TCONF、待機電流門檻、每分鐘容許範圍與截圖參數為暫用測試值，非現場正式值"}
+                "params_note": params_note(self.p)}
             self._save_state()
             self._set_active(cid)
             self._open_worker()
@@ -548,6 +672,35 @@ class CertRuntime:
         if err:
             REQ.write_result(self.root, req, "rejected", err)
             return
+        # C：結束前再跑一次正常取樣 Cycle（同一個 _sample_cycle：同 reader／_CLIENT_LOCK／寫入流程，schema 不變）。
+        #    持 _sample_lock：不與背景取樣同時執行；收尾也在鎖內完成 → 結束後背景取樣不會再寫入。
+        #    取樣失敗照一般失敗規則寫入（ok=False）；任何例外只記事件，不阻擋結束。
+        with self._sample_lock:
+            try:
+                self._sample_cycle("cert_end")
+            except Exception as e:                      # noqa: BLE001
+                self._event("final_poll_error", f"結束前最後取樣例外（不影響結束）：{type(e).__name__}: {e}")
+            worker, cid = self._end_locked(req)
+        # B：「認證結束（最後狀態）」截圖：在最後一筆取樣之後擷取；等待有上限、不持 runtime 鎖；失敗／逾時照實呈現，不阻擋結束
+        if worker:
+            try:
+                worker.submit("cert_final", None, None, "認證結束（最後狀態）", "結束認證（Menu 22）時的最後狀態",
+                              trigger_time=self.clock())
+            except Exception as e:                      # noqa: BLE001
+                self._event("final_shot_error", f"結束截圖排程失敗（不影響結束）：{type(e).__name__}: {e}",
+                            folder=os.path.join(self.root, cid))
+            worker.close(CFG.CERT_FINAL_SHOT_WAIT_SEC)  # 已排入的截圖（含結束截圖）完成或逾時後才產報
+        ok, msg, path = self.generate_report(cid)
+        running = (REQ.read_json(os.path.join(self.root, cid, "cert_state.json")) or {}).get("incomplete")
+        warn = f"⚠ {running}。" if running else ""
+        REQ.write_result(self.root, req, "done",
+                         f"已結束認證 {cid} 的記錄。{warn}" + (f"報告：{path}" if ok else f"報告產生失敗：{msg}（資料已保留，可重產）"),
+                         cert_id=cid, data={"incomplete": running, "report": path, "report_ok": ok})
+        with self._lock:
+            self._reset()
+
+    def _end_locked(self, req):
+        """結束認證的狀態收尾（持 runtime 鎖）。回傳 (截圖 worker 或 None, cert_id)。"""
         with self._lock:
             now = self.clock()
             res = self.analysis()
@@ -576,16 +729,7 @@ class CertRuntime:
             self._save_state()
             self._event("end", f"結束認證（請求 {req['request_id']}）" + (f"；⚠ {running}；報告標記未完成" if running else ""), now)
             self._set_active(None)
-            if self.worker:
-                self.worker.close(0)                    # 已排入的截圖仍會完成；不等待
-            cid = self.cert["cert_id"]
-        ok, msg, path = self.generate_report(cid)
-        warn = f"⚠ {running}。" if running else ""
-        REQ.write_result(self.root, req, "done",
-                         f"已結束認證 {cid} 的記錄。{warn}" + (f"報告：{path}" if ok else f"報告產生失敗：{msg}（資料已保留，可重產）"),
-                         cert_id=cid, data={"incomplete": running, "report": path, "report_ok": ok})
-        with self._lock:
-            self._reset()
+            return self.worker, self.cert["cert_id"]
 
     def _stage_keys(self, folder):
         rt = self if folder == self.folder else self._offline(folder)
@@ -723,7 +867,7 @@ class CertRuntime:
             notes = [f"認證測試 {cid}：背景服務自 {st.get('started_at')} 起持續取樣（含休息），"
                      f"至 {st.get('ended_at') or '（記錄中）'}；共 {len(rt.records)} 筆。",
                      "原始讀值照存：不沿用上一筆、不補 0、不內插；讀取失敗或欄位無效 → 該分鐘 N/A、曲線斷線。",
-                     "參數（取樣週期、G、確認門檻、待機電流門檻、每分鐘容許範圍、截圖等待／重試）為暫用測試值，非現場正式值。",
+                     params_note(st.get("params")) + "。",
                      "傳感器溫度／PCS 模組溫度取自 6161 /api/temperature（st／pt.moduleTemperature），對應關係待實機確認。",
                      "停止指令時間（Tc）取自控制結果檔的快照（寫檔時間；該檔只保留最近一次，非完整歷史）。"]
             for it in st.get("interruptions") or []:
@@ -784,7 +928,10 @@ class CertRuntime:
                          test_info=self.cert.get("test_info"),
                          interruptions=len(self.cert.get("interruptions") or []))
                 try:
+                    a0 = time.perf_counter()
                     res = self.analysis()
+                    if self.is_active():
+                        self._note_status(a0, time.perf_counter(), self._last_analysis_hit)
                     names = stage_names(res.stages)
                     s["stages"] = [{"no": st.no, "name": names[st.no], "start": _iso(st.start.t),
                                     "end_by": st.end_by, "label": st.label} for st in res.stages]

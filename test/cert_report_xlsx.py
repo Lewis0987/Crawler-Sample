@@ -39,10 +39,10 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from xml.sax.saxutils import escape
 
 import cert_report_config as CFG
-from cert_screenshot import caption as shot_caption, png_size, select_stage_shot, shot_flag
+from cert_screenshot import caption as shot_caption, png_size, select_final_shot, select_stage_shot, shot_flag
 from cert_controls import DIRECTION_TEXT, describe as describe_action
-from cert_stage_engine import (R_NO_HMI, _num, command_stage, fmt_t, field_value, has_hmi_values, overall_minutes,
-                               stage_minutes, stage_names)
+from cert_stage_engine import (R_NO_HMI, _num, command_stage, fmt_t, field_value, has_hmi_values, minute_value,
+                               overall_minutes, stage_minutes, stage_names)
 
 NA = CFG.NA
 LOG_HEADERS = ["時間", "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓",
@@ -117,7 +117,7 @@ def _write_log_sheet(ws, rows, remark_fn, p, table_name):
     for r, mr in enumerate(rows, 2):
         a = ws.cell(r, 1, mr.T)
         a.number_format = "h:mm"
-        vals = [field_value(mr.obs, k, p) if mr.obs is not None else None for k in LOG_KEYS]
+        vals = [minute_value(mr, k, p) for k in LOG_KEYS]      # 極值欄位 = 分鐘 MAX／MIN；其餘 = 該分鐘最後一筆有效觀測
         for c, (k, v) in enumerate(zip(LOG_KEYS, vals), 2):
             cell = ws.cell(r, c, _v(v))
             if k in LOG_FORMATS and v is not None:
@@ -184,13 +184,16 @@ def _make_chart(ws, n, title):
 BATTERY_POWER_ON, BATTERY_POWER_OFF = "已上電", "已下電"
 
 
+FAULT = "故障"
+
+
 def device_state(o):
-    """非充放電期間的電池狀態：待機／停機／N/A。"""
+    """非充放電期間的電池狀態：故障（PCS 故障旗標）／待機／停機／N/A（真正無法判定）。"""
     if o is None or not o.ok:
         return NA                                           # 讀取失敗／無取樣
     f = o.flags or {}
     if f.get("pcs_fault_flag") is True:
-        return NA                                           # 明確故障（目前只有 PCS 故障旗標，不擴大解釋為 BMS 故障）
+        return FAULT                                        # 設備明確回報 PCS 故障 → 已知狀態「故障」（不是 N/A；不擴大解釋為 BMS 故障）
     if f.get("pcs_charging_flag") is True or f.get("pcs_discharging_flag") is True or o.direction in ("C", "D"):
         return NA                                           # 仍有充放電（例：突波、未確認方向）→ 不是待機／停機
     bp = f.get("battery_power_status")
@@ -294,6 +297,21 @@ def _stage_key(st):
     return st.start.t.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+FINAL = "cert_final"                    # 截圖頁的「認證結束（最後狀態）」區塊（不是階段）
+FINAL_TITLE = "認證結束（最後狀態）"
+
+
+def _slot_title(names, st):
+    return FINAL_TITLE if st is FINAL else f"{_stage_title(names, st)}結束"
+
+
+def _select_shot(shots, st, target):
+    """階段 → 該階段結束截圖；FINAL → Menu 22 結束認證時的最後狀態截圖（兩者分開，互不代替）。"""
+    if st is FINAL:
+        return select_final_shot(shots["records"], target)
+    return select_stage_shot(shots["records"], _stage_key(st), target)
+
+
 def _shot_for(shots, st, target):
     """
     回傳 (圖片路徑或 None, 文字, 必要狀態)。shots=None → P1 模式（沒有截圖功能）。
@@ -302,10 +320,11 @@ def _shot_for(shots, st, target):
     """
     if shots is None:
         return None, None, ""
-    job, res = select_stage_shot(shots["records"], _stage_key(st), target)
+    job, res = _select_shot(shots, st, target)
     text = shot_caption(job, res)
     if job is None:
-        text = "【尚未截圖】本階段沒有截圖紀錄。不使用範本或其他時間的畫面代替。"
+        text = ("【無結束截圖】認證進行中，或結束認證時沒有截圖紀錄。不使用其他時間的畫面代替。" if st is FINAL
+                else "【尚未截圖】本階段沒有截圖紀錄。不使用範本或其他時間的畫面代替。")
     if res and res["status"] in ("ok", "stale") and res.get("file"):
         path = os.path.join(shots["folder"], res["file"])
         if os.path.exists(path):
@@ -319,7 +338,7 @@ def _shot_time_text(shots, st, target):
     截圖右上角顯示的日期時間：該階段被選用截圖的 PC 實際擷取時間（screenshots.jsonl 的 captured_at）。
     不用報告產生／重產時間代替；紀錄沒有可解析的 captured_at → "N/A"。
     """
-    _job, res = select_stage_shot(shots["records"], _stage_key(st), target)
+    _job, res = _select_shot(shots, st, target)
     try:
         return datetime.fromisoformat(res["captured_at"]).strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError, KeyError):
@@ -365,8 +384,9 @@ def _shots_note(ws, r, c0, c1, shots):
 
 def _write_overview(ws, stages, names, shots=None):
     """
-    數據概覽：各階段由上而下，淺橘標題 → 電池概覽卡片（原尺寸 1:1）。
-    截圖右側留白放一支細長「時間序」向下箭頭：從第 1 階段截圖頂端到第 2 階段截圖底端（不遮截圖與標題）。
+    數據概覽：各階段由上而下，淺橘標題 → 電池概覽卡片（原尺寸 1:1）；最後一個區塊固定為「認證結束（最後狀態）」
+    （Menu 22 結束認證時擷取；沒有階段時只有這一塊，不會整頁空白）。
+    截圖右側留白放一支細長「時間序」向下箭頭：從第 1 階段截圖頂端到第 2 階段截圖底端（不遮截圖與標題；只算階段區塊）。
     """
     ws.column_dimensions["A"].width = 9.1
     ws.sheet_view.topLeftCell = "A1"            # 切換到本頁時一律從頂端開始
@@ -374,9 +394,10 @@ def _write_overview(ws, stages, names, shots=None):
     r = 1
     spans, right = [], OV_IMG_PX           # 各區塊 (頂端, 底端)：(列 0 起算, 列內偏移 px)；right＝最寬圖片右緣
     times = []                             # 各截圖右上角擷取時間：(圖片頂端列 0 起算, 圖片寬 px, 文字)
-    tcols = _title_cols(f"{_stage_title(names, st)}結束" for st in stages)
-    for st in stages:
-        title = f"{_stage_title(names, st)}結束"
+    slots = list(stages) + [FINAL]
+    tcols = _title_cols(_slot_title(names, st) for st in slots)
+    for st in slots:
+        title = _slot_title(names, st)
         _title_row(ws, r, 1, tcols, title)
         path, text, flag = _shot_for(shots, st, "overview")
         r += 1
@@ -388,7 +409,8 @@ def _write_overview(ws, stages, names, shots=None):
             img.anchor = f"A{r}"
             ws.add_image(img)
             times.append((r - 1, img.width, _shot_time_text(shots, st, "overview")))
-            spans.append(((r - 1, 0), (r - 1 + img.height // ROW_PX, img.height % ROW_PX)))
+            if st is not FINAL:
+                spans.append(((r - 1, 0), (r - 1 + img.height // ROW_PX, img.height % ROW_PX)))
             right = max(right, img.width)
             r += -(-img.height // ROW_PX) + 2
         else:
@@ -396,7 +418,8 @@ def _write_overview(ws, stages, names, shots=None):
             body = (f"【待截圖】HMI 數據概覽－電池概覽卡片\n{title}\n\n{PH_NOTE}" if shots is None
                     else f"HMI 數據概覽－電池概覽卡片\n{title}\n\n{text}")
             _placeholder(ws, r, 1, r + rows - 1, OV_COLS, body)
-            spans.append(((r - 1, 0), (r - 1 + rows, 0)))
+            if st is not FINAL:
+                spans.append(((r - 1, 0), (r - 1 + rows, 0)))
             r += rows + 2
     _shots_note(ws, r, 1, OV_COLS, shots)
     if spans:
@@ -410,7 +433,9 @@ def _write_overview(ws, stages, names, shots=None):
 
 
 def _write_heat(ws, stages, names, shots=None):
-    """即時熱度：各階段由左而右，淺橘標題 →「獨立櫃Pack 即時熱度圖」（置中）→ 獨立櫃 110 區塊（原尺寸 1:1）。"""
+    """即時熱度：各階段由左而右，淺橘標題 →「獨立櫃Pack 即時熱度圖」（置中）→ 獨立櫃 110 區塊（原尺寸 1:1）；
+    最右邊固定為「認證結束（最後狀態）」（沒有階段時只有這一塊）。"""
+    stages = list(stages) + [FINAL]
     paths = [_shot_for(shots, st, "heat") for st in stages]
     widths = [png_size(pth)[0] for pth, _, _ in paths if pth]
     # 區塊間距：以顯示縮放後較窄的 58px／欄計算，圖片右側至少留 2 欄
@@ -418,10 +443,10 @@ def _write_heat(ws, stages, names, shots=None):
     has_flag = any(f for _, _, f in paths)
     img_row = 3 + (1 if has_flag else 0)
     bottom = img_row + 38
-    tcols = _title_cols(f"{_stage_title(names, st)}結束" for st in stages)
+    tcols = _title_cols(_slot_title(names, st) for st in stages)
     for k, st in enumerate(stages):
         c = 1 + pitch * k
-        title = f"{_stage_title(names, st)}結束"
+        title = _slot_title(names, st)
         path, text, flag = paths[k]
         span = -(-png_size(path)[0] // COL_PX_FIT) if path else pitch - 2
         _title_row(ws, 1, c, tcols, title)
@@ -658,13 +683,16 @@ def _arrow_xml(k, prst, spec, r0, text):
 # =============================================================================
 # Raw Data
 # =============================================================================
-RAW_HEADERS = ["序號", "PC 取樣時間", "讀取結果", "狀態", "所屬階段", "對應報表分鐘",
+RAW_HEADERS = ["序號", "時間", "狀態", "對應報表分鐘",
                "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓",
                "傳感器溫度", "PCS 模組溫度", "功率 kW", "說明"]
 RAW_NOTE_COL = len(RAW_HEADERS)
 RAW_COL = {h: i for i, h in enumerate(RAW_HEADERS, 1)}     # 欄名 → 欄號（不寫死欄號）
+# 不輸出「所屬階段」：階段已由「狀態」欄呈現（第N次放電（滿放）…），內部 stage_no／階段分析不受影響。
 # 來源（observations.jsonl:N）不輸出到報告；Obs.src／seq 仍保留於程式內供追溯／重播
-RAW_WIDTHS = {"序號": 7, "PC 取樣時間": 20, "讀取結果": 9, "狀態": 11, "所屬階段": 13, "對應報表分鐘": 34, "說明": 30}
+# 「時間」＝PC 實際取樣時間（Obs.t，含秒、不取整）；N/A 分鐘列＝該報表分鐘（序號空白、底色標示、說明寫原因）。
+# 讀取結果不輸出（Raw Data 只列有效觀測，原本全為「成功」）；成功／失敗仍保留在 observations.jsonl（ok／hmi_ok）。
+RAW_WIDTHS = {"序號": 7, "時間": 20, "狀態": 11, "對應報表分鐘": 34, "說明": 30}
 
 
 # Raw Data 必要量測欄位：任一缺值 → 整筆不輸出。傳感器溫度（sensor_c）為選用：多功能傳感器可能關閉，缺值照常輸出。
@@ -677,7 +705,7 @@ def raw_rows_obs(res, p, names):
     Raw Data 只輸出有效報告資料：HMI 有效（ok 且 has_hmi_values；與 Runtime、每分鐘選樣同一定義）
     且 RAW_REQUIRED 全部有有效數值（field_value；不補值、不沿用鄰近值）
     且「狀態」可依現行 Authority 判定（status_text 不是 N/A：階段內充放電 → 第N次…；其餘只依電池上下電 → 待機／停機；
-    PCS 故障、充放電旗標未歸零、上下電未知 → 無法判定）。不以 SOC／電流／功率推論狀態。
+    PCS 故障 → 故障（設備明確回報，照常輸出）；充放電旗標未歸零、上下電未知 → 無法判定）。不以 SOC／電流／功率推論狀態。
     讀取失敗、HMI 全無值（含僅 6161 溫度有效）、必要欄位缺值、狀態無法判定 → 整筆不輸出；observations.jsonl 原始紀錄不受影響。
     序號維持原觀測 seq（中間跳號 = 該筆未輸出）；序號＝observations.jsonl 列號，可回查原始紀錄。
     """
@@ -699,7 +727,8 @@ def is_report_valid(o, p, names):
 
 
 def _write_raw(ws, res, names, minute_maps, na_rows, p):
-    for c, h in enumerate(RAW_HEADERS, 1):
+    heads, col, note_col = RAW_HEADERS, RAW_COL, RAW_NOTE_COL
+    for c, h in enumerate(heads, 1):
         cell = ws.cell(1, c, h)
         cell.font = FB
         cell.fill = HDR_FILL
@@ -709,13 +738,11 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
     for t, kind, x in items:
         if kind == 0:
             o = x
-            ws.cell(r, RAW_COL["序號"], o.seq + 1)
-            ws.cell(r, RAW_COL["PC 取樣時間"], o.t).number_format = "yyyy-mm-dd hh:mm:ss"
-            ws.cell(r, RAW_COL["讀取結果"], "成功")
-            ws.cell(r, RAW_COL["狀態"], status_text(o, names))
-            ws.cell(r, RAW_COL["所屬階段"], names.get(o.stage_no, "") if o.stage_no else "")
-            ws.cell(r, RAW_COL["對應報表分鐘"], "；".join(minute_maps.get(o.seq, [])))
-            for c, k in enumerate(LOG_KEYS + ["power_kw"], RAW_COL["SOC"]):
+            ws.cell(r, col["序號"], o.seq + 1)
+            ws.cell(r, col["時間"], o.t).number_format = "yyyy-mm-dd hh:mm:ss"
+            ws.cell(r, col["狀態"], status_text(o, names))
+            ws.cell(r, col["對應報表分鐘"], "；".join(minute_maps.get(o.seq, [])))
+            for c, k in enumerate(LOG_KEYS + ["power_kw"], col["SOC"]):
                 v = field_value(o, k, p)
                 cell = ws.cell(r, c, _v(v))
                 if k in LOG_FORMATS and v is not None:
@@ -727,22 +754,20 @@ def _write_raw(ws, res, names, minute_maps, na_rows, p):
                 parts.append(f"電池上下電：{(o.flags or {}).get('battery_power_status') or '未保存'}")
             if o.sensor_ok is False:
                 parts.append("傳感器關閉或異常")
-            ws.cell(r, RAW_NOTE_COL, "；".join(parts))
+            ws.cell(r, note_col, "；".join(parts))
         else:
-            ws.cell(r, RAW_COL["PC 取樣時間"], t).number_format = "yyyy-mm-dd hh:mm:ss"
-            ws.cell(r, RAW_COL["讀取結果"], "（無取樣）")
-            ws.cell(r, RAW_COL["所屬階段"], x["stage"])
-            ws.cell(r, RAW_COL["對應報表分鐘"], "；".join(x["labels"]))
-            ws.cell(r, RAW_NOTE_COL, x["reason"])
-            for c in range(1, RAW_NOTE_COL + 1):
+            ws.cell(r, col["時間"], t).number_format = "yyyy-mm-dd hh:mm:ss"
+            ws.cell(r, col["對應報表分鐘"], "；".join(x["labels"]))
+            ws.cell(r, note_col, x["reason"])
+            for c in range(1, note_col + 1):
                 ws.cell(r, c).fill = WARN_FILL
         r += 1
     num_w = [7, 9, 13, 13, 13, 13, 9, 11, 13, 9]                  # SOC～功率（與原寬度相同）
-    widths = dict(RAW_WIDTHS, **dict(zip(RAW_HEADERS[RAW_COL["SOC"] - 1:RAW_NOTE_COL - 1], num_w)))
-    for h, i in RAW_COL.items():
+    widths = dict(RAW_WIDTHS, **dict(zip(heads[col["SOC"] - 1:note_col - 1], num_w)))
+    for h, i in col.items():
         ws.column_dimensions[get_column_letter(i)].width = widths[h]
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(RAW_NOTE_COL)}{r - 1}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(note_col)}{r - 1}"
 
 
 # =============================================================================
@@ -870,7 +895,8 @@ def build_workbook(res, meta):
     for i, st in enumerate(res.stages, 1):
         ws = wb.create_sheet(_sheet_name(i, names, st))
         sheet_of[st.no] = ws.title
-        rows = stage_minutes(res, st, valid=lambda o: is_report_valid(o, p, names_full))   # 與 Raw Data 同一有效判定
+        rows = stage_minutes(res, st, valid=lambda o: is_report_valid(o, p, names_full),   # 與 Raw Data 同一有效判定
+                             ext_scope="minute")             # 四個極值＝階段所涵蓋分鐘的完整日曆分鐘（排除明確反方向）
         n_rows[st.no] = len(rows)
         n_rows[("na", st.no)] = sum(1 for m in rows if m.obs is None)
         if rows:
@@ -884,13 +910,14 @@ def build_workbook(res, meta):
 
     ws_all = wb.create_sheet("整體測試")
     orows = overall_minutes(res, valid=lambda o: is_report_valid(o, p, names_full),          # 有效觀測優先（同一判定）
-                            phase=lambda o: overall_phase(o, names_full))                     # 不跨語意；沒有 → 原規則
+                            phase=lambda o: overall_phase(o, names_full),                     # 不跨語意；沒有 → 原規則
+                            ext_scope="minute")              # 四個極值＝完整日曆分鐘（一般欄位仍為最後語意範圍）
     n_rows["overall"] = len(orows)
 
     def overall_remark(mr):
         if mr.obs is None:
             return f"N/A：{mr.na_reason}"
-        if not has_hmi_values(mr.obs):          # 容許範圍內只有僅 6161 溫度的觀測
+        if not has_hmi_values(mr.obs):          # 該分鐘內只有僅 6161 溫度的觀測
             return f"N/A：{R_NO_HMI}，僅有 6161 溫度"
         return status_text(mr.obs, names_full)
 
