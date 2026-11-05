@@ -238,7 +238,8 @@ try:
     shots = FakeShot(fail_calls={2})      # 第 1 次＝停頓候選，第 2 次＝第 1 階段結束候選（失敗）
     rtA = runtime(root, clock, plant, shots, cmd_file=cmd_file)
     outs = []
-    ui = cert_menu.UI(root, inp=feed(["340KW", "2", "製冷21℃", "潤泰退回pack", "定功率170kw", "YES"]),
+    # 2026-11-03：Menu 21 不再詢問冷氣溫度／硬體概述（改由服務端開始時讀一次環控）→ 輸入只剩規格、循環數、測試條件
+    ui = cert_menu.UI(root, inp=feed(["340KW", "2", "定功率170kw", "YES"]),
                       out=outs.append, now=clock, wait_sec=0.3)
     REQ.atomic_write_json(os.path.join(root, "status.json"),
                           {"updated_at": REQ.now_str(clock()), "pid": 1, "owner_role": "service"})
@@ -883,11 +884,14 @@ try:
     check(f"T1 每個寫入 observation 的 Cycle 各一筆計時（{len(tim_t)} = {len(obs_t)}），obs_t 逐筆對應",
           len(obs_t) > 30 and [x["obs_t"] for x in tim_t if x["written"]] == [o["t"] for o in obs_t])
     num = lambda v: isinstance(v, (int, float))
-    need = ("cycle_ms", "hmi_ms", "heat_ms", "rt_lock_wait_ms", "obs_write_ms", "state_write_ms", "after_sample_ms")
-    check("T2 計時欄位齊全且為毫秒數值（perf_counter）；Cycle ≥ HMI＋6161；第一筆沒有間隔、之後有；"
+    need = ("cycle_ms", "hmi_ms", "heat_ms", "heat_wait_ms", "rt_lock_wait_ms", "obs_write_ms", "state_write_ms",
+            "after_sample_ms")
+    check("T2 計時欄位齊全且為毫秒數值（perf_counter）；HMI 與 6161 平行 → Cycle ≥ max(HMI, 6161)、"
+          "Cycle ≥ HMI＋HMI 後等 6161 的時間；第一筆沒有間隔、之後有；"
           "截圖關閉時每次取樣不跑 analysis() → analysis_ms 為 None（不捏造）",
           all(num(x[k]) and x[k] >= 0 for x in tim_t for k in need) and all(x["analysis_ms"] is None for x in tim_t)
-          and all(x["cycle_ms"] + 0.5 >= x["hmi_ms"] + x["heat_ms"] for x in tim_t)
+          and all(x["cycle_ms"] + 0.5 >= max(x["hmi_ms"], x["heat_ms"]) for x in tim_t)
+          and all(x["cycle_ms"] + 0.5 >= x["hmi_ms"] + x["heat_wait_ms"] for x in tim_t)
           and tim_t[0]["interval_ms"] is None and all(num(x["interval_ms"]) for x in tim_t[1:])
           and all(len(x["wall_start"]) == 23 for x in tim_t))
     check("T3 reader 計時（等 _CLIENT_LOCK／read_all 毫秒）併入；status.json 的 analysis 耗時與呼叫間隔併入",

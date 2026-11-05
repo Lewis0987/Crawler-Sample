@@ -39,6 +39,7 @@ TYPES = {
     "stage_label": "階段標記",
     "confirm_item": "不確定項目確認",
     "manual_shot": "立即截圖／手動補拍",
+    "post_test_supplement": "已結束認證事後補拍",
     "regenerate": "重新產生認證報告",
 }
 STATUS_TEXT = {"done": "完成", "rejected": "拒絕", "failed": "失敗", "expired": "逾期未執行",

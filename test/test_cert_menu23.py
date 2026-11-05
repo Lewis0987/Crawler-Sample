@@ -221,7 +221,7 @@ try:
         os.path.join(root_p, POST)).analysis()
     check("停止後 SOC 0%／100% 不會自動變成滿放／滿充（沒有人工標記 → 放電／充電）",
           list(summary_titles(rp_.stages, {"cabinet_spec": "250KW"}).values())
-          == ["250KW 第一次放電", "250KW 第一次充電", "250KW 第二次充電", "250KW 第二次放電"])
+          == ["250KW 第1次放電", "250KW 第1次充電", "250KW 第2次充電", "250KW 第2次放電"])
 
     print("\n== 不確定項目確認（原流程不變）==")
     REQ.atomic_write_json(os.path.join(root, "status.json"),
@@ -280,9 +280,9 @@ try:
         from openpyxl import load_workbook
         wb = load_workbook(path_)
         title = lambda ch: "".join(r_.t for p_ in ch.title.tx.rich.p for r_ in (p_.r or []))
-        check("離線重產：Summary 標題 250KW 第一次放電／第一次充電／第二次滿放／第二次充電",
+        check("離線重產：Summary 標題 250KW 第1次放電／第1次充電／第2次放電（滿放）／第2次充電（與階段頁同名）",
               ok_ and [title(c) for c in wb["Summary"]._charts][:4]
-              == ["250KW 第一次放電", "250KW 第一次充電", "250KW 第二次滿放", "250KW 第二次充電"])
+              == ["250KW 第1次放電", "250KW 第1次充電", "250KW 第2次放電（滿放）", "250KW 第2次充電"])
     else:
         print("  （略過：本機沒有 CERT_20261029_082805）")
 finally:

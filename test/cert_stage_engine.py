@@ -593,11 +593,13 @@ EXTREME_FIELDS = {"rack_max_c": max, "rack_min_c": min, "cell_vmax_v": max, "cel
 MINUTE = timedelta(minutes=1)
 
 
-def minute_aggregate(gen, ext, p):
+def minute_aggregate(gen, ext, p, prefer=None):
     """
     Calendar Minute 彙整（Stage／Overall 共用）。gen、ext 已由呼叫端限定在同一分鐘、同一語意範圍且依時間排序。
-    gen：可作一般欄位的觀測 → 取最後一筆（SOC／電流／電壓／功率／PCS／傳感器全部來自同一筆）。
+    gen：可作一般欄位的觀測 → 取最後一筆（SOC／電流／電壓／功率／PCS／傳感器全部來自同一筆）；
+         prefer（選用）：gen 中有符合者 → 改取「符合者的最後一筆」（例：優先含 PCS 模組溫度的取樣），沒有才取 gen 最後一筆。
     ext：可參與極值的觀測 → 各極值欄位只要該欄位本身有效即可參與（不要求其他欄位齊全）；同值取較早；保留來源觀測供追溯。
+         極值不受 prefer 影響。
     """
     extremes = {}
     for k, fn in EXTREME_FIELDS.items():
@@ -606,7 +608,8 @@ def minute_aggregate(gen, ext, p):
         if c:
             v = fn(x[0] for x in c)
             extremes[k] = (v, next(o for x, o in c if x == v))
-    return (gen[-1] if gen else None), extremes
+    pick = [o for o in gen if prefer(o)] if prefer is not None else []
+    return (pick[-1] if pick else (gen[-1] if gen else None)), extremes
 
 
 def minute_value(mr, key, p):
@@ -710,7 +713,7 @@ def _minute_pool(res):
 OPPOSITE = {"C": "D", "D": "C"}
 
 
-def stage_minutes(res, st, valid=None, ext_scope="stage"):
+def stage_minutes(res, st, valid=None, ext_scope="stage", prefer=None):
     """
     階段頁（Calendar Minute）：分鐘列 = 階段首筆觀測所在分鐘 ～ 最後運行觀測（A）所在分鐘（分鐘範圍不因極值規則擴張）。
     一般欄位：每分鐘只用 [HH:MM:00, 下一分鐘) 內、屬於本階段（stage_no 相同、首筆～A 之間）、方向為本階段方向或停頓（I）的觀測，
@@ -720,6 +723,7 @@ def stage_minutes(res, st, valid=None, ext_scope="stage"):
       "stage"  = 同一般欄位那批本階段觀測（預設，舊行為）；
       "minute" = 該分鐘完整日曆分鐘候選（_minute_pool：含階段前後同分鐘的待機／休息／停止後過渡／方向未明），
                  但排除可明確判定為反方向的觀測（direction ＝ 本階段相反方向；沿用引擎 classify 的方向）（正式階段頁）。
+    prefer：一般欄位優先選用條件（見 minute_aggregate；與整體頁同一條件）。
     沒有可用觀測 → 一般欄位 N/A 並註明原因（極值仍照實呈現）；不補值、不跨分鐘。
     """
     p = res.params
@@ -734,7 +738,7 @@ def stage_minutes(res, st, valid=None, ext_scope="stage"):
         mm = _in_minute(cands, ts, M)
         gen = [o for o in mm if valid is None or valid(o)]
         ext_src = mm if pool_of is None else [o for o in pool_of(M) if o.direction != OPPOSITE[st.dir]]
-        last, ext = minute_aggregate(gen, ext_src, p)
+        last, ext = minute_aggregate(gen, ext_src, p, prefer)
         reason = ""
         if last is None:
             near = [o for o in _in_minute(res.obs, all_ts, M) if o.stage_no in (None, st.no) or not o.ok]
@@ -744,7 +748,7 @@ def stage_minutes(res, st, valid=None, ext_scope="stage"):
     return rows
 
 
-def overall_minutes(res, valid=None, phase=None, ext_scope="phase"):
+def overall_minutes(res, valid=None, phase=None, ext_scope="phase", prefer=None):
     """
     整體頁（Calendar Minute）：開始～結束全程（首筆觀測所在分鐘 ～ 最後觀測所在分鐘），含休息。
     每分鐘先依原整體頁規則決定候選：該分鐘內有 HMI 讀值的觀測；沒有才退用僅 6161 溫度的觀測。
@@ -753,6 +757,7 @@ def overall_minutes(res, valid=None, phase=None, ext_scope="phase"):
     極值欄位（ext_scope）：
       "phase"  = 該語意範圍內該欄位本身有效者的 MAX／MIN（預設，舊行為）；
       "minute" = 該分鐘全部候選（不分語意：待機／運行／休息／故障／停機）中該欄位本身有效者的 MAX／MIN（正式整體頁）。
+    prefer：有 valid 觀測時，一般欄位優先選用條件（見 minute_aggregate；與階段頁同一條件）；原規則 fallback 不套用（仍取最後一筆）。
     該分鐘沒有可用觀測 → N/A 並註明原因（不跨分鐘、不補值）。
     """
     if not res.obs:
@@ -771,7 +776,7 @@ def overall_minutes(res, valid=None, phase=None, ext_scope="phase"):
             k = ph(pool[-1])
             same = [o for o in pool if ph(o) == k]
             vv = [o for o in same if valid is None or valid(o)]
-            last, ext = minute_aggregate(vv or same, pool if ext_scope == "minute" else same, p)
+            last, ext = minute_aggregate(vv or same, pool if ext_scope == "minute" else same, p, prefer if vv else None)
             rows.append(MinuteRow(M, last, "", ext))
         M += MINUTE
     return rows

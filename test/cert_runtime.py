@@ -35,6 +35,9 @@ import traceback
 from datetime import datetime, timedelta
 
 import cert_report_config as CFG
+import cert_env as ENV
+import cert_heat_link as HL
+import cert_supplement as SUP
 import cert_requests as REQ
 from cert_controls import describe as describe_action
 from cert_stage_engine import Obs, analyze, classify, stage_names
@@ -178,13 +181,16 @@ class CertRuntime:
     capturer        → P2 截圖函式（測試注入假的）；enable_shots=False 不截圖
     clock           → 現在時間（模擬測試注入）
     read_timing()   → reader 最近一次的計時 dict（例：等鎖／讀取毫秒）；只寫入 cert_timing.jsonl，None = 不提供
+    env_reader()    → 開始認證時讀一次環控（cert_env.read_env 的結果；None＝無 client）；None = 不讀（不產生起始環控快照）
     """
 
     def __init__(self, root, reader, heat_reader=None, single_state=None, cmd_file=None,
                  params=None, shot_params=None, capturer=None, enable_shots=None, clock=datetime.now,
-                 log=print, read_timing=None):
+                 log=print, read_timing=None, env_reader=None):
         self.root = root
         self.reader = reader
+        self.env_reader = env_reader
+        self._env_thread = None
         self.heat_reader = heat_reader
         self.single_state = single_state or (lambda: None)
         self.cmd_file = cmd_file
@@ -207,6 +213,7 @@ class CertRuntime:
         self.shot_note = ""         # 截圖頁附註（正式執行為空）
         self._lock = threading.RLock()
         self._sample_lock = threading.Lock()   # 一次只跑一個取樣 Cycle（背景取樣與 Menu 22 最後取樣互斥，不會同時讀 HMI）
+        self._supp_workers = {}     # 已結束認證的事後補拍：認證資料夾 → ScreenshotWorker（寫 supplements 子資料夾）
         self._reset()
         os.makedirs(root, exist_ok=True)
 
@@ -224,6 +231,8 @@ class CertRuntime:
         self._delayed = set()       # (job_id, target)
         self._last_cmd_sig = None
         self._report_busy = False
+        self._hl = None             # 6161 連線狀態（由 records 重播；重啟／新認證後於下一筆取樣時重建）
+        self._hl_keys = set()       # 已記錄的 6161 連線事件 key（避免重複提醒）
 
     # ---- 檔案 ---------------------------------------------------------------
     def _f(self, name, folder=None):
@@ -273,6 +282,7 @@ class CertRuntime:
         self.decisions = _read_jsonl(self._f("decisions.jsonl"))
         self.commands = _read_jsonl(self._f("commands.jsonl"))
         self._last_cmd_sig = self.cert.get("last_cmd_sig")
+        self._hl = None
         self._open_worker()
         self._rebuild_shot_track()
 
@@ -363,11 +373,30 @@ class CertRuntime:
         with self._sample_lock:
             return self._sample_cycle("schedule")
 
+    def _read_heat(self, box):
+        """6161 讀取（平行執行緒；每個 Cycle 一次）。結果與耗時寫入 box，任何例外都記錄為讀取失敗。"""
+        t0 = time.perf_counter()
+        try:
+            box["heat"] = self.heat_reader()
+        except Exception as e:                          # noqa: BLE001
+            box["err"] = f"{type(e).__name__}: {e}"
+        finally:
+            box["ms"] = _ms(t0, time.perf_counter())
+
     def _sample_cycle(self, trigger):
-        """一個正常取樣 Cycle（呼叫端須持 _sample_lock）。trigger 只寫入計時檔：schedule＝背景排程、cert_end＝Menu 22 最後取樣。"""
-        reading, rerr, heat, herr = None, "", None, ""
+        """
+        一個正常取樣 Cycle（呼叫端須持 _sample_lock）。trigger 只寫入計時檔：schedule＝背景排程、cert_end＝Menu 22 最後取樣。
+        HMI 與 6161 平行讀取（各一次，不新增請求）：6161 逾時不再拖延 HMI。
+        取樣時間（observation t）＝ HMI 讀取完成時間；下一筆仍為「取樣時間 + 取樣週期」。
+        本 Cycle 一定等 6161 讀取結束（受 CERT_HEAT_API_TIMEOUT_SEC 限制）才寫入與返回 → 不留背景執行緒、不重疊取樣。
+        """
+        reading, rerr = None, ""
+        box, th = {}, None
         pc = {"start": time.perf_counter()}
         wall = _wall_ms()
+        if self.heat_reader is not None:
+            th = threading.Thread(target=self._read_heat, args=(box,), name="cert-heat-read", daemon=True)
+            th.start()
         try:
             reading = self.reader()
             if reading is None:
@@ -375,18 +404,18 @@ class CertRuntime:
         except Exception as e:                          # noqa: BLE001
             rerr = f"{type(e).__name__}: {e}"
         pc["hmi"] = time.perf_counter()
-        if self.heat_reader is not None:
-            try:
-                heat = self.heat_reader()
-            except Exception as e:                      # noqa: BLE001
-                herr = f"{type(e).__name__}: {e}"
+        t_hmi = self.clock()                            # HMI 實際讀取完成時間＝這筆取樣的時間
+        if th is not None:
+            th.join()
+        heat, herr = box.get("heat"), box.get("err", "")
         pc["heat"] = time.perf_counter()
+        pc["heat_ms"] = box.get("ms")
         with self._lock:
             pc["lock"] = time.perf_counter()
             if not self.is_active():
                 self._write_timing(wall, pc, None, reading, rerr, herr, trigger)
                 return None
-            now = self.clock()
+            now = t_hmi
             rec = build_record(now, reading, rerr, heat, herr)
             _append_jsonl(self._f("observations.jsonl"), rec)
             pc["obs"] = time.perf_counter()
@@ -398,6 +427,7 @@ class CertRuntime:
             pc["state"] = time.perf_counter()
             self.next_sample = now + timedelta(seconds=self.p["SAMPLE_INTERVAL_SEC"])
             self._last_analysis_ms = self._last_analysis_hit = None
+            self._heat_link_update(now)
             try:
                 self._after_sample(now)
             except Exception as e:                      # noqa: BLE001
@@ -405,6 +435,31 @@ class CertRuntime:
             pc["after"] = time.perf_counter()
             self._write_timing(wall, pc, rec, reading, rerr, herr, trigger)
             return rec
+
+    def _heat_link_update(self, now):
+        """6161 連線狀態：只依剛寫入的取樣結果（不新增請求）。連續失敗達門檻記一次事件、恢復時記恢復與中斷時長。
+        重啟／新認證後第一次呼叫 → 由全部 records 重播重建，已記錄過的事件（events.jsonl 的 key）不重複。Fail Open。"""
+        try:
+            if self._hl is None:
+                self._hl_keys = {e.get("key") for e in _read_jsonl(self._f("events.jsonl")) if e.get("key")}
+                self._hl = HL.HeatLinkTracker(self.p["GAP_G_SEC"], CFG.CERT_HEAT_LINK_ALERT_SEC)
+                last = len(self.records) - 1
+                for i, rec in enumerate(self.records):
+                    for kind, run, detail in self._hl.feed(rec):
+                        self._heat_link_event(kind, run, detail if i == last else "（依取樣紀錄補記）" + detail, now)
+            elif self.records:
+                for kind, run, detail in self._hl.feed(self.records[-1]):
+                    self._heat_link_event(kind, run, detail, now)
+        except Exception as e:                          # noqa: BLE001
+            self._event("heat_link_error", f"6161 連線狀態判斷例外（不影響取樣）：{type(e).__name__}: {e}", now)
+
+    def _heat_link_event(self, kind, run, detail, now):
+        key = HL.event_key(kind, run)
+        if key in self._hl_keys:
+            return
+        self._hl_keys.add(key)
+        _append_jsonl(self._f("events.jsonl"), {"t": _iso(now), "type": kind, "detail": detail, "key": key})
+        self.log(f"[CERT] {'⚠ ' if kind != 'heat_link_up' else ''}{detail}")
 
     def _write_timing(self, wall, pc, rec, reading, rerr, herr, trigger="schedule"):
         """一個 Cycle 一筆計時（診斷用）。任何錯誤只計數，不丟例外、不影響 observation 與後續流程（Fail Open）。"""
@@ -415,7 +470,8 @@ class CertRuntime:
                  "written": rec is not None, "n_obs": len(self.records),
                  "cycle_ms": _ms(pc["start"], end),
                  "interval_ms": _ms(self._last_cycle_end, end) if self._last_cycle_end is not None else None,
-                 "hmi_ms": _ms(pc["start"], pc["hmi"]), "heat_ms": _ms(pc["hmi"], pc["heat"]),
+                 "hmi_ms": _ms(pc["start"], pc["hmi"]), "heat_ms": pc.get("heat_ms"),     # 6161 本身耗時（與 HMI 平行）
+                 "heat_wait_ms": _ms(pc["hmi"], pc["heat"]),                              # HMI 讀完後再等 6161 的時間
                  "rt_lock_wait_ms": _ms(pc["heat"], pc["lock"]),
                  "obs_write_ms": _ms(pc["lock"], pc["obs"]) if "obs" in pc else None,
                  "state_write_ms": _ms(pc["obs"], pc["state"]) if "state" in pc else None,
@@ -666,6 +722,32 @@ class CertRuntime:
             self.next_sample = now
             REQ.write_result(self.root, req, "done", f"已開始認證 {cid}（背景服務持續記錄）", cert_id=cid)
             self.log(f"[CERT] 開始認證 {cid}")
+            if self.env_reader is not None:                 # 起始環控快照：背景讀一次，不阻擋開始、不持 runtime 鎖
+                self._env_thread = threading.Thread(target=self._capture_env_start, args=(self.folder, cid),
+                                                    name="cert-env-start", daemon=True)
+                self._env_thread.start()
+
+    def _capture_env_start(self, folder, cid):
+        """開始認證時讀一次環控（冷氣設定＋10 個設備狀態）→ env_start_snapshot.json（只寫一次）。
+        讀取失敗照實記錄在快照（不是設備異常）；任何例外只記事件，不影響認證。"""
+        path = os.path.join(folder, ENV.SNAPSHOT_FILE)
+        if os.path.exists(path):
+            return
+        now = self.clock()
+        try:
+            captured = self.env_reader()
+            err = None if captured is not None else "沒有已登入的 client（未讀取）"
+        except Exception as e:                              # noqa: BLE001
+            captured, err = None, f"{type(e).__name__}: {e}"
+        try:
+            snap = ENV.build_snapshot(captured, now, cid, err)
+            REQ.atomic_write_json(path, snap)
+            bad = [d["name"] for d in snap["devices"] if d["status"] == ENV.ABNORMAL]
+            failed = [n for n, e in snap["endpoints"].items() if not e["ok"]]
+            self._event("env_start", f"認證開始環控快照：冷氣 {ENV.summary_lines(snap)[0]}；異常 {'、'.join(bad) or '無'}"
+                        + (f"；讀取失敗 {'、'.join(failed)}" if failed else ""), now, folder=folder)
+        except Exception as e:                              # noqa: BLE001
+            self._event("env_start_error", f"起始環控快照寫入失敗（不影響認證）：{type(e).__name__}: {e}", now, folder=folder)
 
     def _h_end_cert(self, req):
         folder, err = self._check_cert(req)
@@ -828,6 +910,69 @@ class CertRuntime:
         REQ.write_result(self.root, req, "done", f"已排入手動截圖（{jid}），背景執行；結果見截圖紀錄",
                          data={"job_id": jid, "stage_start": key})
 
+    def _h_post_test_supplement(self, req):
+        """
+        Menu 24（沒有進行中的認證時）：已結束認證的事後補拍 —— 只拍 6161 即時熱度（獨立櫃 110），
+        只限原始「階段結束」即時熱度截圖失敗或缺少的階段。照片與紀錄獨立保存在 supplements（不寫原始紀錄）；
+        先檢查 6161 是否恢復連線，未恢復 → 直接記失敗、不開瀏覽器、不產生圖片。
+        """
+        from cert_screenshot import load_manifest, select_stage_shot
+        folder, err = self._check_cert(req, need_active=False)
+        if not err and self.is_active():
+            err = f"認證 {self.cert['cert_id']} 進行中 → 事後補拍請於結束後進行（進行中請用立即截圖）"
+        if not err and not self.enable_shots:
+            err = "截圖功能未啟用（CERT_SCREENSHOT_ENABLED=False）"
+        if not err and (REQ.read_json(os.path.join(folder, "cert_state.json")) or {}).get("status") != "ended":
+            err = f"認證 {req.get('cert_id')} 尚未結束 → 不能事後補拍"
+        if err:
+            REQ.write_result(self.root, req, "rejected", err)
+            return
+        pl = req.get("payload") or {}
+        key = pl.get("stage_start")
+        res = self._offline(folder).analysis()
+        names = stage_names(res.stages)
+        c = next((x for x in SUP.candidates(folder, res, names, select_stage_shot, load_manifest)
+                  if x["stage_start"] == key), None)
+        if c is None:
+            known = any(_iso(st.start.t) == key for st in res.stages)
+            REQ.write_result(self.root, req, "rejected",
+                             f"階段 {key} 的原始即時熱度截圖已成功 → 不需事後補拍" if known else f"找不到階段 {key}")
+            return
+        extra = {"cert_id": req["cert_id"], "stage_no": c["stage_no"], "stage_start": key, "stage_name": c["name"],
+                 "stage_end": c["stage_end"], "stage_end_note": c["end_note"], "orig_job_id": c["orig_job_id"],
+                 "orig_status": c["orig_status"], "orig_reason": c["orig_reason"], "orig_trigger": c["orig_trigger"],
+                 "source": SUP.SOURCE, "page_time_note": SUP.PAGE_TIME_NOTE, "request_id": req["request_id"]}
+        reason = f"事後補拍：{pl.get('reason') or '操作人員要求'}（非階段結束原始畫面）"
+        w = self._supp_worker(folder)
+        args = (SUP.KIND, c["stage_no"], key, c["name"], reason)
+        kw = {"trigger_time": self.clock(), "targets": ("heat",), "ref_job": c["orig_job_id"], "extra": extra}
+        pre = ""
+        if self.heat_reader is not None:
+            try:
+                self.heat_reader()
+            except Exception as e:                      # noqa: BLE001
+                pre = f"6161 尚未恢復連線（事前檢查 {type(e).__name__}: {e}）→ 未擷取"
+        if pre:
+            jid = w.submit_failed(*args, pre, **kw)
+            REQ.write_result(self.root, req, "failed", f"事後補拍未執行：{pre}；已記錄失敗（{jid}），沒有產生圖片",
+                             cert_id=req["cert_id"], data={"job_id": jid, "stage_start": key})
+            return
+        jid = w.submit(*args, **kw)
+        REQ.write_result(self.root, req, "done",
+                         f"已排入事後補拍（{jid}；{c['name']}；只拍 6161 即時熱度），背景執行；"
+                         f"結果見 supplements，修訂報告請用「25 重新產生認證報告」",
+                         cert_id=req["cert_id"], data={"job_id": jid, "stage_start": key})
+
+    def _supp_worker(self, folder):
+        w = self._supp_workers.get(folder)
+        if w is None:
+            from cert_screenshot import ScreenshotWorker, shot_params
+            kw = {"params": self.shot_params or shot_params()}
+            if self.capturer is not None:
+                kw["capturer"] = self.capturer
+            w = self._supp_workers[folder] = ScreenshotWorker(SUP.folder_of(folder), **kw)
+        return w
+
     def _h_regenerate(self, req):
         folder, err = self._check_cert(req, need_active=False)
         if err:
@@ -854,10 +999,9 @@ class CertRuntime:
             st = REQ.read_json(os.path.join(folder, "cert_state.json")) or {}
             rep = os.path.join(folder, "reports")
             os.makedirs(rep, exist_ok=True)
-            import glob as _glob
-            n = 1
-            while _glob.glob(os.path.join(_glob.escape(rep), f"認證測試報告_{cid}_{n:02d}*.xlsx")):
-                n += 1
+            # 編號：現有檔案＋cert_state 紀錄＋supplements 修訂紀錄中用過的最大號 + 1（已刪除的編號也不重用）
+            n = max(SUP.report_numbers(folder, cid, st) | {0}) + 1
+            supp = SUP.has_supplements(folder)         # 有事後補拍 → 產報紀錄寫 supplements，不寫原始 state／events
             # 檔名直接標示狀態（不改動已確認的頁面版面）：設備仍運行時結束 → _未完成；記錄中產生 → _中途
             suffix = "_未完成" if st.get("incomplete") else ("_中途" if st.get("status") == "recording" else "")
             path = os.path.join(rep, f"認證測試報告_{cid}_{n:02d}{suffix}.xlsx")
@@ -879,15 +1023,32 @@ class CertRuntime:
             if st.get("status") == "recording":
                 notes.insert(0, "⚠ 本報告產生時認證仍在記錄中（中途報告）")
             meta_cmds = list(rt.commands)                   # 控制紀錄頁：原始指令（階段於產報時對應）
-            meta = {"conditions": [f"冷氣溫度：{ti.get('aircon') or '（未輸入）'}",
-                                   f"硬體概述：{ti.get('hardware') or '（未輸入）'}",
+            # 冷氣溫度／硬體概述：認證開始環控快照（不連 HMI；舊認證沒有快照 → 人工輸入並標示，沒有則 N/A）
+            th = self._env_thread
+            if th is not None and th.is_alive() and folder == self.folder:
+                th.join(CFG.CERT_ENV_START_WAIT_SEC)         # 剛開始就結束：等起始快照寫完（有上限）
+            env_snap =REQ.read_json(os.path.join(folder, ENV.SNAPSHOT_FILE))
+            aircon_txt, hardware_txt = ENV.summary_lines(env_snap, ti)
+            env_note = ENV.failure_note(env_snap)
+            if env_note:
+                notes.append(env_note)
+            meta = {"conditions": [f"冷氣溫度：{aircon_txt}",
+                                   f"硬體概述：{hardware_txt}",
                                    f"測試條件：{ti.get('conditions') or '（未輸入）'}"],
                     "source_notes": notes, "cabinet_spec": ti.get("cabinet_spec"), "cycles": ti.get("cycles"),
                     "commands": meta_cmds}
             if os.path.exists(os.path.join(folder, "screenshots.jsonl")) or os.path.isdir(os.path.join(folder, "screenshots")):
-                meta["screenshots"] = {"folder": folder, "records": load_manifest(folder), "note": self.shot_note}
+                hl, _evs = HL.replay(rt.records, rt.p["GAP_G_SEC"], CFG.CERT_HEAT_LINK_ALERT_SEC)
+                meta["screenshots"] = {"folder": folder, "records": load_manifest(folder), "note": self.shot_note,
+                                       "heat_link": {"runs": hl.all_runs(), "gap_sec": rt.p["GAP_G_SEC"]}}
+                if supp:
+                    meta["screenshots"]["supplements"] = {"folder": SUP.folder_of(folder), "records": SUP.load(folder)}
             save_report(res, meta, part)
             os.replace(part, path)
+            if supp:
+                SUP.append_report_log(folder, {"type": "report", "file": os.path.relpath(path, folder),
+                                               "at": REQ.now_str(self.clock()), "supplements": len(SUP.load(folder))})
+                return True, "", path
             st["reports"] = (st.get("reports") or []) + [{"file": os.path.relpath(path, folder), "at": REQ.now_str(self.clock())}]
             st["last_report_error"] = None
             self._write_state_any(folder, st)
@@ -900,6 +1061,9 @@ class CertRuntime:
                 except OSError:
                     pass
             msg = f"{type(e).__name__}: {e}"
+            if SUP.has_supplements(folder):
+                SUP.append_report_log(folder, {"type": "report_failed", "at": REQ.now_str(self.clock()), "error": msg})
+                return False, msg, None
             st = REQ.read_json(os.path.join(folder, "cert_state.json")) or {}
             st["last_report_error"] = {"at": REQ.now_str(self.clock()), "error": msg}
             self._write_state_any(folder, st)
@@ -927,6 +1091,8 @@ class CertRuntime:
                          last_sample_ok=self.cert.get("last_sample_ok"),
                          test_info=self.cert.get("test_info"),
                          interruptions=len(self.cert.get("interruptions") or []))
+                if self._hl is not None and self.is_active():
+                    s["heat_link"] = self._hl.status()
                 try:
                     a0 = time.perf_counter()
                     res = self.analysis()

@@ -31,7 +31,7 @@ from openpyxl.utils import get_column_letter
 
 import cert_report_config as CFG
 from cert_stage_engine import Obs, analyze
-from cert_report_xlsx import (LOG_HEADERS, _cn_num, arrow_text, build_workbook, overall_title, rest_minutes_text, save_report,
+from cert_report_xlsx import (LOG_HEADERS, arrow_text, build_workbook, overall_title, rest_minutes_text, save_report,
                               summary_titles)
 
 _results = []
@@ -148,12 +148,13 @@ try:
     r18 = row_of(ws, "10:18")
     _gen = [COL[h] for h in ("SOC", "電流", "總電壓", "傳感器溫度", "PCS 模組溫度")]
     _ext = [COL[h] for h in ("Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓")]
-    check("該分鐘 PCS 模組溫度全部無值 → 一般欄位 N/A＋原因「無完整有效取樣」（不虛構、不沿用鄰近值）；"
-          "極值欄位本身有效 → 照實取分鐘 MAX／MIN（Policy B）",
-          all(ws.cell(r18, c).value == "N/A" for c in _gen)
+    check("該分鐘 PCS 模組溫度全部無值（6161 缺值、HMI 正常）→ 只有 PCS N/A；SOC／電流／總電壓／傳感器照實取該分鐘最後一筆"
+          "（10:18:50，不虛構、不沿用鄰近值）；極值欄位照實取分鐘 MAX／MIN（Policy B）",
+          ws.cell(r18, COL["PCS 模組溫度"]).value == "N/A"
+          and [ws.cell(r18, COL[h]).value for h in ("SOC", "電流", "總電壓", "傳感器溫度")] == [50, CUR["D"], 1200.0, 25.0]
           and abs(ws.cell(r18, _ext[0]).value - (40 + 1130 / 600)) < 1e-9
           and [ws.cell(r18, c).value for c in _ext[1:]] == [30, 3.4015, 3.3852]
-          and "無完整有效取樣" in str(ws.cell(r18, NOTE).value) and ws.cell(2, COL["PCS 模組溫度"]).value == 60.0)
+          and "無完整有效取樣" not in str(ws.cell(r18, NOTE).value) and ws.cell(2, COL["PCS 模組溫度"]).value == 60.0)
     pair_ok = True
     for r in range(2, ws.max_row + 1):
         for vis, hid in ((COL["Rack 最大溫度"], 27), (COL["Rack 最小溫度"], 28), (COL["傳感器溫度"], 29)):
@@ -216,34 +217,37 @@ try:
     from cert_report_xlsx import RAW_REQUIRED
     from cert_stage_engine import _num, has_hmi_values
     raw_obs_rows = [r_ for r_ in rw.iter_rows(min_row=2, values_only=True) if r_[RH.index("序號")] is not None]   # N/A 分鐘列序號空白
-    check("Raw Data 必要欄位 = SOC／電流／Rack 最大／Rack 最小／Cell 最大／Cell 最小／總電壓／PCS 模組／功率（傳感器為選用）",
+    check("Raw Data 必要欄位 = SOC／電流／Rack 最大／Rack 最小／Cell 最大／Cell 最小／總電壓／功率（全部 HMI；"
+          "傳感器、PCS 模組溫度＝6161 選用）",
           RAW_REQUIRED == ["soc", "current_a", "rack_max_c", "rack_min_c", "cell_vmax_v", "cell_vmin_v", "voltage_v",
-                           "pcs_module_c", "power_kw"])
+                           "power_kw"])
     check("11 Raw Data Filter：ok=True 但 HMI 全無值（僅 6161 PCS 模組溫度 80 有效）→ 整筆不輸出（不是改空白）",
           o_nh.t not in raw_by_t and not any("無有效讀值" in str(v) for r_ in raw_obs_rows for v in r_))
     check("12 HMI 有效但必要欄位缺值（SOC／電流／電壓／Cell 電壓 N/A）→ 整筆不輸出", o_part.t not in raw_by_t)
-    check("12 HMI 有效、只有 PCS 模組溫度為 \"-\"（6161 未給值）→ 整筆不輸出", o_pcs.t not in raw_by_t)
+    rp_ = raw_by_t.get(o_pcs.t)
+    check("12 HMI 有效、只有 PCS 模組溫度為 \"-\"（6161 未給值）→ 整筆照常輸出，PCS 顯示 N/A，HMI 數值照實",
+          rp_ is not None and rp_[RH.index("PCS 模組溫度")] == "N/A" and rp_[RH.index("SOC")] == 50
+          and rp_[RH.index("電流")] == CUR["D"] and rp_[RH.index("序號")] == o_pcs.seq + 1)
     _p, _n = raw_by_t.get(o_pcs.t - timedelta(seconds=10)), raw_by_t.get(o_pcs.t + timedelta(seconds=10))
-    check("13/15 前後 PCS 模組溫度有效（60）→ 保留；被排除那筆不以前後值補入、不留空白列",
+    check("13/15 前後 PCS 模組溫度有效（60）→ 保留；PCS 缺值那筆不以前後值補入（仍為 N/A）",
           _p is not None and _n is not None and _p[RH.index("PCS 模組溫度")] == 60.0
-          and _n[RH.index("PCS 模組溫度")] == 60.0
-          and not any(r_[RH.index("時間")] == o_pcs.t for r_ in raw_obs_rows))
+          and _n[RH.index("PCS 模組溫度")] == 60.0 and rp_ is not None and rp_[RH.index("PCS 模組溫度")] == "N/A")
     rs_ = raw_by_t.get(o_sen.t)
     check("14 傳感器（選用）N/A、其他必要欄位齊全 → 整筆保留、傳感器顯示 N/A",
           rs_ is not None and rs_[RH.index("序號")] == o_sen.seq + 1 and rs_[RH.index("傳感器溫度")] == "N/A")
     expect = [o for o in nh.obs if o.ok and has_hmi_values(o)
               and all(_num(o.values.get(k)) is not None for k in RAW_REQUIRED)]
     check(f"Raw Data 觀測列數 = HMI 有效且必要欄位齊全的觀測數（{len(raw_obs_rows)} = {len(expect)}；全部 {len(nh.obs)}），"
-          "沒有任何必要欄位為 N/A、不留空白列",
-          len(raw_obs_rows) == len(expect) == len(nh.obs) - 4
+          "沒有任何必要（HMI）欄位為 N/A、不留空白列",
+          len(raw_obs_rows) == len(expect) == len(nh.obs) - 3
           and all(r_[0] is not None and r_[1] is not None for r_ in raw_obs_rows)
           and not any(r_[RH.index(h)] == "N/A" for r_ in raw_obs_rows
                       for h in ("SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓",
-                                "總電壓", "PCS 模組溫度", "功率 kW")))
+                                "總電壓", "功率 kW")))
     seqs = [r_[RH.index("序號")] for r_ in raw_obs_rows]
     check("17 Traceability：序號沿用原觀測 seq（跳過被排除者、不重新編號），序號＝observations.jsonl 列號（內部 src 仍保留）",
           o_nh.seq + 1 not in seqs and o_nh2.seq + 1 not in seqs and o_nh.seq in seqs and o_nh2.seq + 2 in seqs
-          and o_pcs.seq + 1 not in seqs and o_pcs.seq in seqs and o_pcs.seq + 2 in seqs
+          and o_part.seq + 1 not in seqs and o_part.seq in seqs and o_pcs.seq + 1 in seqs
           and all(nh.obs[r_[0] - 1].t == r_[RH.index("時間")]
                   and nh.obs[r_[0] - 1].src for r_ in raw_obs_rows))
     check("1/3/4 Raw Data 欄位：不含「來源」「讀取結果」「所屬階段」，「PC 取樣時間」改名「時間」，固定 15 欄 A～O",
@@ -420,8 +424,8 @@ try:
           all(not overlap(s[1], f) for s in shapes for f in frames))
     def title_of(ch):
         return "".join(r.t for p_ in ch.title.tx.rich.p for r in (p_.r or []))
-    check("Summary 圖表標題：250KW 第一次放電、250KW 第一次充電（電櫃規格前綴；未標記 → 用方向）＋全程",
-          [title_of(c) for c in ss._charts][:3] == ["250KW 第一次放電", "250KW 第一次充電", "250KW 第二次放電"]
+    check("Summary 圖表標題：250KW 第1次放電、250KW 第1次充電（電櫃規格前綴；未標記 → 只有方向）＋全程",
+          [title_of(c) for c in ss._charts][:3] == ["250KW 第1次放電", "250KW 第1次充電", "250KW 第2次放電"]
           and title_of(ss._charts[-1]) == "【250KW】電櫃充放2個循環溫度曲線")
     check("整體溫度曲線標題：Summary 與「整體測試」頁一致＝「【250KW】電櫃充放2個循環溫度曲線」（規格取自測試資訊）",
           title_of(ss._charts[-1]) == title_of(wb["整體測試"]._charts[0]) == "【250KW】電櫃充放2個循環溫度曲線")
@@ -453,28 +457,31 @@ try:
         assert [st.dir for st in r_.stages] == [k for k, _s, _w in plan]
         return list(summary_titles(r_.stages, meta).values())
     spec = {"cabinet_spec": "250KW"}
-    check("滿放＋滿充＋無標記＋滿充 → 250KW 第一次滿放／第一次滿充／第二次放電／第二次滿充（起始 SOC 100／0 且有人工標記）",
+    check("Summary 圖表標題＝階段名稱＋操作人員標記：滿放／滿充／無標記／滿充 → 250KW 第1次放電（滿放）／第1次充電（滿充）／"
+          "第2次放電／第2次充電（滿充）",
           titled([("D", 100, "滿放"), ("C", 0, "滿充"), ("D", 100, None), ("C", 0, "滿充")], spec)
-          == ["250KW 第一次滿放", "250KW 第一次滿充", "250KW 第二次放電", "250KW 第二次滿充"])
+          == ["250KW 第1次放電（滿放）", "250KW 第1次充電（滿充）", "250KW 第2次放電", "250KW 第2次充電（滿充）"])
     check("電櫃規格未輸入（無欄位／None／空白）→ 不加前綴，不顯示 None、N/A",
-          all(titled([("D", 100, "滿放"), ("C", 0, None)], m_) == ["第一次滿放", "第一次充電"]
+          all(titled([("D", 100, "滿放"), ("C", 0, None)], m_) == ["第1次放電（滿放）", "第1次充電"]
               for m_ in (None, {}, {"cabinet_spec": None}, {"cabinet_spec": "  "})))
-    check("起始 SOC 不是精確 0／100（充電 SOC 1＋滿充、放電 SOC 99＋滿放）→ 充電／放電",
-          titled([("C", 1, "滿充"), ("D", 99, "滿放")], spec) == ["250KW 第一次充電", "250KW 第一次放電"])
-    check("首筆 SOC 缺值＋滿充／滿放標記 → 充電／放電（無法驗證起始條件）",
-          titled([("C", None, "滿充"), ("D", None, "滿放")], spec) == ["250KW 第一次充電", "250KW 第一次放電"])
-    check("無標記：起始 SOC 0／100 也不自動認定 → 充電／放電",
-          titled([("C", 0, None), ("D", 100, None)], spec) == ["250KW 第一次充電", "250KW 第一次放電"])
-    check("標記為未滿／中止 → 充電／放電",
+    check("起始 SOC 不是 0／100（充電 SOC 1＋滿充、放電 SOC 99＋滿放）→ 仍依操作人員標記顯示（同階段頁）",
+          titled([("C", 1, "滿充"), ("D", 99, "滿放")], spec) == ["250KW 第1次充電（滿充）", "250KW 第1次放電（滿放）"])
+    check("首筆 SOC 缺值＋滿充／滿放標記 → 依標記顯示",
+          titled([("C", None, "滿充"), ("D", None, "滿放")], spec) == ["250KW 第1次充電（滿充）", "250KW 第1次放電（滿放）"])
+    check("無標記：起始 SOC 0／100 也不自動認定滿充／滿放 → 充電／放電",
+          titled([("C", 0, None), ("D", 100, None)], spec) == ["250KW 第1次充電", "250KW 第1次放電"])
+    check("標記為未滿／中止 → 照實顯示",
           titled([("C", 0, "未滿"), ("D", 100, "中止"), ("C", 0, "中止"), ("D", 100, "未滿")], spec)
-          == ["250KW 第一次充電", "250KW 第一次放電", "250KW 第二次充電", "250KW 第二次放電"])
-    check("標記方向不符（舊資料繞過防呆：放電標滿充、充電標滿放）→ 不採用，仍為放電／充電",
-          titled([("D", 100, "滿充"), ("C", 0, "滿放")], spec) == ["250KW 第一次放電", "250KW 第一次充電"])
-    check("次數依充／放電方向計數、不受標記影響：滿放／放電／滿充／滿放 → 第一次／第二次／第一次／第三次",
+          == ["250KW 第1次充電（未滿）", "250KW 第1次放電（中止）", "250KW 第2次充電（中止）", "250KW 第2次放電（未滿）"])
+    check("標記方向不符（舊資料繞過防呆）→ 與階段頁相同，照實顯示該標記（不改寫、不推論）",
+          titled([("D", 100, "滿充"), ("C", 0, "滿放")], spec) == ["250KW 第1次放電（滿充）", "250KW 第1次充電（滿放）"])
+    check("次數依充／放電方向各自計數、不受標記影響：滿放／放電／滿充／滿放 → 第1／第2次放電、第1次充電、第3次放電",
           titled([("D", 100, "滿放"), ("D", 100, None), ("C", 0, "滿充"), ("D", 100, "滿放")], spec)
-          == ["250KW 第一次滿放", "250KW 第二次放電", "250KW 第一次滿充", "250KW 第三次滿放"])
-    check("中文序數：1→一、10→十、11→十一、23→二十三",
-          [_cn_num(n) for n in (1, 10, 11, 23)] == ["一", "十", "十一", "二十三"])
+          == ["250KW 第1次放電（滿放）", "250KW 第2次放電", "250KW 第1次充電（滿充）", "250KW 第3次放電（滿放）"])
+    sum_t = [ch.title.tx.rich.p[0].r[0].t for ch in wb["Summary"]._charts][:-1]       # 最後一張是全程圖
+    stg_t = [wb[n]._charts[0].title.tx.rich.p[0].r[0].t for n in wb.sheetnames
+             if re.match(r"\d+\.", n) and wb[n]._charts]
+    check(f"整份報告：Summary 各階段圖表標題與各階段頁圖表標題逐一相同（{sum_t}）", sum_t == stg_t and len(sum_t) == 3)
 
     print("\n== 截圖頁 ==")
     sv = wb["數據概覽"].sheet_view
@@ -483,9 +490,9 @@ try:
     for name in ("數據概覽", "即時熱度"):
         w = wb[name]
         ph = [c.value for row in w.iter_rows() for c in row if c.value and "待截圖" in str(c.value)]
-        check(f"{name}：每個階段 1 個＋「認證結束（最後狀態）」1 個「待截圖」標示（共 4），沒有任何圖片",
-              len(ph) == 4 and not w._images and all("不使用範本" in v for v in ph)
-              and sum("認證結束（最後狀態）" in v for v in ph) == 1)
+        check(f"{name}：每個階段 1 個「待截圖」標示（共 3），沒有任何圖片；循環數 2（循環測試）→ 不顯示「認證結束（最後狀態）」",
+              len(ph) == 3 and not w._images and all("不使用範本" in v for v in ph)
+              and not any("認證結束（最後狀態）" in str(c.value) for row in w.iter_rows() for c in row if c.value))
     with zipfile.ZipFile(path) as z:
         names = z.namelist()
         check("檔案內沒有任何圖片（xl/media）", not any(n.startswith("xl/media/") for n in names))
@@ -727,10 +734,10 @@ try:
     check("N8 極值只需該欄位本身有效：10:02:40 總電壓缺值（不符合正式報表有效判定）的 Rack 最小 25 仍參與 → 25",
           not avalid(o160) and ext(srow["10:02"], "rack_min_c") == (25, 160))
     o135 = next(o_ for o_ in ares.obs if sec(o_) == 135)
-    check("N9 PCS 缺值不排除真實極值：10:02:15（PCS \"-\"）Rack 最大 45、Cell 最小 3.100 參與分鐘極值；"
-          "一般欄位仍取有效的 10:02:55；該筆不進 Raw Data",
-          not avalid(o135) and ext(srow["10:02"], "rack_max_c") == (45, 135) and ext(srow["10:02"], "cell_vmin_v") == (3.1, 135)
-          and sec(srow["10:02"].obs) == 175 and o135 not in RXv.raw_rows_obs(ares, p, anames))
+    check("N9 PCS 缺值（6161）不影響 HMI 有效性：10:02:15（PCS \"-\"）仍為有效取樣、進 Raw Data；"
+          "Rack 最大 45、Cell 最小 3.100 照實參與分鐘極值；一般欄位取 10:02:55",
+          avalid(o135) and ext(srow["10:02"], "rack_max_c") == (45, 135) and ext(srow["10:02"], "cell_vmin_v") == (3.1, 135)
+          and sec(srow["10:02"].obs) == 175 and o135 in RXv.raw_rows_obs(ares, p, anames))
     # 2026-11-03 正式需求：階段頁一般欄位仍只用本階段；四個極值＝階段所涵蓋分鐘的完整日曆分鐘（含同分鐘待機／休息），排除明確反方向
     check("N10 Stage 起始不完整分鐘：10:00 一般欄位只用放電（10:00:45）；"
           "極值＝完整分鐘，含 10:00:00～20 待機（Rack 最小 10）；舊 stage 範圍仍為 30",
@@ -765,10 +772,10 @@ try:
           and (ext(orow_ph["10:00"], "rack_max_c")[0], ext(orow_ph["10:00"], "rack_min_c")[0]) == (40, 30)
           and ext(orow_ph["10:09"], "rack_max_c")[0] == 20
           and all(orow_ph[k_].obs is orow[k_].obs for k_ in orow))
-    check("N11b 不 forward／backward fill：10:05 整分鐘 PCS 缺值 → 一般欄位 N/A＋原因（不沿用 10:04:50／10:06:00），"
-          "極值照實（Rack 最大 42）",
-          srow["10:05"].obs is None and "該分鐘內無完整有效取樣" in srow["10:05"].na_reason
-          and all(arow["10:05"][h_] == "N/A" for h_ in ("SOC", "電流", "總電壓", "傳感器溫度", "PCS 模組溫度"))
+    check("N11b 10:05 整分鐘 PCS 缺值（HMI 正常）→ 一般欄位取該分鐘 HMI 有效的最後一筆 10:05:50，只有 PCS N/A"
+          "（不沿用 10:04:50／10:06:00 的 PCS）；極值照實（Rack 最大 42）",
+          sec(srow["10:05"].obs) == 350
+          and [arow["10:05"][h_] for h_ in ("SOC", "電流", "總電壓", "傳感器溫度", "PCS 模組溫度")] == [80, -140.0, 910.0, 25.0, "N/A"]
           and arow["10:05"]["Rack 最大溫度"] == 42)
     check("N14b Overall 故障：10:09 一般欄位仍代表故障（10:09:50 故障觀測）；"
           "極值＝完整分鐘，同分鐘已上電休息的 Rack 最大 50（10:09:00）也納入 → 50（故障不隔離極值）",
@@ -779,6 +786,93 @@ try:
           and not orow["10:10"].ext)
     check("N14d Overall 沒有新增整列 N/A：每一分鐘都有觀測（休息、故障、僅 6161 都照常呈現）",
           all(m_.obs is not None for m_ in orow.values()))
+
+    # 2026-11-05 方案 B：PCS 模組溫度（6161）改為選用；每分鐘一般欄位優先選「含 PCS 溫度」的有效取樣（階段頁＝整體頁），
+    # 沒有才選 HMI 有效的最後一筆；極值聚合不受影響；Raw Data 不套用此優先規則
+    PCS_NA = dict(pcs_module_c="-")
+    pb = [mk(s_, 0.0, ON, **REST) for s_ in (0, 10, 20)]
+    pb += [mk(s_) for s_ in range(30, 100, 10)]                                       # 10:00～10:01:30 全部含 PCS
+    pb += [mk(100, soc=70, **PCS_NA), mk(110, soc=70, rack_max_c=55, **PCS_NA)]      # 10:01 最後兩筆 PCS 缺值（Rack 最大 55）
+    pb += [mk(s_, soc=69, **PCS_NA) for s_ in range(120, 180, 10)]                   # 10:02 整分鐘 PCS 缺值
+    pb += [mk(s_, soc=68) for s_ in range(180, 230, 10)] + [mk(230, 0.0, ON, **NO_HMI)]   # 10:03:50 HMI 失敗（僅 6161）
+    pb += [mk(s_, soc=68) for s_ in range(240, 300, 10)] + [mk(s_, 0.0, ON, **REST) for s_ in range(300, 361, 10)]
+    pres = analyze(pb, p)
+    pnames = {st_.no: RXv._stage_title(_sn(pres.stages), st_) for st_ in pres.stages}
+    pvalid = lambda o_: RXv.is_report_valid(o_, p, pnames)
+    pref = lambda o_: RXv.has_pcs_temp(o_, p)
+    ps = {m_.T.strftime("%H:%M"): m_ for m_ in _sm(pres, pres.stages[0], valid=pvalid, ext_scope="minute", prefer=pref)}
+    po = {m_.T.strftime("%H:%M"): m_ for m_ in _om(pres, valid=pvalid, phase=lambda o_: RXv.overall_phase(o_, pnames),
+                                                  ext_scope="minute", prefer=pref)}
+    ps0 = {m_.T.strftime("%H:%M"): m_ for m_ in _sm(pres, pres.stages[0], valid=pvalid, ext_scope="minute")}
+    check("B1 10:01 最後兩筆 PCS 缺值 → 階段頁與整體頁都優先選含 PCS 的最後一筆 10:01:30（SOC 80、PCS 60），"
+          "不是 10:01:50（無 prefer 時才會選 10:01:50）",
+          sec(ps["10:01"].obs) == sec(po["10:01"].obs) == 90 and RXv.field_value(ps["10:01"].obs, "pcs_module_c", p) == 60.0
+          and sec(ps0["10:01"].obs) == 110)
+    check("B2 極值不受選樣優先影響：10:01 Rack 最大仍為 PCS 缺值那筆的 55（來源 10:01:50）",
+          ext(ps["10:01"], "rack_max_c") == (55, 110) and ext(po["10:01"], "rack_max_c") == (55, 110))
+    check("B3 10:02 整分鐘 PCS 缺值 → 兩頁都選 HMI 有效的最後一筆 10:02:50（SOC 69），PCS N/A；不沿用 10:01 的 PCS",
+          sec(ps["10:02"].obs) == sec(po["10:02"].obs) == 170
+          and RXv.field_value(ps["10:02"].obs, "pcs_module_c", p) is None and _num(ps["10:02"].obs.values["soc"]) == 69)
+    check("B4 HMI 失敗（僅 6161 PCS 80）不當成有效：10:03 兩頁都選 10:03:40（HMI 有效），10:03:50 不選、不進 Raw Data",
+          sec(ps["10:03"].obs) == sec(po["10:03"].obs) == 220
+          and all(sec(o_) != 230 for o_ in RXv.raw_rows_obs(pres, p, pnames)))
+    praw = {sec(o_) for o_ in RXv.raw_rows_obs(pres, p, pnames)}
+    check("B5 Raw Data 不套用優先規則：PCS 缺值的 HMI 有效取樣（10:01:40／50、10:02 整分鐘）全部輸出",
+          {100, 110, 120, 130, 140, 150, 160, 170} <= praw)
+    check("B6 階段頁與整體頁同一分鐘選用同一筆取樣（階段範圍內全部分鐘）",
+          all(ps[k_].obs is po[k_].obs for k_ in ps if ps[k_].obs is not None))
+
+    # 2026-11-05 PCS 模組溫度呈現：有值 → 數值；該筆記錄 6161 讀取失敗 → FAIL＋該筆實際原因；其他缺值 → N/A＋說明（不推論）
+    def mkn(sec_, notes_, cur=-140.0, flags=None, **v):
+        o_ = mk(sec_, cur, flags, **v)
+        o_.notes = list(notes_)
+        return o_
+    F_REF = "6161 讀取失敗：ConnectionRefusedError: [WinError 10061] 拒絕連線"
+    F_TO = "6161 讀取失敗：TimeoutError: timed out"
+    F_URL = "6161 讀取失敗：URLError: <urlopen error timed out>"
+    pc = [mk(s_, 0.0, ON, **REST) for s_ in (0, 10, 20)]
+    pc += [mk(s_) for s_ in range(30, 110, 10)]                                       # 10:00～10:01:40 含 PCS
+    pc += [mkn(110, [F_REF], pcs_module_c=None)]                                      # 10:01:50 讀取失敗（拒絕連線）
+    pc += [mkn(s_, [F_URL if s_ == 160 else F_TO], pcs_module_c=None, sensor_c=None) for s_ in range(120, 180, 10)]
+    pc += [mkn(s_, ["6161 無資料（API 回傳空內容）"], pcs_module_c=None) for s_ in range(180, 240, 10)]
+    pc += [mkn(s_, [], pcs_module_c=None, sensor_c="-") for s_ in range(240, 300, 10)]   # 原因無法確認；傳感器停用
+    pc += [mk(s_, 0.0, ON, **REST) for s_ in range(300, 350, 10)] + [mkn(350, [F_TO], 0.0, ON, pcs_module_c=None, **REST)]
+    pcres = analyze(pc, p)
+    wpc = load_workbook(save_report(pcres, META, os.path.join(tmp, "pcsfail.xlsx")))
+    sp_ = wpc[[n_ for n_ in wpc.sheetnames if re.match(r"\d+\.", n_)][0]]
+    op_ = wpc["整體測試"]
+    rp2 = wpc["Raw Data"]
+    RH2 = [c.value for c in rp2[1]]
+    rraw = {int((r_[RH2.index("時間")] - T0).total_seconds()): r_ for r_ in rp2.iter_rows(min_row=2, values_only=True)
+            if r_[RH2.index("序號")] is not None}
+    cell = lambda ws_, hhmm, h_: ws_.cell(row_of(ws_, hhmm), COL[h_]).value
+    note = lambda ws_, hhmm: str(ws_.cell(row_of(ws_, hhmm), NOTE).value or "")
+    check("P1 10:01 同分鐘較早有 PCS 值、最後一筆 6161 拒絕連線 → 選用 10:01:40：PCS 60，備註不混入同分鐘的失敗原因",
+          cell(sp_, "10:01", "PCS 模組溫度") == 60.0 and cell(op_, "10:01", "PCS 模組溫度") == 60.0
+          and "PCS" not in note(sp_, "10:01") and "PCS" not in note(op_, "10:01"))
+    check("P2 10:02 整分鐘 6161 讀取失敗 → 階段頁、整體頁 PCS = FAIL，備註為選用那筆（10:02:50）的實際原因 TimeoutError"
+          "（不是同分鐘 10:02:40 的 URLError、也不寫死）；SOC／電流／電壓／Rack／Cell 照實",
+          cell(sp_, "10:02", "PCS 模組溫度") == "FAIL" == cell(op_, "10:02", "PCS 模組溫度")
+          and f"PCS 模組溫度 FAIL（資料取得失敗）：{F_TO}" in note(sp_, "10:02") and "URLError" not in note(sp_, "10:02")
+          and [cell(sp_, "10:02", h_) for h_ in ("SOC", "電流", "總電壓", "Rack 最小溫度", "Cell 最大電壓")]
+          == [80, -140.0, 910.0, 30, 3.30])
+    check("P3 整體頁備註保留既有狀態文字，再附 PCS 失敗原因（不覆蓋）：「第1次放電；PCS 模組溫度 FAIL…」",
+          note(op_, "10:02") == f"第1次放電；PCS 模組溫度 FAIL（資料取得失敗）：{F_TO}")
+    check("P4 6161 有回應但空內容 → N/A＋「6161 回傳空內容」；沒有任何原因紀錄 → N/A＋「原因無法確認」（不判定為通訊故障）",
+          cell(sp_, "10:03", "PCS 模組溫度") == "N/A" and "6161 回傳空內容" in note(sp_, "10:03")
+          and cell(sp_, "10:04", "PCS 模組溫度") == "N/A" and "原因無法確認" in note(sp_, "10:04")
+          and "FAIL" not in note(sp_, "10:03") + note(sp_, "10:04"))
+    check("P5 傳感器停用／缺值 → 維持 N/A（6161 讀取失敗時也不顯示 FAIL）",
+          cell(sp_, "10:02", "傳感器溫度") == "N/A" and cell(sp_, "10:04", "傳感器溫度") == "N/A")
+    check("P6 Raw Data 逐筆同一規則：10:01:50 FAIL＋拒絕連線原因；10:02:40 FAIL＋URLError；10:02:50 FAIL＋TimeoutError；"
+          "10:03 N/A＋空內容；有值者無 PCS 備註",
+          rraw[110][RH2.index("PCS 模組溫度")] == "FAIL" and F_REF in rraw[110][RH2.index("說明")]
+          and rraw[160][RH2.index("PCS 模組溫度")] == "FAIL" and F_URL in rraw[160][RH2.index("說明")]
+          and F_TO in rraw[170][RH2.index("說明")] and rraw[180][RH2.index("PCS 模組溫度")] == "N/A"
+          and "回傳空內容" in rraw[180][RH2.index("說明")]
+          and rraw[100][RH2.index("PCS 模組溫度")] == 60.0 and not rraw[100][RH2.index("說明")])
+    check("P7 Raw Data 備註不覆蓋：休息取樣既有「分析狀態／電池上下電」說明保留，後面再附 PCS 失敗原因",
+          rraw[350][RH2.index("說明")] == f"分析狀態：休息；電池上下電：已上電；PCS 模組溫度 FAIL（資料取得失敗）：{F_TO}")
     _off = mk(9999, 0.0, {"battery_power_status": "已下電"}, **REST)
     _on = mk(9999, 0.0, ON, **REST)
     _ra = analyze(ag[:3] + [_on, _off], p)
@@ -1015,11 +1109,13 @@ try:
         nf = {s_.no: RX._stage_title(RX.stage_names(rf.stages), s_) for s_ in rf.stages}
         st_na = [o for o in req_ok if RX.status_text(o, nf) == "N/A"]
         fin = [o for o in req_ok if RX.status_text(o, nf) != "N/A"]
-        check(f"082805：Raw Data 觀測列 = HMI 有效 ∧ 必要欄位齊全 ∧ 狀態可判定（{len(fobs)} = {len(fin)}；原始 {len(rtf.records)}、"
-              f"HMI 無效 {len(rf.obs) - len(hv)}、PCS 模組缺值 {len(pcs_miss)}、狀態無法判定 {len(st_na)}）",
-              len(fobs) == len(fin) == 3191 and len(req_ok) == 3204 and len(hv) == 3209
+        check(f"082805：Raw Data 觀測列 = HMI 有效 ∧ 必要（HMI）欄位齊全 ∧ 狀態可判定（{len(fobs)} = {len(fin)}；"
+              f"原始 {len(rtf.records)}、HMI 無效 {len(rf.obs) - len(hv)}、狀態無法判定 {len(st_na)}；"
+              f"PCS 模組缺值 {len(pcs_miss)} 筆改為照常輸出、PCS 顯示 N/A）",
+              len(fobs) == len(fin) == 3196 and len(req_ok) == 3209 and len(hv) == 3209
               and len(rf.obs) == len(rtf.records) == 3229
-              and [hm(o.t) for o in pcs_miss] == ["13:24:55", "13:43:41", "16:41:16", "17:55:49", "17:56:34"])
+              and [hm(o.t) for o in pcs_miss] == ["13:24:55", "13:43:41", "16:41:16", "17:55:49", "17:56:34"]
+              and {hm(o.t) for o in pcs_miss} <= ftimes)
         from collections import Counter
         f_ = lambda o: o.flags or {}
         cause = Counter("PCS 故障" if f_(o).get("pcs_fault_flag") is True
@@ -1030,8 +1126,8 @@ try:
               and all(o.direction == "I" and o.stage_no is None for o in st_na))
         stc = Counter(r_[RH.index("狀態")] for r_ in fobs)
         check(f"082805 Raw Data 狀態分布：{dict(stc)}（無 N/A）",
-              stc == {"第1次放電（滿放）": 683, "第1次充電（滿充）": 686, "第2次放電（滿放）": 689,
-                      "第2次充電（滿充）": 411, "待機": 684, "停機": 3, "故障": 35})
+              stc == {"第1次放電（滿放）": 683, "第1次充電（滿充）": 686, "第2次放電（滿放）": 690,
+                      "第2次充電（滿充）": 413, "待機": 686, "停機": 3, "故障": 35})
         flt_rows = [r_ for r_ in fobs if r_[RH.index("狀態")] == "故障"]
         KH = {"SOC": "soc", "電流": "current_a", "總電壓": "voltage_v", "Rack 最大溫度": "rack_max_c",
               "Rack 最小溫度": "rack_min_c", "Cell 最大電壓": "cell_vmax_v", "Cell 最小電壓": "cell_vmin_v",
@@ -1060,15 +1156,27 @@ try:
                       for m_ in _fm)
               and all(RX.overall_phase(v_[1], _nf15) == RX.overall_phase(m_.obs, _nf15)
                       for m_ in _fmp for v_ in m_.ext.values()))
-        check("082805：17:55:49（3138）、17:56:34（3142）JSON 仍在、Raw Data 不輸出；前後 3137／3139、3141／3143 保留",
+        by_seq = {r_[0]: r_ for r_ in fobs}
+        check("082805：17:55:49（3138）、17:56:34（3142）PCS 缺值（HMI 正常）→ Raw Data 照常輸出、PCS N/A；"
+              "前後 3137／3139、3141／3143 保留且 PCS 有值（不互相補值）",
               rtf.records[3137]["t"].endswith("17:55:49") and rtf.records[3141]["t"].endswith("17:56:34")
-              and not {"17:55:49", "17:56:34"} & ftimes
-              and {r_[0] for r_ in fobs} >= {3137, 3139, 3141, 3143} and not {3138, 3142} & {r_[0] for r_ in fobs})
-        check("082805：傳感器（選用）全部 N/A 仍輸出；Raw Data 沒有任何必要欄位為 N/A",
+              and {"17:55:49", "17:56:34"} <= ftimes
+              and all(by_seq[s_][RH.index("PCS 模組溫度")] == "N/A" for s_ in (3138, 3142))
+              and all(by_seq[s_][RH.index("PCS 模組溫度")] != "N/A" for s_ in (3137, 3139, 3141, 3143)))
+        pcs_bad = {hm(r_[RH.index("時間")]): (r_[RH.index("PCS 模組溫度")], r_[RH.index("說明")]) for r_ in fobs
+                   if r_[RH.index("PCS 模組溫度")] in ("N/A", "FAIL")}
+        check("082805：傳感器（選用）全部 N/A 仍輸出；PCS 模組溫度缺值只有原始缺值的 5 筆："
+              "13:43:41 記錄 6161 讀取失敗 → FAIL＋實際原因；其餘 4 筆 6161 回傳「-」→ N/A＋說明；HMI 必要欄位沒有任何 N/A",
               all(r_[RH.index("傳感器溫度")] == "N/A" for r_ in fobs)
+              and set(pcs_bad) == {"13:24:55", "13:43:41", "16:41:16", "17:55:49", "17:56:34"}
+              and pcs_bad["13:43:41"][0] == "FAIL"
+              and pcs_bad["13:43:41"][1] == ("分析狀態：休息；電池上下電：已上電；"      # 既有說明保留，PCS 原因附在後面
+                                             "PCS 模組溫度 FAIL（資料取得失敗）：6161 讀取失敗：URLError: <urlopen error timed out>")
+              and all(v_[0] == "N/A" and v_[1].endswith("PCS 模組溫度 N/A：6161 回傳非數值（-）")
+                      for k_, v_ in pcs_bad.items() if k_ != "13:43:41")
               and not any(r_[RH.index(h)] == "N/A" for r_ in fobs
                           for h in ("SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓",
-                                    "總電壓", "PCS 模組溫度", "功率 kW")))
+                                    "總電壓", "功率 kW")))
         check("082805：08:57:22 在 observations.jsonl（第 165 筆）存在、Raw Data 不存在；08:57:12、08:57:33 仍在",
               j165["t"].endswith("08:57:22") and "08:57:22" not in ftimes
               and {"08:57:12", "08:57:33"} <= ftimes)
@@ -1183,8 +1291,9 @@ try:
         nf9 = {s_.no: RX._stage_title(stage_names(r9.stages), s_) for s_ in r9.stages}
         v9 = lambda o_: RX.is_report_valid(o_, p9, nf9)
         from cert_stage_engine import minute_value, overall_minutes
-        new9 = [stage_minutes(r9, s_, valid=v9) for s_ in r9.stages]
-        ov9 = overall_minutes(r9, valid=v9, phase=lambda o_: RX.overall_phase(o_, nf9))
+        pf9 = lambda o_: RX.has_pcs_temp(o_, p9)                                         # 正式報表選樣優先條件（方案 B）
+        new9 = [stage_minutes(r9, s_, valid=v9, prefer=pf9) for s_ in r9.stages]
+        ov9 = overall_minutes(r9, valid=v9, phase=lambda o_: RX.overall_phase(o_, nf9), prefer=pf9)
         pna = lambda rows: sum(minute_value(m_, "pcs_module_c", p9) is None for m_ in rows)
         check(f"V13 092500：階段頁 {[len(r_) for r_ in new9]} = {sum(map(len, new9))} 列（起始不完整分鐘納入）、"
               f"整體頁 {len(ov9)} 列、階段頁 PCS N/A {[pna(r_) for r_ in new9]}",
@@ -1194,15 +1303,20 @@ try:
         m1131 = next(m_ for m_ in new9[0] if m_.T.strftime("%H:%M") == "11:31")
         src = m1131.ext["cell_vmin_v"][1]
         check(f"V14 092500 Extreme Policy B：Stage 1 11:31 Cell 最小 = {m1131.ext['cell_vmin_v'][0]} V"
-              f"（來源 {src.t:%H:%M:%S} #{src.seq + 1}，PCS 缺值、不在 Raw Data）；一般欄位仍取有效觀測",
-              m1131.ext["cell_vmin_v"][0] == 2.861 and src.seq + 1 == 677 and not v9(src) and v9(m1131.obs)
+              f"（來源 {src.t:%H:%M:%S} #{src.seq + 1}，PCS 缺值但 HMI 有效 → 現在也進 Raw Data）；"
+              "一般欄位優先取含 PCS 的有效觀測",
+              m1131.ext["cell_vmin_v"][0] == 2.861 and src.seq + 1 == 677 and v9(src) and v9(m1131.obs)
+              and pf9(m1131.obs)
               and all(r_[-1].obs is s_.A for r_, s_ in zip(new9, r9.stages)))
-        legacy = [o_ for o_ in r9.obs if o_.ok and has_hmi_values(o_)                     # 修改前 raw_rows_obs 的條件
-                  and all(RX.field_value(o_, k_, p9) is not None for k_ in RX.RAW_REQUIRED)
+        legacy = [o_ for o_ in r9.obs if o_.ok and has_hmi_values(o_)                     # 方案 B 前的條件（PCS 必要）
+                  and all(RX.field_value(o_, k_, p9) is not None for k_ in RX.RAW_REQUIRED + ["pcs_module_c"])
                   and RX.status_text(o_, nf9) != RX.NA]
         raw9 = RX.raw_rows_obs(r9, p9, nf9)
-        check(f"V16 092500：Raw Data 有效集合不變（{len(raw9)} 筆，與修改前條件逐筆相同）",
-              raw9 == legacy and len(raw9) == 3213)
+        added9 = [o_ for o_ in raw9 if o_ not in legacy]
+        check(f"V16 092500：Raw Data＝修改前 3213 筆＋只因 PCS 缺值被排除的 HMI 有效取樣 {len(added9)} 筆"
+              f"（共 {len(raw9)} 筆；新增者 PCS 全部缺值、其他必要欄位齊全）",
+              len(legacy) == 3213 and all(o_ in raw9 for o_ in legacy) and len(raw9) == 3213 + len(added9)
+              and added9 and all(not pf9(o_) for o_ in added9))
         rid = {id(o_) for o_ in raw9}
         check("V16b 092500：每一個階段頁選用觀測都在 Raw Data 有效集合內（不再使用 Raw Data 已排除的觀測）",
               all(id(m_.obs) in rid for r_ in new9 for m_ in r_ if m_.obs) and all(m_.obs for r_ in new9 for m_ in r_))

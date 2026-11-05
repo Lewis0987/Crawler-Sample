@@ -71,6 +71,8 @@ CERT_REQUEST_EXPIRE_SEC = 300           # 請求建立後超過此秒數仍未�
 CERT_MENU_WAIT_SEC = 20                 # 選單送出請求後等待結果的時間；逾時顯示「結果待確認」，可再查詢
 CERT_HEAT_API_URL = "http://192.168.70.201:6161/api/temperature?no=1"   # 傳感器／PCS 模組溫度來源（唯讀 GET）
 CERT_HEAT_API_TIMEOUT_SEC = 3
+CERT_HEAT_LINK_ALERT_SEC = 60           # 6161 連續讀取失敗達此秒數 → 記一次連線異常事件＋選單提示（依既有取樣判斷，不另發請求）
+CERT_ENV_START_WAIT_SEC = 60            # 開始後立即產報時，等「認證開始環控快照」寫完的上限（逾時 → 冷氣溫度／硬體概述 N/A）
 CERT_SCREENSHOT_ENABLED = True          # 階段截圖（P2）；False → 只記錄資料，不截圖
 
 # ---- 報告外觀 ---------------------------------------------------------------

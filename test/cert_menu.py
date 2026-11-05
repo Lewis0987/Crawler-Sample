@@ -5,10 +5,12 @@
 選單**只建立請求、讀取狀態與結果**，不寫任何認證資料，也不需要（不會搶）Monitor Ownership。
 實際記錄由背景服務（Monitor Owner，角色 service）處理。
 
-  21 開始認證測試          輸入電櫃規格（不固定 340KW）、循環數（選填，不自動推算）、冷氣溫度、硬體概述、測試條件
+  21 開始認證測試          輸入電櫃規格（不固定 340KW）、循環數（選填，不自動推算）、測試條件；
+                          冷氣溫度、硬體概述由服務端開始時讀一次環控自動產生（env_start_snapshot.json）
   22 結束認證測試          只結束記錄，不送停止指令；設備仍運行 → 服務端提示並標記未完成
   23 階段標記／不確定項目確認
-  24 立即截圖／手動補拍
+  24 立即截圖／手動補拍    有進行中的認證 → 立即截圖（不變）；沒有 → 已結束認證的事後補拍（只補拍 6161 即時熱度，
+                          限原始截圖失敗／缺少的階段；照片另存 supplements，不代表階段結束時的狀態）
   25 重新產生認證報告      每次產生新檔，不覆蓋舊報告
   26 查看目前認證狀態
   27 查詢請求結果          等待逾時（結果待確認）時用請求 ID 查詢；**不要重複送出**
@@ -147,11 +149,11 @@ class UI:
             except (ValueError, AssertionError):
                 self.out("循環數必須是正整數，已取消。")
                 return None
+        # 冷氣溫度、硬體概述不再人工輸入：由背景服務在開始時讀一次環控（認證開始環控快照）自動產生
         payload = {"cabinet_spec": spec, "cycles": int(cyc) if cyc else None,
-                   "aircon": self.ask("冷氣溫度（選填）："), "hardware": self.ask("硬體概述（選填）："),
                    "conditions": self.ask("測試條件（選填，例：定功率 170kW）：")}
-        self.out(f"確認：電櫃規格 {spec or '（未設定）'}｜循環數 {cyc or '（不填）'}｜"
-                 f"冷氣 {payload['aircon'] or '-'}｜硬體 {payload['hardware'] or '-'}｜條件 {payload['conditions'] or '-'}")
+        self.out(f"確認：電櫃規格 {spec or '（未設定）'}｜循環數 {cyc or '（不填）'}｜條件 {payload['conditions'] or '-'}")
+        self.out("冷氣溫度、硬體概述：開始時由背景服務自動讀取環控（只讀一次），不需輸入。")
         self.out("開始後背景服務持續記錄到「結束認證測試」為止（含休息）；充放電仍用 Menu 4～7 操作。")
         if self.ask("輸入 YES 開始：") != "YES":
             self.out("已取消。")
@@ -268,9 +270,60 @@ class UI:
     def shot(self):
         cid = REQ.active_on_disk(self.root)
         if not cid:
-            self.out("目前沒有進行中的認證（手動補拍只在記錄中可用）。")
-            return None
+            return self.post_supplement()
         return self.submit("manual_shot", {"reason": self.ask("原因（Enter＝操作人員要求立即截圖）：")},
+                           cert_id=cid)
+
+    def supplement_rows(self, cid):
+        """唯讀：已結束認證中可事後補拍的階段（原始即時熱度截圖失敗或缺少）。與服務端用同一條分析路徑與同一判定。"""
+        import cert_supplement as SUP
+        from cert_runtime import CertRuntime
+        from cert_screenshot import load_manifest, select_stage_shot
+        from cert_stage_engine import stage_names
+        folder = os.path.join(self.root, cid)
+        res = CertRuntime(self.root, reader=None, enable_shots=False, log=lambda *a: None)._offline(folder).analysis()
+        return SUP.candidates(folder, res, stage_names(res.stages), select_stage_shot, load_manifest)
+
+    def post_supplement(self):
+        """沒有進行中的認證：已結束認證的事後補拍（post_test_supplement）。先說明、再選認證與階段，輸入 YES 才送出。"""
+        self.out("目前沒有進行中的認證 → 可使用「已結束認證的事後補拍」（post_test_supplement）：")
+        self.out("  只補拍 6161 即時熱度（獨立櫃 110），只限原始階段結束截圖失敗或缺少的階段；")
+        self.out("  ⚠ 事後補拍不代表階段結束時的設備狀態，不取代原始截圖失敗紀錄（照片另存 supplements）。")
+        if self.ask("進入事後補拍？（Y＝進入，Enter＝取消）：", "n").upper() not in ("Y", "YES"):
+            self.out("已取消。")
+            return None
+        cid = self.pick_cert()
+        if not cid:
+            return None
+        st = REQ.read_json(os.path.join(self.root, cid, "cert_state.json")) or {}
+        if st.get("status") != "ended":
+            self.out(f"認證 {cid} 尚未結束 → 不能事後補拍。")
+            return None
+        rows = self.supplement_rows(cid)
+        if not rows:
+            self.out(f"認證 {cid} 沒有原始即時熱度截圖失敗或缺少的階段 → 不需事後補拍。")
+            return None
+        status_txt = {"failed": "失敗", "missing": "缺少", "pending": "未完成"}
+        for i, r in enumerate(rows, 1):
+            self.out(f"  {i}. 階段 {r['stage_no']} {r['name']}｜原始即時熱度截圖："
+                     f"{status_txt.get(r['orig_status'], r['orig_status'])}｜已事後補拍 {r['n_supplements']} 次")
+        v = self.ask("選擇階段（輸入編號，Enter＝取消）：")
+        try:
+            r = rows[int(v) - 1]
+        except (ValueError, IndexError):
+            self.out("已取消。")
+            return None
+        self.out(f"認證：{cid}｜階段 {r['stage_no']} {r['name']}（開始 {r['stage_start'].replace('T', ' ')}）")
+        self.out(f"  原始截圖：{status_txt.get(r['orig_status'], r['orig_status'])}｜原因：{r['orig_reason']}"
+                 + (f"｜觸發 {r['orig_trigger'].replace('T', ' ')}" if r.get("orig_trigger") else ""))
+        self.out(f"  階段結束時間：{r['end_note'] or 'N/A'}")
+        self.out("  補拍內容：6161 即時熱度（獨立櫃 110），記錄實際拍攝時間；照片與紀錄另存 supplements。")
+        self.out("  ⚠ 事後補拍不代表階段結束時的設備狀態；報告保留原始失敗紀錄，補拍照片另行標示。")
+        self.out("  （服務會先確認 6161 已恢復連線；未恢復 → 記為失敗、不產生圖片）")
+        if self.ask("輸入 YES 執行事後補拍：") != "YES":
+            self.out("已取消。")
+            return None
+        return self.submit("post_test_supplement", {"stage_start": r["stage_start"], "reason": "操作人員要求（Menu 24）"},
                            cert_id=cid)
 
     # ---- 25 重產 --------------------------------------------------------------
@@ -293,6 +346,9 @@ class UI:
                      f"目前 {st.get('last_direction', '未知')}")
             self.out(f"  電櫃規格 {ti.get('cabinet_spec') or '（未設定）'}｜循環數 {ti.get('cycles') or '（不填）'}｜"
                      f"服務中斷 {st.get('interruptions', 0)} 次")
+            hl = heat_link_text(st)
+            if hl:
+                self.out(f"  {hl}")
             for s in st.get("stages") or []:
                 self.out(f"  階段 {s['no']}. {s['name']}｜開始 {s['start']}｜{s['end_by']}｜標記 {s.get('label') or '-'}")
             for u in st.get("uncertain") or []:
@@ -319,6 +375,16 @@ class UI:
                 "25": self.regenerate, "26": self.status, "27": self.query}[choice]()
 
 
+def heat_link_text(st):
+    """status.json 的 6161 連線狀態 → 提示文字；正常或沒有資料 → None。"""
+    h = (st or {}).get("heat_link") or {}
+    if h.get("state") != "down":
+        return None
+    start = (f"起點 {str(h.get('first_fail')).replace('T', ' ')}" if h.get("start_known")
+             else f"起點無法確認（{h.get('start_note')}）")
+    return f"⚠ 6161 連線異常：連續讀取失敗 {h.get('seconds')} 秒，{start}；即時熱度截圖可能失敗"
+
+
 def status_line(root=None):
     """主選單顯示用的一行摘要（唯讀）。"""
     if not enabled():
@@ -331,4 +397,5 @@ def status_line(root=None):
     alive, why = UI(root).service_alive()
     return (f"【認證測試｜記錄中】{cid}｜取樣 {st.get('sample_count', '-')} 筆｜"
             f"最後 {st.get('last_sample_time', '-')}｜目前 {st.get('last_direction', '未知')}"
-            + ("" if alive else f"｜⚠ {why}"))
+            + ("" if alive else f"｜⚠ {why}")
+            + (f"｜{heat_link_text(st)}" if heat_link_text(st) else ""))

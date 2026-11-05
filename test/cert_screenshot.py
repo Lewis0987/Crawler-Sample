@@ -46,7 +46,8 @@ from datetime import datetime
 import cert_report_config as CFG
 
 KIND_TEXT = {"candidate": "候選截圖", "stage_end": "階段結束截圖", "pause": "停頓點截圖",
-             "manual": "手動補拍", "delayed": "延遲補拍", "cert_final": "認證結束（最後狀態）"}
+             "manual": "手動補拍", "delayed": "延遲補拍", "cert_final": "認證結束（最後狀態）",
+             "post_test_supplement": "事後補拍（認證結束後）"}
 STATUS_TEXT = {"ok": "成功", "stale": "資料未更新", "failed": "失敗"}
 
 CHROME_CANDIDATES = [
@@ -436,7 +437,7 @@ class ScreenshotWorker:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
     def submit(self, kind, stage_no, stage_start, stage_name, reason, trigger_time=None,
-               targets=("overview", "heat"), ref_job=None, extra=None):
+               targets=("overview", "heat"), ref_job=None, extra=None, run=True):
         assert kind in KIND_TEXT, kind
         now = datetime.now()
         job_id = f"{now:%Y%m%d_%H%M%S}_{kind}_{uuid.uuid4().hex[:6]}"
@@ -446,10 +447,22 @@ class ScreenshotWorker:
                "requested_at": _iso(now), "targets": list(targets), "ref_job": ref_job,
                "extra": extra or {}}
         self._append(job)
-        with self._cv:
-            self._q.append(job)
-            self._cv.notify()
+        if run:
+            with self._cv:
+                self._q.append(job)
+                self._cv.notify()
         return job_id
+
+    def submit_failed(self, kind, stage_no, stage_start, stage_name, reason, fail_reason, trigger_time=None,
+                      targets=("overview", "heat"), ref_job=None, extra=None):
+        """不擷取、直接記為失敗（例：事前連線檢查未通過）：照常登記工作＋每個目標一筆失敗結果，不產生圖片。"""
+        jid = self.submit(kind, stage_no, stage_start, stage_name, reason, trigger_time=trigger_time,
+                          targets=targets, ref_job=ref_job, extra=extra, run=False)
+        for t in targets:
+            self._append({"type": "result", "job_id": jid, "target": t,
+                          "target_name": self.targets[t].name if t in self.targets else t,
+                          "status": "failed", "reason": fail_reason, "attempts": [], "file": None})
+        return jid
 
     def mark_unfinished(self, reason):
         """
@@ -547,7 +560,8 @@ class ScreenshotWorker:
                 if info.get("data_time"):
                     lag = (info["captured_at"] - info["data_time"]).total_seconds()
                     info["data_lag_sec"] = lag
-                    if lag > p["SHOT_STALE_SEC"]:
+                    # 事後補拍不套用新鮮度合格判定（補拍本來就不代表當時狀態；頁面時間只記錄）
+                    if lag > p["SHOT_STALE_SEC"] and job["kind"] != "post_test_supplement":
                         stale = f"頁面更新時間 {info['data_time']:%H:%M:%S} 落後擷取時間 {lag:.0f} 秒"
                 os.replace(tmp, final_file)
                 if stale:
@@ -650,8 +664,8 @@ def _dur(sec):
     return f"{sec // 60} 分 {sec % 60} 秒" if sec >= 60 else f"{sec} 秒"
 
 
-def caption(job, res, note=""):
-    """報告圖片說明（如實標示類型、擷取時間、頁面時間、補拍）。"""
+def caption(job, res, note="", fail_lines=()):
+    """報告圖片說明（如實標示類型、擷取時間、頁面時間、補拍）。fail_lines：截圖失敗時附加的說明行（例：6161 連續失敗起點）。"""
     if job is None:
         return "尚未截圖"
     lines = []
@@ -662,6 +676,9 @@ def caption(job, res, note=""):
         tries = len(res.get("attempts", []))
         lines.append(f"【截圖失敗】{KIND_TEXT[eff]}，嘗試 {tries} 次")
         lines.append(f"原因：{res['reason']}")
+        if job.get("trigger_time"):
+            lines.append(f"截圖觸發時間：{_fmt(job['trigger_time'])}")
+        lines += list(fail_lines)
         lines.append("不使用範本或其他時間的畫面代替。")
         return "\n".join(lines)
     head = KIND_TEXT[eff]

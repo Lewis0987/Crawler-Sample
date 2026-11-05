@@ -46,6 +46,17 @@ def _reader():
 _READ_TIMING = {}       # 最近一次 HMI 讀取：等 _CLIENT_LOCK 毫秒、read_all 毫秒（perf_counter）
 
 
+def _env_reader():
+    """開始認證時讀一次環控（cert_env.read_env；約 8 個唯讀 GET），同 _reader 在 _CLIENT_LOCK 內用共用 client。"""
+    import report_monitor as RM
+    import cert_env
+    client = RM._report.get("client")
+    if client is None:
+        return None
+    with RM._CLIENT_LOCK:
+        return cert_env.read_env(client)
+
+
 def _heat_reader():
     with urllib.request.urlopen(CFG.CERT_HEAT_API_URL, timeout=CFG.CERT_HEAT_API_TIMEOUT_SEC) as r:
         return json.loads(r.read().decode("utf-8") or "{}")
@@ -79,7 +90,7 @@ def start_if_enabled(stop_event, log=print):
     root = REQ.cert_root(RM.OUTPUT_DIR)
     rt = CertRuntime(root, reader=_reader, heat_reader=_heat_reader, single_state=single_report_state,
                      cmd_file=os.path.join(RM.OUTPUT_DIR, "device_control_action_result.json"), log=log,
-                     read_timing=lambda: dict(_READ_TIMING))
+                     read_timing=lambda: dict(_READ_TIMING), env_reader=_env_reader)
     # 認證進行中 → 單次報告所有建立入口一律拒絕；記憶體狀態之外再看磁碟（續接失敗時也不會誤建單次報告）
     RM.set_cert_active_provider(lambda: rt.active_id() or REQ.active_on_disk(root))
     try:
