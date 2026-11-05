@@ -216,7 +216,7 @@ try:
     raw_by_t = {r_[RH.index("時間")]: r_ for r_ in rw.iter_rows(min_row=2, values_only=True)}
     from cert_report_xlsx import RAW_REQUIRED
     from cert_stage_engine import _num, has_hmi_values
-    raw_obs_rows = [r_ for r_ in rw.iter_rows(min_row=2, values_only=True) if r_[RH.index("序號")] is not None]   # N/A 分鐘列序號空白
+    raw_obs_rows = [r_ for r_ in rw.iter_rows(min_row=2, values_only=True) if r_[RH.index("序號")] is not None]
     check("Raw Data 必要欄位 = SOC／電流／Rack 最大／Rack 最小／Cell 最大／Cell 最小／總電壓／功率（全部 HMI；"
           "傳感器、PCS 模組溫度＝6161 選用）",
           RAW_REQUIRED == ["soc", "current_a", "rack_max_c", "rack_min_c", "cell_vmax_v", "cell_vmin_v", "voltage_v",
@@ -250,16 +250,16 @@ try:
           and o_part.seq + 1 not in seqs and o_part.seq in seqs and o_pcs.seq + 1 in seqs
           and all(nh.obs[r_[0] - 1].t == r_[RH.index("時間")]
                   and nh.obs[r_[0] - 1].src for r_ in raw_obs_rows))
-    check("1/3/4 Raw Data 欄位：不含「來源」「讀取結果」「所屬階段」，「PC 取樣時間」改名「時間」，固定 15 欄 A～O",
-          RH == ["序號", "時間", "狀態", "對應報表分鐘", "SOC", "電流",
+    check("1/3/4 Raw Data 欄位：不含「來源」「讀取結果」「所屬階段」「對應報表分鐘」，「PC 取樣時間」改名「時間」，固定 14 欄 A～N",
+          RH == ["序號", "時間", "狀態", "SOC", "電流",
                  "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓", "傳感器溫度",
                  "PCS 模組溫度", "功率 kW", "說明"]
-          and "讀取結果" not in RH and "PC 取樣時間" not in RH and "所屬階段" not in RH)
+          and "讀取結果" not in RH and "PC 取樣時間" not in RH and "所屬階段" not in RH and "對應報表分鐘" not in RH)
     _tc = [r_[1] for r_ in rw.iter_rows(min_row=2)]
-    check("Raw Data「時間」欄（B）＝PC 取樣時間原值：datetime 含秒、格式 yyyy-mm-dd hh:mm:ss；凍結首列、篩選 A1:O",
+    check("Raw Data「時間」欄（B）＝PC 取樣時間原值：datetime 含秒、格式 yyyy-mm-dd hh:mm:ss；凍結首列、篩選 A1:N",
           _tc and all(isinstance(c_.value, datetime) and c_.number_format == "yyyy-mm-dd hh:mm:ss" for c_ in _tc)
           and any(c_.value.second for c_ in _tc) and rw.freeze_panes == "A2"
-          and rw.auto_filter.ref == f"A1:O{rw.max_row}" and rw.column_dimensions["B"].width == 20)
+          and rw.auto_filter.ref == f"A1:N{rw.max_row}" and rw.column_dimensions["B"].width == 20)
     check("2 Raw Data 任何儲存格都不出現 observations.jsonl:*（來源只留在程式內部）",
           not any("observations.jsonl" in str(v) for r_ in rw.iter_rows(values_only=True) for v in r_ if v is not None))
     print("\n== Raw Data 狀態 ==")
@@ -525,34 +525,35 @@ try:
     hdr = [c.value for c in rw[1]]
     rows = [[c.value for c in r_] for r_ in rw.iter_rows(min_row=2)]
     H = {h: i for i, h in enumerate(hdr)}                     # 欄名 → 索引（不寫死欄號）
-    check("Raw Data：Rack 最小溫度後加入 Cell 最大／最小電壓，說明欄在最後（O，移除來源、讀取結果、所屬階段後各左移一欄）",
+    check("Raw Data：Rack 最小溫度後加入 Cell 最大／最小電壓，說明欄在最後（N，移除來源、讀取結果、所屬階段、對應報表分鐘）",
           hdr[H["Rack 最小溫度"]:H["Rack 最小溫度"] + 3] == ["Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓"]
-          and hdr[-1] == "說明" and len(hdr) == 15 and rw.auto_filter.ref.startswith("A1:O"))
+          and hdr[-1] == "說明" and len(hdr) == 14 and rw.auto_filter.ref.startswith("A1:N"))
     _ok = [r for r in rows if r[H["序號"]] is not None and r[H["Cell 最大電壓"]] not in (None, "N/A")]
     check(f"Raw Data Cell 電壓保留原始值（{_ok[0][H['Cell 最大電壓']] if _ok else None}）",
           _ok and _ok[0][H["Cell 最大電壓"]] == 3.4015 and _ok[0][H["Cell 最小電壓"]] == 3.3852)
-    obs_rows = [r for r in rows if r[H["序號"]] is not None]           # 觀測列有序號；N/A 分鐘列序號空白
-    na_rows = [r for r in rows if r[H["序號"]] is None]
+    obs_rows = [r for r in rows if r[H["序號"]] is not None]
     from cert_report_xlsx import _stage_title, raw_rows_obs, status_text as _status_text
     from cert_stage_engine import stage_names as _sn
     nf_ = {st.no: _stage_title(_sn(res.stages), st) for st in res.stages}
-    check(f"Raw Data 只輸出有效報告資料：讀取失敗 5 筆、必要欄位缺值、狀態無法判定者整筆不輸出（觀測列 {len(obs_rows)}），"
-          "失敗原因仍在 N/A 分鐘列",
-          len(obs_rows) == len(raw_rows_obs(res, p, nf_)) and all(res.obs[r[H["序號"]] - 1].ok for r in obs_rows)
+    check(f"Raw Data 只輸出有效報告資料：讀取失敗 5 筆、必要欄位缺值、狀態無法判定者整筆不輸出（觀測列 {len(obs_rows)}）；"
+          "每一列都是取樣列（序號＝觀測列號），沒有 N/A 分鐘列",
+          len(obs_rows) == len(rows) == len(raw_rows_obs(res, p, nf_)) and all(res.obs[r[H["序號"]] - 1].ok for r in obs_rows)
           and len(obs_rows) < len(res.obs) - 5)
     check("Raw Data「時間」保留實際取樣時間（含秒）", hdr[1] == "時間"
           and obs_rows[0][H["時間"]] == T0)
-    m = [r for r in obs_rows if r[H["對應報表分鐘"]] and "階段頁「1.第1次放電」 10:05（+50 秒）" in r[H["對應報表分鐘"]]]
-    check("階段頁每分鐘可對回 Raw Data 原始紀錄（10:05 → 該分鐘最後一筆 10:05:50）",
-          len(m) == 1 and m[0][H["時間"]] == T0 + timedelta(minutes=5, seconds=50))
-    check("N/A 分鐘在 Raw Data 有 N/A 分鐘列（序號空白）與原因",
-          any("10:30（N/A）" in str(r[H["對應報表分鐘"]]) and "讀取失敗" in str(r[H["說明"]]) for r in na_rows))
+    _s05 = _stage_title(_sn(res.stages), res.stages[0])
+    _r1005 = [r for r in obs_rows if r[H["時間"]] == T0 + timedelta(minutes=5, seconds=50)]
+    check("不輸出分鐘對照：任何儲存格都沒有「階段頁「…」HH:MM（±N 秒）」「整體 HH:MM」「（N/A）」等對照文字；"
+          "階段頁 10:05 選用的 10:05:50 仍在 Raw Data、狀態只顯示階段名稱",
+          not any(re.search(r"（[+-]\d+ 秒）|階段頁「|整體 \d\d:\d\d|\d\d:\d\d（N/A）", str(v))
+                  for r in rows for v in r if v is not None)
+          and len(_r1005) == 1 and _r1005[0][H["狀態"]] == _s05)
 
-    print("\n== Raw Data 永遠沒有「所屬階段」（0／1／多階段固定 15 欄 A～O；階段由「狀態」呈現）==")
+    print("\n== Raw Data 永遠沒有「所屬階段」「對應報表分鐘」（0／1／多階段固定 14 欄 A～N；階段由「狀態」呈現）==")
     from cert_report_xlsx import RAW_HEADERS, RAW_WIDTHS
 
     def raw_layout(ws_):
-        """表頭、欄名→欄字母、各欄寬度、篩選、凍結、時間欄格式、N/A 列底色是否涵蓋整列且不超出。"""
+        """表頭、欄名→欄字母、各欄寬度、篩選、凍結、時間欄格式、沒有序號空白的 N/A 分鐘列、欄數不超出。"""
         hd = [c_.value for c_ in ws_[1]]
         L = {h_: get_column_letter(i_) for i_, h_ in enumerate(hd, 1)}
         num_w = dict(zip(["SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓",
@@ -562,26 +563,25 @@ try:
         t_ok = all(r_[hd.index("時間")].number_format == "yyyy-mm-dd hh:mm:ss"
                    and isinstance(r_[hd.index("時間")].value, datetime) for r_ in rows_)
         na_ = [r_ for r_ in rows_ if r_[0].value is None]
-        fill_ok = all(len({c_.fill.fgColor.rgb for c_ in r_[:len(hd)]}) == 1 and r_[0].fill.fgColor.rgb != "00000000"
-                      for r_ in na_) and ws_.max_column == len(hd)
-        return hd, L, w_ok, t_ok, na_, fill_ok
+        cols_ok = ws_.max_column == len(hd)
+        return hd, L, w_ok, t_ok, na_, cols_ok
 
-    FIXED = ["序號", "時間", "狀態", "對應報表分鐘", "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度",
+    FIXED = ["序號", "時間", "狀態", "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度",
              "Cell 最大電壓", "Cell 最小電壓", "總電壓", "傳感器溫度", "PCS 模組溫度", "功率 kW", "說明"]
-    LETTERS = {"狀態": "C", "對應報表分鐘": "D", "SOC": "E", "Cell 最大電壓": "I", "功率 kW": "N", "說明": "O"}
+    LETTERS = {"狀態": "C", "SOC": "D", "Cell 最大電壓": "H", "功率 kW": "M", "說明": "N"}
 
     def fixed_ok(ws_, hd_, L_):
-        return (hd_ == FIXED == RAW_HEADERS and ws_.max_column == 15 and all(L_[k_] == v_ for k_, v_ in LETTERS.items())
-                and ws_.auto_filter.ref == f"A1:O{ws_.max_row}" and ws_.freeze_panes == "A2")
+        return (hd_ == FIXED == RAW_HEADERS and ws_.max_column == 14 and all(L_[k_] == v_ for k_, v_ in LETTERS.items())
+                and ws_.auto_filter.ref == f"A1:N{ws_.max_row}" and ws_.freeze_panes == "A2")
 
     # Case C：多階段（第1次放電 → 第1次充電 → 第2次放電）
     hdB, LB, wB, tB, naB, fB = raw_layout(rw)
     nB = {st.no: _stage_title(_sn(res.stages), st) for st in res.stages}
     by_seq_B = {r[H["序號"]]: r for r in obs_rows}
     staged = [o for o in res.obs if o.stage_no and o.seq + 1 in by_seq_B]
-    check(f"Case C 多階段（{len(res.stages)} 個）→ 仍固定 15 欄 A～O、沒有「所屬階段」；篩選 A1:O、凍結 A2、欄寬、時間格式、"
-          "N/A 列底色只到 O 全部正確",
-          fixed_ok(rw, hdB, LB) and wB and tB and fB and naB)
+    check(f"Case C 多階段（{len(res.stages)} 個）→ 仍固定 14 欄 A～N、沒有「所屬階段」「對應報表分鐘」；篩選 A1:N、凍結 A2、"
+          "欄寬、時間格式全部正確；階段頁有 N/A 分鐘也不在 Raw Data 加 N/A 分鐘列",
+          fixed_ok(rw, hdB, LB) and wB and tB and fB and not naB)
     # 階段前／階段間／階段後的待機（已上電、必要欄位齊全 → 會進 Raw Data）
     def idle_on(s_):
         o_ = obs_at(s_, "I", cell_vmax_v=3.40, cell_vmin_v=3.38)
@@ -596,7 +596,7 @@ try:
     stagedB = [o for o in resB.obs if o.stage_no and o.seq + 1 in rB]
     idleB = [o for o in resB.obs if not o.stage_no and o.seq + 1 in rB]
     first = [o for o in stagedB if o.stage_no == 1]
-    check(f"Case B 有階段（放電＋充電，{len(resB.stages)} 個）→ 仍固定 15 欄 A～O、沒有「所屬階段」，格式正確",
+    check(f"Case B 有階段（放電＋充電，{len(resB.stages)} 個）→ 仍固定 14 欄 A～N、沒有「所屬階段」，格式正確",
           len(resB.stages) == 2 and fixed_ok(wbB["Raw Data"], hB, LB2) and wB2 and tB2 and fB2)
     check(f"Case B「狀態」照原規則呈現階段：階段內 {len(stagedB)} 筆＝第1次放電／第1次充電；"
           f"階段前／間／後的待機 {len(idleB)} 筆＝待機；數值欄未錯位",
@@ -611,7 +611,7 @@ try:
                                          (next(o for o in staged if o.stage_no == k_) for k_ in (1, 2, 3))]
           and len(set(shown)) == 3 and all(s_.startswith(("第1次放電", "第1次充電", "第2次放電")) for s_ in set(shown)))
 
-    # Case A：整份沒有階段（Idle-only）；10:05 整分鐘無取樣 → N/A 提示列
+    # Case A：整份沒有階段（Idle-only）；10:05 整分鐘無取樣 → 整體頁 N/A（Raw Data 只列取樣，不加 N/A 分鐘列）
     idle_obs = []
     for s in list(range(0, 300, 10)) + list(range(360, 601, 10)):
         o_ = obs_at(s, "I", cell_vmax_v=3.40, cell_vmin_v=3.38)
@@ -623,19 +623,18 @@ try:
     hdA, LA, wA, tA, naA, fA = raw_layout(rw0)
     rows0 = [[c_.value for c_ in r_] for r_ in rw0.iter_rows(min_row=2)]
     obs0 = [r_ for r_ in rows0 if r_[0] is not None]
-    check("Case A 整份沒有階段 → 同樣固定 15 欄 A～O、沒有「所屬階段」",
+    check("Case A 整份沒有階段 → 同樣固定 14 欄 A～N、沒有「所屬階段」「對應報表分鐘」",
           not res0.stages and fixed_ok(rw0, hdA, LA))
-    check("Case A 篩選 A1:O、凍結首列、各欄寬度依欄名、時間欄 datetime yyyy-mm-dd hh:mm:ss（含秒）",
-          rw0.auto_filter.ref == f"A1:O{rw0.max_row}" and rw0.freeze_panes == "A2" and wA and tA)
+    check("Case A 篩選 A1:N、凍結首列、各欄寬度依欄名、時間欄 datetime yyyy-mm-dd hh:mm:ss（含秒）",
+          rw0.auto_filter.ref == f"A1:N{rw0.max_row}" and rw0.freeze_panes == "A2" and wA and tA)
     check(f"Case A 觀測列：序號／時間＝原觀測，狀態＝待機，數值欄對齊（{len(obs0)} 筆＝全部觀測）",
-          len(obs0) == len(idle_obs) and all(res0.obs[r_[0] - 1].t == r_[hdA.index("時間")] for r_ in obs0)
+          len(obs0) == len(idle_obs) == len(rows0) and all(res0.obs[r_[0] - 1].t == r_[hdA.index("時間")] for r_ in obs0)
           and {r_[hdA.index("狀態")] for r_ in obs0} == {"待機"}
-          and all(r_[hdA.index("SOC")] == 50 and r_[hdA.index("電流")] == 0 for r_ in obs0)
-          and all("整體" in str(r_[hdA.index("對應報表分鐘")]) for r_ in obs0 if r_[hdA.index("對應報表分鐘")]))
-    na0 = [[c_.value for c_ in r_] for r_ in naA]
-    check(f"Case A N/A 提示列（{len(na0)} 列）：序號空白、整列底色只到 O、對應報表分鐘＝整體 10:05（N/A）、說明＝原因",
-          len(na0) == 1 and na0[0][hdA.index("時間")] == T0 + timedelta(minutes=5) and fA
-          and "整體 10:05（N/A）" in str(na0[0][hdA.index("對應報表分鐘")]) and "無取樣" in str(na0[0][hdA.index("說明")]))
+          and all(r_[hdA.index("SOC")] == 50 and r_[hdA.index("電流")] == 0 for r_ in obs0))
+    _oa = wb0["整體測試"]
+    _r05 = next(r_ for r_ in range(2, _oa.max_row + 1) if _oa.cell(r_, 1).value == T0 + timedelta(minutes=5))
+    check("Case A 10:05 整分鐘無取樣：整體頁照常 N/A＋原因（無取樣）；Raw Data 不加 N/A 分鐘列（只列取樣）",
+          not naA and fA and _oa.cell(_r05, 2).value == "N/A" and "無取樣" in str(_oa.cell(_r05, NOTE).value))
 
     print("\n== 操作人員確認與一致性 ==")
     dec = [{"item_id": item, "choice": "split", "at": "2026-01-05 12:10:00", "by": "tester"}]

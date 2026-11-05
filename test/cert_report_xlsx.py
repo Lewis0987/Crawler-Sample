@@ -87,7 +87,6 @@ F14B = Font(size=14, bold=True)
 FB = Font(bold=True)
 HDR_FILL = PatternFill("solid", fgColor="DDEBF7")
 PH_FILL = PatternFill("solid", fgColor="F2F2F2")
-WARN_FILL = PatternFill("solid", fgColor="FFF2CC")
 DASH = Side(style="dashed", color="C00000")
 PH_BOX = Border(left=DASH, right=DASH, top=DASH, bottom=DASH)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -731,16 +730,17 @@ def _arrow_xml(k, prst, spec, r0, text):
 # =============================================================================
 # Raw Data
 # =============================================================================
-RAW_HEADERS = ["序號", "時間", "狀態", "對應報表分鐘",
+RAW_HEADERS = ["序號", "時間", "狀態",
                "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓", "總電壓",
                "傳感器溫度", "PCS 模組溫度", "功率 kW", "說明"]
 RAW_NOTE_COL = len(RAW_HEADERS)
 RAW_COL = {h: i for i, h in enumerate(RAW_HEADERS, 1)}     # 欄名 → 欄號（不寫死欄號）
 # 不輸出「所屬階段」：階段已由「狀態」欄呈現（第N次放電（滿放）…），內部 stage_no／階段分析不受影響。
 # 來源（observations.jsonl:N）不輸出到報告；Obs.src／seq 仍保留於程式內供追溯／重播
-# 「時間」＝PC 實際取樣時間（Obs.t，含秒、不取整）；N/A 分鐘列＝該報表分鐘（序號空白、底色標示、說明寫原因）。
+# 「時間」＝PC 實際取樣時間（Obs.t，含秒、不取整）。只列取樣明細：不輸出與階段頁／整體頁的分鐘對照（含 N/A 分鐘列），
+# 各分鐘的選用結果與 N/A 原因見階段頁／整體頁的備註欄。
 # 讀取結果不輸出（Raw Data 只列有效觀測，原本全為「成功」）；成功／失敗仍保留在 observations.jsonl（ok／hmi_ok）。
-RAW_WIDTHS = {"序號": 7, "時間": 20, "狀態": 11, "對應報表分鐘": 34, "說明": 30}
+RAW_WIDTHS = {"序號": 7, "時間": 20, "狀態": 11, "說明": 30}
 
 
 # Raw Data 必要量測欄位（全部為 HMI 欄位）：任一缺值 → 整筆不輸出。
@@ -808,42 +808,31 @@ def is_report_valid(o, p, names):
             and status_text(o, names) != NA)
 
 
-def _write_raw(ws, res, names, minute_maps, na_rows, p):
+def _write_raw(ws, res, names, p):
     heads, col, note_col = RAW_HEADERS, RAW_COL, RAW_NOTE_COL
     for c, h in enumerate(heads, 1):
         cell = ws.cell(1, c, h)
         cell.font = FB
         cell.fill = HDR_FILL
-    items = [(o.t, 0, o) for o in raw_rows_obs(res, p, names)] + [(T, 1, info) for T, info in na_rows.items()]
-    items.sort(key=lambda x: (x[0], x[1]))
     r = 2
-    for t, kind, x in items:
-        if kind == 0:
-            o = x
-            ws.cell(r, col["序號"], o.seq + 1)
-            ws.cell(r, col["時間"], o.t).number_format = "yyyy-mm-dd hh:mm:ss"
-            ws.cell(r, col["狀態"], status_text(o, names))
-            ws.cell(r, col["對應報表分鐘"], "；".join(minute_maps.get(o.seq, [])))
-            pcs, pcs_note = pcs_display(o, p)
-            for c, k in enumerate(LOG_KEYS + ["power_kw"], col["SOC"]):
-                v = field_value(o, k, p)
-                cell = ws.cell(r, c, pcs if k == "pcs_module_c" else _v(v))
-                if k in LOG_FORMATS and v is not None:
-                    cell.number_format = LOG_FORMATS[k]
-            parts = []
-            if o.state not in ("充電", "放電"):
-                # 追溯用：保留內部分析狀態與電池上下電原始值（狀態欄只顯示 待機／停機；無法判定者不輸出）
-                parts.append(f"分析狀態：{o.state}")
-                parts.append(f"電池上下電：{(o.flags or {}).get('battery_power_status') or '未保存'}")
-            if o.sensor_ok is False:
-                parts.append("傳感器關閉或異常")
-            ws.cell(r, note_col, _join_notes(*parts, pcs_note))
-        else:
-            ws.cell(r, col["時間"], t).number_format = "yyyy-mm-dd hh:mm:ss"
-            ws.cell(r, col["對應報表分鐘"], "；".join(x["labels"]))
-            ws.cell(r, note_col, x["reason"])
-            for c in range(1, note_col + 1):
-                ws.cell(r, c).fill = WARN_FILL
+    for o in raw_rows_obs(res, p, names):
+        ws.cell(r, col["序號"], o.seq + 1)
+        ws.cell(r, col["時間"], o.t).number_format = "yyyy-mm-dd hh:mm:ss"
+        ws.cell(r, col["狀態"], status_text(o, names))
+        pcs, pcs_note = pcs_display(o, p)
+        for c, k in enumerate(LOG_KEYS + ["power_kw"], col["SOC"]):
+            v = field_value(o, k, p)
+            cell = ws.cell(r, c, pcs if k == "pcs_module_c" else _v(v))
+            if k in LOG_FORMATS and v is not None:
+                cell.number_format = LOG_FORMATS[k]
+        parts = []
+        if o.state not in ("充電", "放電"):
+            # 追溯用：保留內部分析狀態與電池上下電原始值（狀態欄只顯示 待機／停機；無法判定者不輸出）
+            parts.append(f"分析狀態：{o.state}")
+            parts.append(f"電池上下電：{(o.flags or {}).get('battery_power_status') or '未保存'}")
+        if o.sensor_ok is False:
+            parts.append("傳感器關閉或異常")
+        ws.cell(r, note_col, _join_notes(*parts, pcs_note))
         r += 1
     num_w = [7, 9, 13, 13, 13, 13, 9, 11, 13, 9]                  # SOC～功率（與原寬度相同）
     widths = dict(RAW_WIDTHS, **dict(zip(heads[col["SOC"] - 1:note_col - 1], num_w)))
@@ -959,21 +948,6 @@ def build_workbook(res, meta):
     ws_ov = wb.create_sheet("數據概覽")
     ws_heat = wb.create_sheet("即時熱度")
 
-    minute_maps = {}
-    na_rows = {}
-
-    def track(label, rows, stage_name):
-        for mr in rows:
-            if mr.obs is not None:
-                d = int(round((mr.obs.t - mr.T).total_seconds()))
-                minute_maps.setdefault(mr.obs.seq, []).append(
-                    f"{label} {mr.T:%H:%M}（{d:+d} 秒）")
-            else:
-                e = na_rows.setdefault(mr.T, {"labels": [], "reason": mr.na_reason, "stage": ""})
-                e["labels"].append(f"{label} {mr.T:%H:%M}（N/A）")
-                if stage_name:
-                    e["stage"] = stage_name
-
     sheet_of, n_rows = {}, {}
     for i, st in enumerate(res.stages, 1):
         ws = wb.create_sheet(_sheet_name(i, names, st))
@@ -990,7 +964,6 @@ def build_workbook(res, meta):
             ws.add_chart(ch, CHART_ANCHOR)
         else:
             _write_short_stage(ws, st, p)
-        track(f"階段頁「{ws.title}」", rows, names_full[st.no])
 
     ws_all = wb.create_sheet("整體測試")
     orows = overall_minutes(res, valid=lambda o: is_report_valid(o, p, names_full),          # 有效觀測優先（同一判定）
@@ -1010,7 +983,6 @@ def build_workbook(res, meta):
         _write_log_sheet(ws_all, orows, overall_remark, p, "T_overall")
         ws_all.add_chart(_make_chart(ws_all, len(orows),
                                      overall_title(meta)), CHART_ANCHOR)
-    track("整體", orows, "")
 
     shots = meta.get("screenshots")
     show_final = not is_cycle_test(meta)           # 循環測試：兩個截圖頁都不顯示「認證結束（最後狀態）」
@@ -1018,7 +990,7 @@ def build_workbook(res, meta):
     _write_heat(ws_heat, res.stages, names, shots, show_final)
     _write_summary(wb, ws_sum, res, names_full, sheet_of, n_rows, meta, p)
     # 「控制紀錄」頁已自報告移除；commands.jsonl 仍由 cert_runtime 照常記錄（不影響控制流程／稽核）
-    _write_raw(wb.create_sheet("Raw Data"), res, names_full, minute_maps, na_rows, p)
+    _write_raw(wb.create_sheet("Raw Data"), res, names_full, p)
     return wb
 
 
