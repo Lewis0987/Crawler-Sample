@@ -209,11 +209,14 @@ def test_H_adapter():
     raw = raw_sample()                 # 未經 adapter（= Attempt #3 的錯誤接法）
     okRaw, ckRaw = HO.pre_pause_gates(raw, probe(), None)
     bad = sorted(k for k, v in ckRaw.items() if not v)
-    check("H12d 未經 adapter + soc_max_pct=None → 重現 Attempt #3 的 6 項失敗",
-          not okRaw and bad == sorted(["soc_fresh", "ess_fresh", "tou_off_peak",
-                                       "soc_in_charge_band",
-                                       "decision_is_charge",
-                                       "external_behaviour_known"]))
+    # 🔴 2026-11-06 C2：pre-pause 新增 `external_loop_running`。
+    #    raw sample 沒有 canonical liveness，因此**另外**多 1 項失敗；
+    #    Attempt #3 的歷史 6 項仍必須**全部**重現（斷言未放寬）。
+    _hist6 = ["soc_fresh", "ess_fresh", "tou_off_peak", "soc_in_charge_band",
+              "decision_is_charge", "external_behaviour_known"]
+    check("H12d 未經 adapter + soc_max_pct=None → 重現 Attempt #3 的 6 項失敗"
+          "（＋C2 新增 external_loop_running）",
+          not okRaw and bad == sorted(_hist6 + ["external_loop_running"]))
     check("H12e 經 adapter + canonical soc_max_pct → 同一現場改為 PASS",
           gates(obs())[0])
 
@@ -856,9 +859,11 @@ def test_EB_external_behaviour_known():
     okA, ckA = HO.pre_pause_gates(obs(verdict=vA), probe(), CANONICAL_SOC_MAX)
     check("EB10b external_behaviour_known = True",
           ckA["external_behaviour_known"] is True)
-    check("★★ EB10c Attempt #3 reconstructed → PRE_PAUSE_PREFLIGHT 11 / 11 PASS",
-          okA and sum(1 for v in ckA.values() if v) == 11
-          and len(ckA) == 11)
+    # 🔴 2026-11-06 C2：PRE_PAUSE_ITEMS 由 11 項增為 12 項
+    #    （新增 external_loop_running；本情境 canonical verdict 為 RUNNING）。
+    check("★★ EB10c Attempt #3 reconstructed → PRE_PAUSE_PREFLIGHT 12 / 12 PASS",
+          okA and sum(1 for v in ckA.values() if v) == 12
+          and len(ckA) == 12)
     for k in HO.PRE_PAUSE_ITEMS:
         check("       %s = True" % k, ckA[k] is True)
 
@@ -932,4 +937,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

@@ -99,8 +99,10 @@ def transport(runner=None, to=None, armed=False):
 
 
 def probe_dict(**over):
+    # 🔴 2026-11-06 C7：交接前必須取得 controller pid
     p = {"screen_alive": True, "process_alive": True,
-         "process_identity_ok": True, "controller_running": True}
+         "process_identity_ok": True, "controller_running": True,
+         "pid": "4242"}
     p.update(over)
     return p
 
@@ -110,7 +112,9 @@ def smp(**over):
          "comm_ok": True, "fault": False, "critical_alarms": 0, "fresh": True,
          "soc": 5.0, "soc_fresh": True, "meter_fresh": True, "ess_fresh": True,
          "tou": "OFF_PEAK", "decision": "charge",
-         "external_behaviour_known": True}
+         "external_behaviour_known": True,
+         # 🔴 2026-11-06 C2：交接前 external loop 必須 RUNNING
+         "external_liveness_verdict": RA.EXT_RUNNING}
     s.update(over)
     return s
 
@@ -435,7 +439,7 @@ def test_9_10_restore_timeout():
     o._to(HO.S_PREFLIGHT)
     o._to(HO.S_PAUSE_REQUESTED)
     o._to(HO.S_RESTORE_REQUESTED)
-    sent, why = o.request_restore()
+    sent, why = o.request_restore(o._issue_restore_clearance("test"))  # GAP-5：ARMED 送出需 C3 clearance（測試以正式核發入口取得）
     check("★★ request_restore 回 SEND_OUTCOME_UNKNOWN_MUST_PROBE",
           sent is False and why == "SEND_OUTCOME_UNKNOWN_MUST_PROBE")
     o._to(HO.S_RESTORE_OUTCOME_UNKNOWN, detail=why)
@@ -817,7 +821,7 @@ def test_16b_guard_refusal_exit_codes():
     o3._to(HO.S_PREFLIGHT)
     o3._to(HO.S_PAUSE_REQUESTED)
     o3._to(HO.S_RESTORE_REQUESTED)
-    rsent, rwhy = o3.request_restore()
+    rsent, rwhy = o3.request_restore(o3._issue_restore_clearance("test"))  # GAP-5：ARMED 送出需 C3 clearance（測試以正式核發入口取得）
     check("★★ restore 遇 exit 45 → 未送出（不得宣稱已執行）", rsent is False)
     check("★★ 且不是 UNKNOWN 路徑（明確未送出）",
           rwhy != "SEND_OUTCOME_UNKNOWN_MUST_PROBE")
@@ -869,7 +873,7 @@ def test_16b_guard_refusal_exit_codes():
     o6._to(HO.S_PREFLIGHT)
     o6._to(HO.S_PAUSE_REQUESTED)
     o6._to(HO.S_RESTORE_REQUESTED)
-    rs6, rw6 = o6.request_restore()
+    rs6, rw6 = o6.request_restore(o6._issue_restore_clearance("test"))  # GAP-5：ARMED 送出需 C3 clearance（測試以正式核發入口取得）
     r6out = [x for x in j6.read_all()
              if x.get("kind") == "OUTCOME" and x.get("step") == "RESTORE"]
     check("★★ restore 遇 exit 43 → 未送出，且不宣稱已執行",
@@ -944,4 +948,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "kind": "PHASE6_ATTEMPT_HISTORY_MANIFEST",
+  "description": "Phase 6 FIRST LIVE 歷史證據清單（C4 / GAP-4）。執行時唯讀；以 sha256 鎖定 output/phase6_scheduled_first_live 內所有既有 jsonl。檔案缺失或被修改 -> C4 UNRESOLVED。修改本清單必須由使用者 commit。",
+  "base_dir": "output/phase6_scheduled_first_live",
+  "generated_at": "2026-11-06",
+  "generated_by": "Claude Code（唯讀計算既有檔案 sha256；未修改任何歷史檔）",
+  "files": [
+    {
+      "path": "FIRST-LIVE-ATTEMPT2-20260922.jsonl",
+      "sha256": "c71f7e58c8a123c9ab7910545ae01662e90552c2e548138028ec2a8ae9db0866",
+      "role": "SCHEDULED_LEDGER",
+      "attempt_id": "FIRST-LIVE-ATTEMPT2-20260922",
+      "bytes": 319
+    },
+    {
+      "path": "FIRST-LIVE-ATTEMPT3-20260923.jsonl",
+      "sha256": "97d20c591f1988de705015ac67c791dfc315b650ab4f27639f58b175af6baf5b",
+      "role": "SCHEDULED_LEDGER",
+      "attempt_id": "FIRST-LIVE-ATTEMPT3-20260923",
+      "bytes": 736
+    },
+    {
+      "path": "FIRST-LIVE-ATTEMPT4-20260924.jsonl",
+      "sha256": "193d3fc67677d8f03a3c726cb8848bdca29a80847cf2b1b9472ce851b12a3dfa",
+      "role": "SCHEDULED_LEDGER",
+      "attempt_id": "FIRST-LIVE-ATTEMPT4-20260924",
+      "bytes": 924
+    },
+    {
+      "path": "FIRST-LIVE-ATTEMPT6-20260930.jsonl",
+      "sha256": "324ed8298585a37311c7fffa1ebb2bdf1d0d28ebd3b46175ab49d612a587a9ce",
+      "role": "SCHEDULED_LEDGER",
+      "attempt_id": "FIRST-LIVE-ATTEMPT6-20260930",
+      "bytes": 358
+    },
+    {
+      "path": "FIRST-LIVE-ATTEMPT7-20261001.jsonl",
+      "sha256": "39b2632d3377859f62e5b4662dd9ce0c2b1b66596ba3417d9a4cd471f521a457",
+      "role": "SCHEDULED_LEDGER",
+      "attempt_id": "FIRST-LIVE-ATTEMPT7-20261001",
+      "bytes": 545
+    },
+    {
+      "path": "FIRST-LIVE-ATTEMPT8-20261002.jsonl",
+      "sha256": "ed2061c7c0839a5b17a62bf6d39d65a1d8ca6a34622f2baff0ad4cb2bb8f676d",
+      "role": "SCHEDULED_LEDGER",
+      "attempt_id": "FIRST-LIVE-ATTEMPT8-20261002",
+      "bytes": 1562
+    },
+    {
+      "path": "FIRST-LIVE-ATTEMPT9-20261006.jsonl",
+      "sha256": "d2c19d10433d89ba948cc4d41d9bb5d648c052b61e3a3b3edb10e9bb0b22dc85",
+      "role": "SCHEDULED_LEDGER",
+      "attempt_id": "FIRST-LIVE-ATTEMPT9-20261006",
+      "bytes": 2065
+    },
+    {
+      "path": "handoff_journal.LEGACY_SHARED.snapshot.jsonl",
+      "sha256": "92d2987301a245831db558dbda76646eaaf389611c6560681c7f33053190e630",
+      "role": "LEGACY_SHARED_JOURNAL",
+      "attempt_id": null,
+      "bytes": 4726
+    },
+    {
+      "path": "handoff_journal.jsonl",
+      "sha256": "92d2987301a245831db558dbda76646eaaf389611c6560681c7f33053190e630",
+      "role": "LEGACY_SHARED_JOURNAL",
+      "attempt_id": null,
+      "bytes": 4726
+    },
+    {
+      "path": "handoff_journal_FIRST-LIVE-ATTEMPT8-20261002.jsonl",
+      "sha256": "d45b020f8c05c85c3cb2550c566abdd9ee1cb5058cc68a8d26e8ae5e0e4ad0ba",
+      "role": "ATTEMPT_JOURNAL",
+      "attempt_id": "FIRST-LIVE-ATTEMPT8-20261002",
+      "bytes": 4282
+    },
+    {
+      "path": "handoff_journal_FIRST-LIVE-ATTEMPT9-20261006.jsonl",
+      "sha256": "41e9f28937a28ffc68e3502be010075a849a8fcc662ad42a3bce3ec52b162058",
+      "role": "ATTEMPT_JOURNAL",
+      "attempt_id": "FIRST-LIVE-ATTEMPT9-20261006",
+      "bytes": 5884
+    }
+  ],
+  "exceptions": [
+    {
+      "attempt_id": "FIRST-LIVE-ATTEMPT3-20260923",
+      "approval": "PENDING_USER_APPROVAL",
+      "approved_by": null,
+      "approved_at": null,
+      "correlation": "DIRECT_EVIDENCE_NO_PAUSE_SENT",
+      "reason": "ledger 有 pause INTENT 但沒有 RV_RESUMED。該 INTENT 是 Attempt #3 已知時序 bug（進入 handoff 前就寫入 INTENT）；pause 實際未送出，恢復責任不存在。",
+      "evidence": [
+        {
+          "path": "FIRST-LIVE-ATTEMPT3-20260923.jsonl",
+          "sha256": "97d20c591f1988de705015ac67c791dfc315b650ab4f27639f58b175af6baf5b",
+          "fact": "seq2 INTENT pause 00:05:33；seq3 EXTERNAL_PAUSE_RESPONSIBILITY；seq5 CONSUMED AUTHORITY_ACQUIRE_FAILED 00:05:35；無任何 pause OUTCOME"
+        },
+        {
+          "path": "handoff_journal.jsonl",
+          "sha256": "92d2987301a245831db558dbda76646eaaf389611c6560681c7f33053190e630",
+          "fact": "seq1~3（2026-09-23 00:05:33~34）PREFLIGHT -> 1_PRE_PAUSE_PREFLIGHT FAIL -> ABORTED_PREFLIGHT；當天沒有任何 PAUSE INTENT"
+        },
+        {
+          "path": "attempt3_20260923/scheduled_first_live_FIRST-LIVE-ATTEMPT3-20260923_20260923_000535.json",
+          "sha256": "1fabf9e45209cf08829f5f73b6e1d53cd5e24ca79811ee4561bd07b192db9d29",
+          "fact": "artifact pause_attempt_count=0；ssh_verb_counts={probe:3, loopcheck:3}（沒有 pause）"
+        }
+      ],
+      "times": {
+        "ledger_intent": "2026-09-23T00:05:33",
+        "journal_aborted_preflight": "2026-09-23 00:05:34",
+        "ledger_consumed": "2026-09-23T00:05:35"
+      },
+      "counts": {
+        "ssh_pause": 0,
+        "ssh_restore": 0,
+        "journal_pause_intent_on_date": 0
+      },
+      "limitations": [
+        "legacy journal 沒有 attempt_id，以日期與時間對應"
+      ]
+    },
+    {
+      "attempt_id": "FIRST-LIVE-ATTEMPT4-20260924",
+      "approval": "PENDING_USER_APPROVAL",
+      "approved_by": null,
+      "approved_at": null,
+      "correlation": "INFERRED_CORRELATION",
+      "reason": "ledger 有 pause OUTCOME SENT，但沒有 pause INTENT（Attempt #4 hook 遺漏）與 restore_verified。legacy journal 同日唯一一段紀錄顯示該次 pause 已由 restore 歸還並驗證（RESTORED / COMPLETE）。",
+      "evidence": [
+        {
+          "path": "FIRST-LIVE-ATTEMPT4-20260924.jsonl",
+          "sha256": "193d3fc67677d8f03a3c726cb8848bdca29a80847cf2b1b9472ce851b12a3dfa",
+          "fact": "seq2 OUTCOME pause SENT、seq4 INTENT restore、seq6 OUTCOME restore SENT（皆 00:09:06）、seq7 CONSUMED ABORTED_POST_HANDOFF_REVALIDATION；無 restore_verified"
+        },
+        {
+          "path": "handoff_journal.jsonl",
+          "sha256": "92d2987301a245831db558dbda76646eaaf389611c6560681c7f33053190e630",
+          "fact": "seq4~24 為 2026-09-24 唯一一段：seq7/8 PAUSE INTENT/OUTCOME ok 00:05:47~48；seq17/18 RESTORE INTENT/OUTCOME ok 00:08:46；seq21 11_RESTORE_VERIFY OK、seq22 RESTORED、seq23 COMPLETE 00:09:05"
+        },
+        {
+          "path": "handoff_journal.LEGACY_SHARED.snapshot.jsonl",
+          "sha256": "92d2987301a245831db558dbda76646eaaf389611c6560681c7f33053190e630",
+          "fact": "與 handoff_journal.jsonl 逐位元組相同（同一 sha256）"
+        },
+        {
+          "path": "attempt4_20260924/scheduled_first_live_FIRST-LIVE-ATTEMPT4-20260924_20260924_000906.json",
+          "sha256": "a4aabcc4a3ffcb6f39b7bf980a84da51b07eca625aa96d6c7f1534441133fa6c",
+          "fact": "artifact ssh_verb_counts={pause:1, restore:1}（恰好一對）；restore_resumed=False 為當時已知的證據串接缺陷"
+        }
+      ],
+      "times": {
+        "journal_pause": "2026-09-24 00:05:47~48",
+        "journal_restore": "2026-09-24 00:08:46",
+        "journal_restored_complete": "2026-09-24 00:09:05",
+        "ledger_written": "2026-09-24T00:09:06"
+      },
+      "counts": {
+        "ssh_pause": 1,
+        "ssh_restore": 1,
+        "journal_pause_intent_on_date": 1,
+        "journal_restore_ok_on_date": 1
+      },
+      "limitations": [
+        "legacy journal 紀錄沒有 attempt_id：對應關係是以日期、時間、唯一一對 pause/restore 與 SSH 次數推論，不是以 ID 證明",
+        "artifact 的 restore_resumed=False / restore_verifier_state=None 是當時已知的證據串接缺陷（Attempt #4 postmortem），不是 restore 失敗的證據",
+        "09-24 08:56 唯讀複驗 EXTERNAL_RUNNING 僅見於程式註解記載，非本清單內的檔案證據"
+      ]
+    }
+  ]
+}

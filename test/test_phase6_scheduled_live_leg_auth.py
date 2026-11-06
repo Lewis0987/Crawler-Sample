@@ -368,8 +368,12 @@ auth = FL.build_scheduled_live_leg_authorization(
     p, attempt_id="A5", target_date="2026-09-25",
     window_start="00:05:00", window_end="00:30:00")
 intent = PRD.LiveLegIntent(FL.FIRST_LIVE_ACTION)
-with FL.first_live_dispatch_scope(p):
-    ok = SVC.confirm_live_leg(intent, prompt=auth)
+# 2026-11-06 C1：子程序內暫時解除 FIRST_LIVE_HOLD（finally 改回），
+# 只驗證「無 stdin 時 scheduled 確認不會 hang」這個既有命題。
+import _phase6_hold_override as _HOLD
+with _HOLD.hold_released_for_offline_test():
+    with FL.first_live_dispatch_scope(p):
+        ok = SVC.confirm_live_leg(intent, prompt=auth)
 print("SCHEDULED_CONFIRMED=%r" % ok)
 print("STDIN_EOF=%r" % (sys.stdin.read() == "" if sys.stdin else None))
 """
@@ -743,4 +747,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

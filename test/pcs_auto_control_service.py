@@ -286,13 +286,23 @@ def release_ownership():
     if k is None or not _own["handle"]:
         _own.update(owned=False, handle=None)
         return False
+    # 🔴 2026-11-06 GAP-2：回傳值必須是 ReleaseMutex 的**實際 BOOL 結果**，
+    #    不得只依內部記帳判定成功（與 report_monitor.release_ownership 同一作法）。
+    #    失敗或例外 -> False；記帳一律清除（handle 已關閉，不得再宣稱持有）。
+    released = False
     try:
-        k.ReleaseMutex(_own["handle"])
+        released = bool(k.ReleaseMutex(_own["handle"]))
         k.CloseHandle(_own["handle"])
     except Exception:                                     # noqa: BLE001
-        pass
-    _own.update(owned=False, handle=None, reason="released", thread_id=None)
-    return True
+        released = False
+        try:
+            k.CloseHandle(_own["handle"])
+        except Exception:                                 # noqa: BLE001
+            pass
+    _own.update(owned=False, handle=None,
+                reason=("released" if released else "release_failed"),
+                thread_id=None)
+    return released
 
 
 # ======================================================================

@@ -15,6 +15,7 @@ test_phase6_610b2_handoff_runner.py — Phase 6.10-B2（離線）
     python test_phase6_610b2_handoff_runner.py        # exit 0 = PASS
 """
 import ast
+import datetime
 import io
 import os
 import re
@@ -57,9 +58,23 @@ def tmp_journal():
     return HO.Journal(path=os.path.join(d, "j.jsonl"))
 
 
+# 🔴 2026-11-06 C7：probe 帶固定 pid（交接前後一致）＋ ssh_ok（C3 要求 probe 完整）
+FIXTURE_PID = "4242"
+# 🔴 2026-11-06 C3 P-1：restore 時段內的固定本機時間
+FIXTURE_NOW = datetime.datetime(
+    2026, 9, 3, 1, 0, 0,
+    tzinfo=datetime.timezone(datetime.timedelta(hours=8)))   # GAP-6：Asia/Taipei
+
+
+def tou_bracket(t):
+    """GAP-6 fixture：TOU 判定前後的時間（與 C3 同一基準，Asia/Taipei aware）。"""
+    return {"before": t, "after": t, "mono_before": 0.0, "mono_after": 0.0,
+            "host_before": t.replace(tzinfo=None)}
+
+
 def probe(**over):
     p = {"screen_alive": True, "process_alive": True,
-         "process_identity_ok": True}
+         "process_identity_ok": True, "pid": FIXTURE_PID, "ssh_ok": True}
     p.update(over)
     return p
 
@@ -70,7 +85,9 @@ def smp(**over):
          "comm_ok": True, "fault": False, "critical_alarms": 0, "fresh": True,
          "soc": 5.0, "soc_fresh": True, "meter_fresh": True, "ess_fresh": True,
          "tou": "OFF_PEAK", "decision": "charge",
-         "external_behaviour_known": True}
+         "external_behaviour_known": True,
+         # 🔴 2026-11-06 C2：交接前 external loop 必須 RUNNING
+         "external_liveness_verdict": RA.EXT_RUNNING}
     s.update(over)
     return s
 
@@ -104,16 +121,41 @@ def runner(mode=HO.MODE_DRY_RUN, samples=None, probes=None, senders=None,
         idle_baseline_kw=-1.3, power_tolerance_kw=1.25)
     sq = list(samples or [smp()] * 40)
     pq = list(probes or [probe()] * 40)
-    mq = list(marks or ["2026-09-03 01:00:%02d" % i for i in range(40)])
+    mq = list(marks) if marks is not None else None
 
     def nxt(q, default):
         return q.pop(0) if q else default
 
+    # 🔴 2026-11-06：模擬 external controller —— pause 後停止（loop 時間戳凍結、
+    #    liveness NOT_RUNNING），restore 後恢復（時間戳前進、RUNNING）。
+    #    與真實 auto_control.py 的 stop / start 行為一致；不放寬任何斷言。
+    def _paused():
+        return sd.pause_calls > 0 and sd.restore_calls == 0
+
+    def _sample():
+        s = dict(nxt(sq, smp()))
+        # 🔴 GAP-6：TOU 判定前後的時間（與 C3 同一基準）
+        s.setdefault("tou_sampled_between", tou_bracket(FIXTURE_NOW))
+        if "_fixed_liveness" not in s:
+            s["external_liveness_verdict"] = (RA.EXT_NOT_RUNNING if _paused()
+                                              else RA.EXT_RUNNING)
+        return s
+
+    tick = {"n": 0}
+
+    def _mark():
+        if mq is not None:
+            return nxt(mq, "2026-09-03 02:00:00")
+        if not _paused():
+            tick["n"] += 1
+        return "2026-09-03 01:%02d:%02d" % divmod(tick["n"], 60)
+
     r = HO.HandoffRunner(
-        o, sample_source=(lambda: nxt(sq, smp())),
+        o, sample_source=_sample,
         probe_source=(lambda: nxt(pq, probe())),
-        loop_mark_source=(lambda: nxt(mq, "2026-09-03 02:00:00")),
-        dispatcher=dispatcher, soc_max_pct=SOC_MAX)
+        loop_mark_source=_mark,
+        dispatcher=dispatcher, soc_max_pct=SOC_MAX,
+        now_fn=(lambda: FIXTURE_NOW))
     return r, o, sd
 
 
@@ -262,7 +304,17 @@ def test_5():
     probes3 = [probe()] * 2 + [probe(process_alive=False)] * 30
     r3, o3, sd3 = runner(mode=HO.MODE_ARMED, probes=probes3)
     res3 = r3.run()
-    check("★★ probe 異常後仍送出 restore", sd3.restore_calls == 1)
+    # 🔴 OLD / NEW / WHY（2026-11-06 C3 RESTORE_PRECHECK）
+    #   OLD : process 死掉後仍送出 restore（restore_calls == 1）。
+    #   NEW : RESTORE_PRECHECK 要求 external runtime 健康 -> **不送** restore，
+    #         RESTORE_WITHHELD，恢復責任**保留**（不是遺忘）。
+    #   WHY : 對已不存在的 controller 送 start 沒有意義；原命題
+    #         「pause 後任何失敗都不得遺忘恢復責任」改以責任保留驗證，未放寬。
+    check("★★ probe 異常後不送 restore（RESTORE_WITHHELD）",
+          sd3.restore_calls == 0 and res3["outcome"] == "RESTORE_WITHHELD")
+    check("★★ probe 異常後恢復責任保留（未遺忘）",
+          res3["restore_responsibility"] is True
+          and o3.state == HO.S_RESTORE_WITHHELD)
 
 
 # ======================================================================
@@ -412,4 +464,7 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    raise SystemExit(_HOLD.run_main(main))

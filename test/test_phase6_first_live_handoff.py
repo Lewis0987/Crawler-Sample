@@ -63,6 +63,7 @@ GATE A / GATE B（2026-09-18 P0 flow correction）
     python test_phase6_first_live_handoff.py        # exit 0 = PASS
 """
 import ast
+import datetime
 import io
 import os
 import shutil
@@ -126,10 +127,23 @@ def sample(**kw):
     return d
 
 
+# 🔴 2026-11-06 C7：交接前後一致的 controller pid；C3 P-1：restore 時段內的本機時間
+FIXTURE_PID = "4242"
+FIXTURE_NOW = datetime.datetime(
+    2026, 9, 18, 0, 10, 0,
+    tzinfo=datetime.timezone(datetime.timedelta(hours=8)))   # GAP-6：Asia/Taipei
+
+
+def tou_bracket(t):
+    """GAP-6 fixture：TOU 判定前後的時間（與 C3 同一基準，Asia/Taipei aware）。"""
+    return {"before": t, "after": t, "mono_before": 0.0, "mono_after": 0.0,
+            "host_before": t.replace(tzinfo=None)}
+
+
 def probe(**kw):
     d = {"ssh_ok": True, "screen_alive": True, "process_alive": True,
          "process_identity_ok": True, "guard_variant": "B2",
-         "capability_ok": True}
+         "capability_ok": True, "pid": FIXTURE_PID}
     d.update(kw)
     return d
 
@@ -237,6 +251,20 @@ class Rig(object):
             self.n += 1
         return "2026-09-18 09:%02d:%02d" % (self.n // 60, self.n % 60)
 
+    def ext_sample(self, **kw):
+        """
+        🔴 2026-11-06：模擬 external controller 的 canonical liveness ——
+           pause 之前 RUNNING（C2）、pause 之後 NOT_RUNNING、restore 之後 RUNNING。
+        """
+        d = sample(**kw)
+        paused = (self.remote.pause_calls > 0
+                  and self.remote.restore_calls == 0)
+        d.setdefault("external_liveness_verdict",
+                     RA.EXT_NOT_RUNNING if paused else RA.EXT_RUNNING)
+        # 🔴 GAP-6：TOU 判定前後的時間（與 C3 同一基準）
+        d.setdefault("tou_sampled_between", tou_bracket(FIXTURE_NOW))
+        return d
+
     def run(self, entry_authorized=True):
         """
         🔴 OLD / NEW / WHY / EVIDENCE（2026-10-02 Attempt #8 postmortem）
@@ -253,10 +281,11 @@ class Rig(object):
              該命題與判定強度完全不變。
         """
         r = HO.HandoffRunner(
-            self.o, (lambda: sample()), (lambda: probe()),
+            self.o, (lambda: self.ext_sample()), (lambda: probe()),
             loop_mark_source=self.mark, dispatcher=self._dispatch,
             config=CFG, soc_max_pct=85.0, sleeper=(lambda s: None),
-            dispatch_permit=EntryOnlyPermit(entry_authorized))
+            dispatch_permit=EntryOnlyPermit(entry_authorized),
+            now_fn=(lambda: FIXTURE_NOW))
         self.result = r.run()
         self.runner = r
         return self.result
@@ -300,11 +329,11 @@ def test_I2_pause_not_verified():
     HO.DISPATCH_ENABLED = True
     try:
         r = HO.HandoffRunner(
-            rig.o, (lambda: sample(pcs_state="CHARGING", ac_kw=-40.0,
-                                   authority="EXTERNAL_OR_UNKNOWN")),
+            rig.o, (lambda: rig.ext_sample(pcs_state="CHARGING", ac_kw=-40.0,
+                                           authority="EXTERNAL_OR_UNKNOWN")),
             (lambda: probe()), loop_mark_source=rig.mark,
             dispatcher=rig._dispatch, config=CFG, soc_max_pct=85.0,
-            sleeper=(lambda s: None))
+            sleeper=(lambda s: None), now_fn=(lambda: FIXTURE_NOW))
         rig.result = r.run()
     finally:
         HO.DISPATCH_ENABLED = old
@@ -312,7 +341,16 @@ def test_I2_pause_not_verified():
     check("★★ I2. live leg 從未執行", rig.leg_calls == 0)
     check("★★ I2. Phase 6 從未取得控制權", rig.lease.acquired_once is False)
     check("  Phase 6 charge 指令數 = 0", rig.guard.count("phase6_charge") == 0)
-    check("  責任成立後仍走 restore", rig.remote.restore_calls == 1)
+    # 🔴 OLD / NEW / WHY（2026-11-06 C3 RESTORE_PRECHECK）
+    #   OLD : `restore_calls == 1`（PCS 仍 CHARGING、Authority EXTERNAL 也恢復）。
+    #   NEW : PCS 非 STANDBY/STOPPED、authority 非 IDLE -> **不送** restore，
+    #         RESTORE_WITHHELD，恢復責任**保留**（原命題「責任不會被遺忘」不變）。
+    #   WHY : 條件不明時恢復 external，可能形成雙重控制或非預期放電。
+    check("  責任成立後走到 restore 階段，但 precheck 不通過 -> WITHHELD（0 次）",
+          rig.remote.restore_calls == 0
+          and rig.result["outcome"] == "RESTORE_WITHHELD")
+    check("  恢復責任保留（未遺忘）",
+          rig.result["restore_responsibility"] is True)
 
 
 def test_I3_pause_unknown():
@@ -1396,4 +1434,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

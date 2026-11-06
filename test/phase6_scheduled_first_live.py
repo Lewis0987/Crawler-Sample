@@ -106,6 +106,15 @@ R_NOT_ENABLED = "NOT_ENABLED"
 R_ALREADY_CONSUMED = "ALREADY_CONSUMED"
 R_WRONG_DATE = "WRONG_TARGET_DATE"
 R_EXCEPTION = "EXCEPTION_FAIL_CLOSED"
+# 🔴 2026-11-06 Attempt #10 安全強化
+#   C1：FIRST_LIVE_HOLD 生效 -> 拒絕執行，**不消耗**授權、不做任何設備 I/O
+R_FIRST_LIVE_HOLD = "FIRST_LIVE_HOLD"
+#   C3：RESTORE_PRECHECK 未通過 -> restore 未送出、external 仍暫停、責任保留
+R_RESTORE_WITHHELD = "RESTORE_WITHHELD"
+#   C4：先前 attempt 的恢復責任未解除（且沒有有效人工確認）-> 拒絕，不消耗授權
+R_PRIOR_RESPONSIBILITY_UNRESOLVED = "PRIOR_RESPONSIBILITY_UNRESOLVED"
+#   GAP-4：runtime index 無法登錄 -> 拒絕執行（沒有登錄就不跑 attempt）
+R_RUNTIME_INDEX_UNAVAILABLE = "RUNTIME_INDEX_UNAVAILABLE"
 
 # 🔴 失敗階段（供 postmortem 精確分類；不取代 result）
 STAGE_DISPATCHER_CONSTRUCTION = "DISPATCHER_CONSTRUCTION"
@@ -166,7 +175,7 @@ RESULT_PRECEDENCE = ("real_terminal_step", "derived_booleans",
 ATTEMPT_RESULT_PRECEDENCE = (
     ("P0_SAFETY_UNCERTAIN",
      ("PAUSE_UNKNOWN", "RESTORE_UNKNOWN", "RESTORE_FAILED",
-      "DISPATCH_UNKNOWN")),
+      "DISPATCH_UNKNOWN", "RESTORE_WITHHELD")),
     ("P1_CONTROL_FAILURE", ("DISPATCH_FAILED",)),
     ("P2_DEADLINE", ("DEADLINE_BEFORE_FIELD_ACTION",
                      "DEADLINE_DURING_HANDOFF",
@@ -202,6 +211,8 @@ RESULT_STATES = (
     R_LIVE_LEG_VERIFY_FAILED, R_RESTORE_FAILED, R_RESTORE_UNKNOWN,
     R_POSTCHECK_FAILED, R_PASS,
     R_NOT_ENABLED, R_ALREADY_CONSUMED, R_WRONG_DATE, R_EXCEPTION,
+    R_FIRST_LIVE_HOLD, R_RESTORE_WITHHELD, R_PRIOR_RESPONSIBILITY_UNRESOLVED,
+    R_RUNTIME_INDEX_UNAVAILABLE,
 )
 
 
@@ -519,7 +530,8 @@ class ScheduledFirstLiveRunner(object):
                  safety_preflight, gate_a, handoff_readiness,
                  arm_and_run_handoff, collect_artifact=None,
                  safety_reset=None, host_evidence=None, waiter=None,
-                 max_wait_sec=None, register_pause_intent_hook=None):
+                 max_wait_sec=None, register_pause_intent_hook=None,
+                 prior_journal_dir=None):
         if auth is None or ledger is None:
             raise ValueError("auth / ledger 必填")
         if now_fn is None:
@@ -543,19 +555,62 @@ class ScheduledFirstLiveRunner(object):
         #    sender 呼叫的前一刻回呼；未提供 hook 即**沒有** pause 能力。
         self._register_pause_hook = register_pause_intent_hook
         self.max_wait_sec = max_wait_sec
+        # 🔴 GAP-3：ledger 持久化狀態（寫入失敗才改為 FAILED:<err>）
+        self._ledger_persistence = "OK"
+        # 🔴 C4：跨 attempt 責任掃描的 journal 目錄（None = 正式預設目錄）
+        self.prior_journal_dir = prior_journal_dir
         self.evidence = {}
 
     # ------------------------------------------------------------------
     def _finish(self, result, detail=None):
-        """🔴 任何結果都 SELF DISARM ＋ ONE-SHOT CONSUMED。"""
+        """
+        🔴 任何結果都 SELF DISARM ＋ ONE-SHOT CONSUMED。
+
+        🔴 GAP-3（2026-11-06）：ledger 寫入失敗**不得**再拋出例外而重入
+           `_finish()`，也**不得**宣稱已消耗 / 已保存 ——
+           以 `persistence` 明示 journal / ledger / index 三者實際結果。
+        """
         reset = self._reset() if self._reset is not None else None
         self.evidence.update(
             result=result, detail=detail, safety_reset=reset,
-            one_shot_consumed=True,
             finished_at=self._now().isoformat(timespec="seconds"),
             ledger=self.ledger.as_dict())
         if not self.ledger.consumed:
-            self.ledger.consume(result, detail)
+            try:
+                self.ledger.consume(result, detail)
+            except Exception as e:                             # noqa: BLE001
+                self._ledger_failed(e)
+        self.evidence["one_shot_consumed"] = bool(self.ledger.consumed)
+        self._update_persistence()
+        return dict(self.evidence)
+
+    def _ledger_failed(self, exc):
+        """ledger 寫入失敗：只記錄，不往上拋（持久化狀態降為 FAILED）。"""
+        self._ledger_persistence = "FAILED:%s" % type(exc).__name__
+
+    def _update_persistence(self):
+        hr = self.evidence.get("handoff_result")
+        if isinstance(hr, dict):
+            jp = hr.get("journal_persistence") or "NOT_ATTEMPTED"
+        elif self.evidence.get("failure_stage") == STAGE_HANDOFF_EXECUTION:
+            # handoff 執行中例外：journal 最後狀態無法確認 -> 不得視為已保存
+            jp = "FAILED:UNCONFIRMED"
+        else:
+            jp = "NOT_ATTEMPTED"
+        overall, d = FL.persistence_summary(
+            journal=jp, ledger=self._ledger_persistence, index="NOT_ATTEMPTED")
+        self.evidence["persistence"] = {"overall": overall, "detail": d}
+
+    def _refuse_without_consume(self, result, detail=None):
+        """
+        🔴 C1 / C4：拒絕執行但**不消耗**授權。
+           只做 safety reset（純旗標讀取 / 本機收尾）；不寫 ledger、不 consume。
+        """
+        reset = self._reset() if self._reset is not None else None
+        self.evidence.update(
+            result=result, detail=detail, safety_reset=reset,
+            one_shot_consumed=False, field_side_effects=0,
+            finished_at=self._now().isoformat(timespec="seconds"))
         return dict(self.evidence)
 
     # ------------------------------------------------------------------
@@ -588,6 +643,11 @@ class ScheduledFirstLiveRunner(object):
     def _run_inner(self):
         a = self.auth
 
+        # ---- C1. FIRST_LIVE_HOLD（縱深防禦；主要檢查點在 launcher）----
+        if FL.first_live_hold_active():
+            return self._refuse_without_consume(
+                R_FIRST_LIVE_HOLD, "FIRST_LIVE_HOLD=True -> 拒絕，不消耗授權")
+
         # ---- 0. 授權層 ----
         if self.ledger.consumed:
             self.evidence["window_check_result"] = "NOT_EVALUATED"
@@ -595,6 +655,18 @@ class ScheduledFirstLiveRunner(object):
                                 "result=%s" % self.ledger.result)
         if not a.enabled:
             return self._finish(R_NOT_ENABLED, "authorization.enabled != True")
+
+        # ---- C4. 先前 attempt 的恢復責任（只讀 journal，無設備 I/O）----
+        # 🔴 缺陷 B：只排除「同 attempt_id 且為**本次 ledger 實際檔案**」的項目
+        pv, pdet = FL.scan_prior_responsibility(
+            self.prior_journal_dir, exclude_attempt_id=a.attempt_id,
+            exclude_ledger_path=getattr(self.ledger, "path", None))
+        self.evidence["prior_responsibility"] = {"verdict": pv,
+                                                 "journals": pdet}
+        if pv != FL.PRIOR_CLEAR:
+            return self._refuse_without_consume(
+                R_PRIOR_RESPONSIBILITY_UNRESOLVED,
+                [x["journal"] for x in pdet if x["blocking"]])
 
         verdict, action = recover(self.ledger)
         self.evidence["recovery"] = {"verdict": verdict, "action": action}
@@ -624,7 +696,13 @@ class ScheduledFirstLiveRunner(object):
             return self._finish(R_EXPIRED, "啟動時已超過 window_end")
 
         # ---- 2. STEP 0 fresh source state ----
-        self.ledger.mark(LC_PREFLIGHT, "fresh start")
+        try:
+            self.ledger.mark(LC_PREFLIGHT, "fresh start")
+        except Exception as e:                                 # noqa: BLE001
+            # 🔴 GAP-3：任何 field 動作之前 ledger 就寫不進去 -> 不前進
+            self._ledger_failed(e)
+            return self._finish(R_EXCEPTION,
+                                "ledger 寫入失敗：%s" % type(e).__name__)
         src = self._source_state() if self._source_state else {}
         self.evidence["source_state"] = src
         if src and not all(v is True for k, v in src.items()
@@ -675,7 +753,10 @@ class ScheduledFirstLiveRunner(object):
         self.evidence["handoff_result"] = res
         art = self._collect(res) if self._collect else {}
         self.evidence["handoff_artifact"] = art
-        self._record_from_artifact(art)
+        try:
+            self._record_from_artifact(art)
+        except Exception as e:                                 # noqa: BLE001
+            self._ledger_failed(e)
 
         return self._finish(*self._classify(art))
 
@@ -759,6 +840,13 @@ class ScheduledFirstLiveRunner(object):
                 return (R_AUTHORITY_UNKNOWN_AFTER_DISPATCH,
                         a.get("dispatcher_reason"))
             return R_DISPATCH_UNKNOWN, a.get("dispatcher_reason")
+        # 🔴 C3：restore 被扣住 -> external 仍由我方暫停、責任保留。
+        #    置於 DISPATCH_UNKNOWN / AUTHORITY_UNKNOWN_AFTER_DISPATCH 之後：
+        #    那兩者描述 live leg 本身，仍是 attempt 的主要事實；
+        #    WITHHELD 另由 artifact 的 restore_withheld / manual_attention 保留。
+        if (a.get("handoff_outcome") == R_RESTORE_WITHHELD
+                or a.get("restore_withheld") is True):
+            return R_RESTORE_WITHHELD, a.get("restore_withheld_reason")
         # ---------------- P1  CONTROL FAILURE ----------------
         if do0 == FL.DISPATCH_FAILED:
             return R_DISPATCH_FAILED, a.get("dispatcher_reason")

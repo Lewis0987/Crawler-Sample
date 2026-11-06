@@ -512,7 +512,7 @@ def test_T12_second_restore_blocked():
     o._to(HO.S_PREFLIGHT)
     o._to(HO.S_PAUSE_REQUESTED)
     o._to(HO.S_RESTORE_REQUESTED)
-    s1, w1 = o.request_restore()
+    s1, w1 = o.request_restore(o._issue_restore_clearance("test"))  # GAP-5：ARMED 送出需 C3 clearance（測試以正式核發入口取得）
     s2, w2 = o.request_restore()
     check("★★ T12b. 第一次 restore 送出", s1 is True and len(calls) == 1)
     check("★★ T12b. 第二次被 may_attempt 擋下（不重送）",
@@ -1147,4 +1147,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

@@ -504,4 +504,7 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # 🔴 2026-11-06 GAP-4：boot() 的 C4 需要歷史清單與 runtime index；
+    #    在暫存 C4 環境執行（不碰正式 index / output；HOLD 不解除）。
+    import _phase6_hold_override as _HOLD
+    raise SystemExit(_HOLD.run_main(main, release_hold=False))

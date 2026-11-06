@@ -1774,6 +1774,15 @@ def main(argv=None):
         print(f"[拒絕] --interval 不合法：{args.interval!r}", file=sys.stderr)
         return 2
 
+    # 🔴 C1 FIRST_LIVE_HOLD（2026-11-06）：--execute 會送出真實 PCS 指令，
+    #    HOLD 生效時在**建立任何連線之前**拒絕。不帶 --execute 的量測不受影響。
+    if args.execute:
+        import phase6_handoff_orchestrator as HO                # noqa: PLC0415
+        if HO.first_live_hold_active():
+            print(f"[拒絕] {HO.HOLD_REASON}=True：--execute 在 HOLD 期間不得執行"
+                  "（未建立任何連線、未送出任何指令）。", file=sys.stderr)
+            return 2
+
     out_dir = args.out_dir or _default_out_dir()
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     sample_csv = os.path.join(out_dir, f"pcs_samples_{stamp}.csv")

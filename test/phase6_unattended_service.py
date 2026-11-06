@@ -722,8 +722,12 @@ class UnattendedService(object):
     def __init__(self, journal, instance_guard, sample_source, probe_source,
                  loop_mark_source=None, senders=None, dispatcher=None,
                  mode=HO.MODE_DRY_RUN, soc_max_pct=None, timing=None,
-                 sleeper=None, config=None, clock=None):
+                 sleeper=None, config=None, clock=None,
+                 prior_journal_dir=None):
         self.journal = journal
+        # 🔴 C4：跨 attempt 責任掃描目錄（None = 正式 scheduled journal 目錄）
+        self.prior_journal_dir = prior_journal_dir
+        self.prior_responsibility = None
         self.guard = instance_guard
         self.sample_source = sample_source
         self.probe_source = probe_source
@@ -780,6 +784,15 @@ class UnattendedService(object):
             # 🔴 第二個 instance 一律拒絕啟動，且**不寫 SERVICE_START**
             return BOOT_REFUSED, f"SINGLE_INSTANCE: {why}"
         self.journal.append(EV_SERVICE_START, detail=f"mode={self.mode}")
+
+        # 🔴 C4（2026-11-06）：先前 attempt 的恢復責任未解除 -> 拒絕啟動。
+        #    只讀 journal，**先於**任何 probe；不自動 restore。
+        pv, pdet = HO.scan_prior_responsibility(self.prior_journal_dir)
+        self.prior_responsibility = {"verdict": pv, "journals": pdet}
+        if pv != HO.PRIOR_CLEAR:
+            self.state = BOOT_REFUSED
+            return BOOT_REFUSED, "%s: %s" % (
+                pv, [x["journal"] for x in pdet if x["blocking"]])
 
         probe = self.probe_source()
         # 🔴 recovery 證據只用 PASSIVE_READ_ONLY 的 probe + loopcheck。

@@ -102,6 +102,28 @@ def _art():
     return d
 
 
+def _arm(config):
+    """
+    2026-11-06 GAP-4 fixture：寫一份與 _art() 一致的 handoff journal
+    （pause -> restore -> COMPLETE），落在 C4 暫存環境的 journal 目錄。
+    否則 artifact 宣稱已暫停 / 已恢復、卻沒有 journal，C4 會正確地擋下後續 attempt。
+    """
+    import phase6_handoff_orchestrator as HO
+    aid = (config or {}).get("attempt_id")
+    if aid:
+        j = HO.Journal(path=HO.attempt_journal_path(
+            HO.DEFAULT_SCHEDULED_JOURNAL_DIR, aid), attempt_id=aid)
+        j.append("INTENT", state="PAUSE_REQUESTED", step="PAUSE")
+        j.append("OUTCOME", state="PAUSE_REQUESTED", step="PAUSE", ok=True)
+        j.append("INTENT", state="RESTORE_REQUESTED", step="RESTORE")
+        j.append("OUTCOME", state="RESTORE_REQUESTED", step="RESTORE", ok=True)
+        j.append("STATE", state="RESTORED")
+        j.append("STATE", state="COMPLETE")
+        # 與正式 HandoffRunner 結果相同：journal 實際寫入成功才記 OK
+        return {"outcome": "COMPLETE", "journal_persistence": "OK"}
+    return {"outcome": "COMPLETE"}
+
+
 def validate_provider_definition(config=None):
     if MODE == "validate_fail":
         return False, {"stub_precondition": False}
@@ -123,7 +145,7 @@ def build(config):
             "safety_preflight": (lambda: (True, {"comm": True})),
             "gate_a": gate_a,
             "handoff_readiness": (lambda: (True, {"pause_cap": True})),
-            "arm_and_run_handoff": (lambda: {"outcome": "COMPLETE"}),
+            "arm_and_run_handoff": (lambda: _arm(config)),
             "collect_artifact": (lambda r: _art()),
             "safety_reset": (lambda: {"armed": False}),
             "waiter": (lambda s: None)}
@@ -607,4 +629,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

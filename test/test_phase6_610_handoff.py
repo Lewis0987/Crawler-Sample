@@ -454,7 +454,7 @@ def test_i():
               HO.S_EXTERNAL_PAUSED, HO.S_PHASE6_ACTIVE, HO.S_PHASE6_RELEASING,
               HO.S_PHASE6_RELEASED, HO.S_RESTORE_REQUESTED):
         o2._to(s)
-    ok3, _ = o2.request_restore()
+    ok3, _ = o2.request_restore(o2._issue_restore_clearance("test"))  # GAP-5：ARMED 送出需 C3 clearance（測試以正式核發入口取得）
     check("restore 送出失敗", ok3 is False)
     o2._to(HO.S_RESTORE_FAILED, detail="external 未能恢復")
     check("★★ → RESTORE_FAILED_CRITICAL", o2.state == HO.S_RESTORE_FAILED)
@@ -644,4 +644,7 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    raise SystemExit(_HOLD.run_main(main))

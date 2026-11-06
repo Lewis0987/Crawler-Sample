@@ -262,10 +262,30 @@ def test_A9R_exact_regression():
     check("A9R17 ★★ 判斷門檻一併保存",
           art.get("authority_ttl_sec") == 180.0
           and art.get("authority_power_tolerance_kw") == 1.25)
-    check("A9R18 ★★ external restore 仍恰好一次",
-          env["ssh"].calls.count("restore") == 1)
+    # 🔴 OLD / NEW / WHY（2026-11-06 C3 RESTORE_PRECHECK ＋ P-2）
+    #   OLD : `ssh.calls.count("restore") == 1`（CHARGE 後 authority UNKNOWN
+    #         仍自動恢復 external）。
+    #   NEW : restore **0 次**、RESTORE_WITHHELD、責任保留、MA_REQUIRED，
+    #         且 precheck 明細中 authority_idle 為 False。
+    #   WHY : CHARGE 後控制權 UNKNOWN，無法排除其他控制來源與 Phase 6 殘留
+    #         setpoint；此時恢復 external 可能形成雙重控制或非預期放電。
+    #         這是**收緊**：由「必送一次」改為「條件不明就不送」。
+    _pc = (res.get("restore_precheck") or {}).get("checks") or {}
+    check("A9R18 ★★ external restore 0 次（RESTORE_WITHHELD，不自動恢復）",
+          env["ssh"].calls.count("restore") == 0
+          and res.get("outcome") == "RESTORE_WITHHELD"
+          and h["orchestrator"].state == HO.S_RESTORE_WITHHELD
+          and res.get("restore_responsibility") is True
+          and art.get("manual_attention") == FL.MA_REQUIRED
+          and _pc.get("authority_idle") is False)
     check("A9R19 ★★ authority 已釋放", h["lease"].held is False)
     check("A9R20 ★★ rest state 恢復", rest_ok())
+    # 🔴 A9R21（2026-11-06 新增）：WITHHELD 時不得多送任何指令
+    check("A9R21 ★★ WITHHELD：restore 0 ／PCS STOP 0 ／CHARGE 仍 1 ／"
+          "DISCHARGE 0（未多送任何指令）",
+          env["ssh"].calls.count("restore") == 0
+          and (ch, di, stp) == (1, 0, 0)
+          and int(c.get("phase6_charge", 0) or 0) == 1)
     env["a9"] = art
     return art
 
@@ -288,15 +308,38 @@ def test_R_post_restore():
     check("R5 ★★ reconciliation 未送出任何 PCS 指令",
           rec.get("commands_sent") == {"charge": 0, "discharge": 0,
                                        "pcs_stop": 0})
-    check("R1d ★★ external restore RV_RESUMED ＋ EXTERNAL_RUNNING ＋ 觀測可得"
-          " -> EXTERNAL_TAKEOVER_VERIFIED",
-          art.get("external_takeover") == FL.EXTERNAL_TAKEOVER_VERIFIED
-          and art.get("external_takeover_verified") is True)
-    check("R1e ★★ takeover VERIFIED 仍不得把 live_leg_result 改 SUCCESS",
+    # 🔴 OLD / NEW / WHY（2026-11-06 C3）
+    #   OLD : A9 情境 -> EXTERNAL_TAKEOVER_VERIFIED。
+    #   NEW : A9 情境 restore **未送出** -> EXTERNAL_TAKEOVER_WITHHELD。
+    #         原本對「成功接手」的驗證**保留**於 R1d-N（同一組輸入，純函式）。
+    #   WHY : restore 沒送出，就不可能「接手已驗證」。
+    check("R1d ★★ A9 情境：restore 未送出 -> EXTERNAL_TAKEOVER_WITHHELD"
+          "（不得宣稱 VERIFIED）",
+          art.get("external_takeover") == FL.EXTERNAL_TAKEOVER_WITHHELD
+          and art.get("external_takeover_verified") is False)
+    check("R1e ★★ takeover 結果不得把 live_leg_result 改 SUCCESS",
           art.get("live_leg_result") == FL.LLR_UNKNOWN)
-    check("R1f ★★ takeover VERIFIED -> OPERATOR_REVIEW_RECOMMENDED",
-          art.get("manual_attention") == FL.MA_OPERATOR_REVIEW
-          and art.get("manual_attention_required") is False)
+    # 🔴 OLD：A9 情境 -> OPERATOR_REVIEW_RECOMMENDED、required False。
+    #    NEW：external 仍被我方暫停 -> MANUAL_ATTENTION_REQUIRED。
+    #    原斷言保留於 R1f-N。
+    check("R1f ★★ A9 情境：RESTORE_WITHHELD -> MANUAL_ATTENTION_REQUIRED",
+          art.get("manual_attention") == FL.MA_REQUIRED
+          and art.get("manual_attention_required") is True)
+    check("R1g ★★ A9 情境：PCS 可能仍在 Phase 6 setpoint 的警示保留",
+          art.get("pcs_state_warning")
+          == FL.PCS_MAY_STILL_BE_UNDER_PHASE6_SETPOINT)
+
+    # R1d-N / R1f-N —— 原本的成功接手驗證（與舊 A9 artifact 同一組輸入）
+    vN, cN = FL.evaluate_external_takeover(
+        restore_verifier_state="RESUMED",
+        external_liveness="EXTERNAL_RUNNING",
+        reconciliation={"communication_ok": True, "pcs_state": "STANDBY"})
+    check("R1d-N ★★ external restore RV_RESUMED ＋ EXTERNAL_RUNNING ＋ 觀測可得"
+          " -> EXTERNAL_TAKEOVER_VERIFIED",
+          vN == FL.EXTERNAL_TAKEOVER_VERIFIED and all(cN.values()))
+    maN = FL.evaluate_manual_attention(FL.LLR_UNKNOWN, vN, True, False)[0]
+    check("R1f-N ★★ takeover VERIFIED -> OPERATOR_REVIEW_RECOMMENDED",
+          maN == FL.MA_OPERATOR_REVIEW)
 
     # R2 —— restore UNKNOWN
     v, c2 = FL.evaluate_external_takeover(
@@ -476,4 +519,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

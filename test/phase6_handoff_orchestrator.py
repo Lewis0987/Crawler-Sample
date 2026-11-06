@@ -42,8 +42,11 @@ phase6_handoff_orchestrator.py — Phase 6.10 Unattended Ownership Handoff
 import io
 import os
 import json
+import math
 import time
+import hashlib
 import datetime
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_JOURNAL = os.path.join(os.path.dirname(HERE), "output",
@@ -53,6 +56,28 @@ DEFAULT_JOURNAL = os.path.join(os.path.dirname(HERE), "output",
 # 🔴 FIRST LIVE 尚未完成 —— 本模組結構上不得送出任何實機控制
 # ======================================================================
 DISPATCH_ENABLED = False
+
+# ======================================================================
+# 🔴 C1 FIRST_LIVE_HOLD（2026-11-06 Attempt #10 安全強化）
+# ======================================================================
+#   全專案**唯一**的 HOLD 定義。True = 禁止任何 FIRST LIVE 現場動作：
+#     · launcher：build_dependencies() / ledger / 任何設備 I/O 之前拒絕，不消耗授權
+#     · ScheduledFirstLiveRunner：第一行拒絕，不消耗授權（縱深防禦）
+#     · request_pause()：不寫 INTENT、sender 0 次
+#     · STAGE A entry gate / STAGE B dispatch scope：拒絕
+#     · phase6_field_measure --execute：建立任何連線之前拒絕
+#   🔴 **不提供**環境變數 / 設定檔 / CLI 開關；解除只能由使用者修改本常數並 commit。
+#   🔴 每次都在呼叫當下讀取模組屬性（不在 import 時快取）。
+#   🔴 只有**明確為 False** 才算解除；其他任何值一律視為 HOLD（Fail Closed）。
+#   🔴 `request_restore()` **不受** HOLD 管制 —— restore 由 C3 RESTORE_PRECHECK
+#      把關，HOLD 不得擋住必要的安全收尾。
+FIRST_LIVE_HOLD = True
+HOLD_REASON = "FIRST_LIVE_HOLD"
+
+
+def first_live_hold_active():
+    """HOLD 是否生效。只有 `FIRST_LIVE_HOLD is False` 才回 False。"""
+    return FIRST_LIVE_HOLD is not False
 
 MODE_DRY_RUN = "DRY_RUN"          # 什麼都不送，只跑狀態機與 Gate（預設）
 MODE_OBSERVE = "OBSERVE"          # 只做 fresh read 與 Gate 評估，不進交接
@@ -161,6 +186,11 @@ S_OWNERSHIP_CONFLICT = "OWNERSHIP_CONFLICT_CRITICAL"  # 🔴 兩者同時持有
 S_PAUSE_OUTCOME_UNKNOWN = "PAUSE_OUTCOME_UNKNOWN"
 S_RESTORE_OUTCOME_UNKNOWN = "RESTORE_OUTCOME_UNKNOWN"
 
+# ---- C3. RESTORE_PRECHECK 未通過：**不送** restore，責任保留 ----
+# 🔴 不是失敗也不是完成：external 仍由我方暫停，需人工處理。
+#    同時屬於 TERMINAL（本次 attempt 不再前進）與 PENDING_RESTORE（責任仍在）。
+S_RESTORE_WITHHELD = "RESTORE_WITHHELD"
+
 # 這些狀態代表「我方已暫停 external，尚未恢復」→ 背負 restore 責任
 PENDING_RESTORE_STATES = frozenset({
     S_PAUSE_REQUESTED, S_PAUSE_VERIFYING, S_EXTERNAL_PAUSED,
@@ -169,10 +199,11 @@ PENDING_RESTORE_STATES = frozenset({
     # 🔴 兩個 timeout 不確定狀態一律算「背負責任」—— 寧可多還一次，
     #    也不能因為「可能沒暫停成功」就當作沒事。
     S_PAUSE_OUTCOME_UNKNOWN, S_RESTORE_OUTCOME_UNKNOWN,
+    S_RESTORE_WITHHELD,
 })
 TERMINAL_STATES = frozenset({
     S_COMPLETE, S_ABORTED_PREFLIGHT, S_ABORTED_PAUSE_FAILED,
-    S_RESTORE_FAILED, S_OWNERSHIP_CONFLICT,
+    S_RESTORE_FAILED, S_OWNERSHIP_CONFLICT, S_RESTORE_WITHHELD,
 })
 CRITICAL_STATES = frozenset({S_RESTORE_FAILED, S_OWNERSHIP_CONFLICT})
 
@@ -193,7 +224,7 @@ TRANSITIONS = {
     S_PHASE6_RELEASING: {S_PHASE6_RELEASED, S_OWNERSHIP_CONFLICT},
     S_PHASE6_RELEASED: {S_RESTORE_REQUESTED},
     S_RESTORE_REQUESTED: {S_RESTORE_VERIFYING, S_RESTORE_FAILED,
-                          S_RESTORE_OUTCOME_UNKNOWN},
+                          S_RESTORE_OUTCOME_UNKNOWN, S_RESTORE_WITHHELD},
     # 同理：restore 逾時也只能先觀測。不得直接重送 restore。
     S_RESTORE_OUTCOME_UNKNOWN: {S_RESTORE_VERIFYING, S_RESTORE_FAILED},
     S_RESTORE_VERIFYING: {S_RESTORED, S_RESTORE_FAILED},
@@ -203,6 +234,8 @@ TRANSITIONS = {
     S_ABORTED_PAUSE_FAILED: set(),
     S_RESTORE_FAILED: set(),
     S_OWNERSHIP_CONFLICT: {S_RESTORE_REQUESTED},   # 人工處置後仍需歸還
+    # 🔴 WITHHELD 沒有任何出口：本次 attempt 不得自行再嘗試 restore
+    S_RESTORE_WITHHELD: set(),
 }
 
 
@@ -526,7 +559,10 @@ def _entry_gate_authorizes(permit):
     🔴 只呼叫 `permit.allows_dispatcher_entry()`（duck typing，避免循環 import）。
     🔴 Fail Closed：None / 沒有該方法 / 呼叫拋例外 / 回傳非 True 一律 False。
     🔴 **不得**改用 `authorizes()`（那是含 authority 的 STAGE B）。
+    🔴 C1：FIRST_LIVE_HOLD 生效時一律拒絕（先於 permit 評估）。
     """
+    if first_live_hold_active():
+        return False, HOLD_REASON
     if permit is None:
         return False, "未提供 permit"
     fn = getattr(permit, "allows_dispatcher_entry", None)
@@ -737,6 +773,42 @@ class OnceGuard(object):
 
 
 # ======================================================================
+# GAP-5. RestoreClearance（2026-11-06）
+# ======================================================================
+# 🔴 `request_restore()` 本身也必須有 C3 把關，不能只靠唯一呼叫點。
+#    clearance 只由 `HandoffRunner._restore_gate()` 在 RESTORE_PRECHECK 與
+#    送出前重新確認**都通過後**核發，綁定：
+#      attempt_id / orchestrator / 檢查結果 digest / 核發時間
+#    並且一次性、逾時（RESTORE_PRECHECK_MAX_AGE_SEC）即失效。
+# 🔴 Python 無法阻止刻意自行建立物件：這是防止**意外**直接呼叫的結構把關，
+#    不是對惡意程式碼的保護（與 GAP-1 同類限制）。
+RESTORE_PRECHECK_REQUIRED = "RESTORE_PRECHECK_REQUIRED"
+
+
+class RestoreClearance(object):
+    """C3 通過證明。**只能由 orchestrator._issue_restore_clearance() 建立。**"""
+
+    def __init__(self, orchestrator, attempt_id, checks_digest, issued_mono):
+        self.orchestrator = orchestrator
+        self.attempt_id = attempt_id
+        self.checks_digest = checks_digest
+        self.issued_mono = issued_mono
+        self.used = False
+
+    def as_dict(self):
+        return {"attempt_id": self.attempt_id,
+                "checks_digest": self.checks_digest,
+                "issued_mono": self.issued_mono, "used": self.used}
+
+
+def restore_checks_digest(precheck_checks, recheck_checks):
+    """檢查結果的 sha256（排序後 JSON）——clearance 綁定用。"""
+    body = json.dumps({"precheck": precheck_checks, "recheck": recheck_checks},
+                      sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(body.encode("ascii")).hexdigest()
+
+
+# ======================================================================
 # Orchestrator
 # ======================================================================
 class HandoffOrchestrator(object):
@@ -772,6 +844,11 @@ class HandoffOrchestrator(object):
         self.history = [S_IDLE]
         self.guard = OnceGuard(journal)
         self.failure_reason = None
+        # 🔴 GAP-5：restore 的一次性 clearance 與互斥鎖（RLock：同執行緒重入
+        #    也會進到驗證，看到 clearance 已用過 / 已 attempted 而被拒絕）
+        self._restore_lock = threading.RLock()
+        self._issued_clearance = None
+        self._issued_digest = None
 
     # ---- 狀態轉移（白名單 ＋ 稽核）----
     def _to(self, new_state, detail=None, **extra):
@@ -814,7 +891,11 @@ class HandoffOrchestrator(object):
         送出 external pause。**責任在送出前就以 journal 記下**。
 
         🔴 DRY_RUN / OBSERVE 一律不真的送 —— 回 (False, 原因)。
+        🔴 C1：FIRST_LIVE_HOLD 生效時**最先**拒絕 —— 不寫 INTENT、
+           不標記 attempted、sender 0 次，因此不會產生任何恢復責任。
         """
+        if first_live_hold_active():
+            return False, HOLD_REASON
         step = "PAUSE"
         if not self.guard.may_attempt(step):
             return False, "ALREADY_ATTEMPTED_MUST_VERIFY_NOT_RESEND"
@@ -884,7 +965,43 @@ class HandoffOrchestrator(object):
                 and observation.get("authority") != "EXTERNAL_OR_UNKNOWN")
 
     # ---- 步驟：restore ----
-    def request_restore(self):
+    def _issue_restore_clearance(self, checks_digest):
+        """
+        🔴 GAP-5：核發 restore clearance。正式程式**只有**
+           `HandoffRunner._restore_gate_inner()` 會呼叫（AST regression 驗證）。
+        """
+        with self._restore_lock:
+            c = RestoreClearance(self, getattr(self.journal, "attempt_id", None),
+                                 checks_digest, self._clock())
+            self._issued_clearance = c
+            self._issued_digest = str(checks_digest)
+            return c
+
+    def _clearance_ok(self, clearance):
+        """回傳 (ok, why)。任何無法確認一律 False。"""
+        if not isinstance(clearance, RestoreClearance):
+            return False, "未提供 clearance"
+        if clearance is not self._issued_clearance:
+            return False, "clearance 不是本 orchestrator 最近核發者"
+        if clearance.orchestrator is not self:
+            return False, "clearance 屬於其他 orchestrator"
+        if clearance.attempt_id != getattr(self.journal, "attempt_id", None):
+            return False, "clearance attempt_id 不符"
+        if clearance.used:
+            return False, "clearance 已使用過"
+        if clearance.checks_digest != self._issued_digest:
+            return False, "clearance 檢查結果 digest 不符"
+        try:
+            age = self._clock() - clearance.issued_mono
+        except Exception:                                      # noqa: BLE001
+            return False, "clearance 時效無法判定"
+        if (isinstance(age, bool) or not isinstance(age, (int, float))
+                or not math.isfinite(age) or age < 0
+                or age > RESTORE_PRECHECK_MAX_AGE_SEC):
+            return False, "clearance 逾時或時效無法判定（age=%r）" % (age,)
+        return True, None
+
+    def request_restore(self, clearance=None):
         """
         送出 external restore。**與 request_pause 對稱：ONE ATTEMPT ONLY。**
 
@@ -892,30 +1009,42 @@ class HandoffOrchestrator(object):
            之後也**不會盲目重送** —— 已嘗試過就只能以觀測驗證結果。
         🔴 `SEND_SENT` 與 `SEND_UNKNOWN` 皆**不得**自動重送；
            第二次呼叫一律擋下，由呼叫端走 RESTORE_FAILED_CRITICAL（責任保留）。
+        🔴 GAP-5：ARMED 送出前必須持有有效的 `RestoreClearance`；
+           不符 -> RESTORE_PRECHECK_REQUIRED（不寫 INTENT、不標記 attempted、
+           sender 0 次）。clearance **先消耗再送出**；整段在鎖內執行。
         """
-        step = "RESTORE"
-        if not self.guard.may_attempt(step):
-            return False, "ALREADY_ATTEMPTED_MUST_VERIFY_NOT_RESEND"
-        if self.mode != MODE_ARMED:
-            return False, f"MODE_{self.mode}_WILL_NOT_SEND"
-        if self.journal is not None:
-            self.journal.append("INTENT", state=self.state, step=step,
-                                detail=f"即將送出 external {RESTORE_COMMAND}")
-        self.guard.mark_attempt(step)
-        outcome, why2 = self.remote.send_restore_ex()
-        ok = (outcome == SEND_SENT)
-        if self.journal is not None:
-            self.journal.append(
-                "OUTCOME", state=self.state, step=step,
-                detail=f"send_restore -> {outcome}"
-                       + (f" ({why2})" if why2 else ""),
-                ok=(True if ok else (None if outcome == SEND_UNKNOWN else False)),
-                send_outcome=outcome)
-        if ok:
-            self.guard.mark_confirmed(step)
-        if outcome == SEND_UNKNOWN:
-            return False, "SEND_OUTCOME_UNKNOWN_MUST_PROBE"
-        return ok, None
+        with self._restore_lock:
+            step = "RESTORE"
+            if not self.guard.may_attempt(step):
+                return False, "ALREADY_ATTEMPTED_MUST_VERIFY_NOT_RESEND"
+            if self.mode != MODE_ARMED:
+                return False, f"MODE_{self.mode}_WILL_NOT_SEND"
+            ok_c, why_c = self._clearance_ok(clearance)
+            if not ok_c:
+                return False, "%s: %s" % (RESTORE_PRECHECK_REQUIRED, why_c)
+            clearance.used = True
+            self._issued_clearance = None
+            self._issued_digest = None
+            if self.journal is not None:
+                self.journal.append("INTENT", state=self.state, step=step,
+                                    detail=f"即將送出 external {RESTORE_COMMAND}",
+                                    restore_clearance_digest=(
+                                        clearance.checks_digest))
+            self.guard.mark_attempt(step)
+            outcome, why2 = self.remote.send_restore_ex()
+            ok = (outcome == SEND_SENT)
+            if self.journal is not None:
+                self.journal.append(
+                    "OUTCOME", state=self.state, step=step,
+                    detail=f"send_restore -> {outcome}"
+                           + (f" ({why2})" if why2 else ""),
+                    ok=(True if ok else (None if outcome == SEND_UNKNOWN else False)),
+                    send_outcome=outcome)
+            if ok:
+                self.guard.mark_confirmed(step)
+            if outcome == SEND_UNKNOWN:
+                return False, "SEND_OUTCOME_UNKNOWN_MUST_PROBE"
+            return ok, None
 
     def verify_restore(self, probe):
         """restore 驗證。回傳 (ok, checks)。"""
@@ -1007,7 +1136,13 @@ Step 2 成功後，在 RESTORED 之前的任何失敗都必須保留 RESTORE RES
 PRE_PAUSE_ITEMS = ("soc_fresh", "meter_fresh", "ess_fresh", "tou_off_peak",
                    "soc_in_charge_band", "decision_is_charge", "comm_ok",
                    "fault_clear", "alarm_clear", "external_runtime_healthy",
-                   "external_behaviour_known")
+                   "external_behaviour_known", "external_loop_running")
+
+# 🔴 必須與 `phase6_remote_adapter.EXT_RUNNING / EXT_NOT_RUNNING` 完全一致。
+#    本模組在 import 時不載入 remote adapter，因此以字面值宣告，
+#    並由 regression 斷言兩者相等。
+EXT_RUNNING_VERDICT = "EXTERNAL_RUNNING"
+EXT_NOT_RUNNING_VERDICT = "EXTERNAL_NOT_RUNNING"
 
 # 🔴 這三項**不得**出現在 pre-pause：留成常數讓回歸可以直接驗。
 PRE_PAUSE_MUST_NOT_REQUIRE = ("authority_idle", "pcs_idle",
@@ -1037,6 +1172,12 @@ def pre_pause_gates(sample, probe, soc_max_pct):
                                      and probe.get("process_alive") is True
                                      and probe.get("process_identity_ok") is True),
         "external_behaviour_known": sample.get("external_behaviour_known") is True,
+        # 🔴 C2（2026-11-06）：交接前 external loop 必須**正在前進**。
+        #    KNOWN 不等於 RUNNING —— 人工停止的 controller（NOT_RUNNING）
+        #    若被我方 pause 再 restore，等於替人重新啟動它。
+        #    `external_behaviour_known` 的既有定義**不變**；本項是新增條件。
+        "external_loop_running": (sample.get("external_liveness_verdict")
+                                  == EXT_RUNNING_VERDICT),
     }
     return all(checks.values()), checks
 
@@ -1057,8 +1198,1020 @@ def post_pause_precheck(sample, probe):
         "alarm_clear": sample.get("critical_alarms") == 0,
         "external_runtime_healthy": (probe.get("screen_alive") is True
                                      and probe.get("process_alive") is True),
+        # 🔴 C7（2026-11-06）：暫停後也必須確認仍是同一身分的 controller。
+        #    只是**必要條件**，不代表已證明前景或唯一控制器。
+        "process_identity_ok": probe.get("process_identity_ok") is True,
     }
     return all(checks.values()), checks
+
+
+# ======================================================================
+# C3. RESTORE_PRECHECK（2026-11-06 Attempt #10 安全強化）
+# ======================================================================
+# 🔴 restore 不再是「責任成立就一定送」。external controller 恢復後會依
+#    自己的 policy 控制 PCS；條件不明時恢復它，可能形成雙重控制或非預期放電。
+#    任一項不成立 -> **不送** restore -> S_RESTORE_WITHHELD（責任保留、需人工）。
+#
+# P-1 時段 / P-8 PCS 狀態 / 30 秒時效：已核准政策常數集中在
+#     `phase6_restore_policy`（本模組維持「不硬編碼任何時刻」的既有契約）。
+from phase6_restore_policy import (                            # noqa: E402
+    RESTORE_WINDOW_START, RESTORE_WINDOW_END, RESTORE_ALLOWED_PCS_STATES,
+    RESTORE_PRECHECK_MAX_AGE_SEC, in_restore_window,
+    RESTORE_TIME_UTC_OFFSET, HOST_CLOCK_MAX_SKEW_SEC,
+    WALL_MONO_MAX_DRIFT_SEC)
+
+# 🔴 GAP-2 Phase 6 authority lease 釋放狀態
+LS_NEVER_HELD = "NEVER_HELD"
+LS_RELEASED = "RELEASED"
+LS_RELEASE_UNKNOWN = "RELEASE_UNKNOWN"
+LS_RELEASE_NOT_ATTEMPTED = "RELEASE_NOT_ATTEMPTED"
+LS_STILL_HELD = "STILL_HELD"
+# 單元測試的簡易 dispatcher 沒有 lease；production provider 一律有 lease。
+LS_NO_LEASE_OBJECT = "NO_LEASE_OBJECT"
+LS_RELEASED_OK = frozenset({LS_NEVER_HELD, LS_RELEASED, LS_NO_LEASE_OBJECT})
+
+# 🔴 GAP-3 持久化狀態（journal / ledger / runtime index 共用詞彙）
+JP_OK = "OK"
+JP_FAILED = "FAILED"
+JP_NOT_ATTEMPTED = "NOT_ATTEMPTED"
+PERSISTED = "PERSISTED"
+PERSISTED_PARTIAL = "PARTIAL"
+CRITICAL_NOT_PERSISTED = "CRITICAL_NOT_PERSISTED"
+
+
+def persistence_summary(journal=JP_NOT_ATTEMPTED, ledger=JP_NOT_ATTEMPTED,
+                        index=JP_NOT_ATTEMPTED):
+    """
+    三種持久化結果 -> (overall, detail)。
+
+    🔴 只有實際寫入成功（含 fsync）才算 OK；其他一律不得視為已保存。
+    🔴 沒有任何一項 OK（全部失敗或全部未嘗試）-> CRITICAL_NOT_PERSISTED。
+    """
+    d = {"journal": journal, "ledger": ledger, "index": index}
+
+    def _ok(v):
+        return v == JP_OK
+    oks = [k for k, v in d.items() if _ok(v)]
+    attempted = [k for k, v in d.items() if v != JP_NOT_ATTEMPTED]
+    if not oks:
+        return CRITICAL_NOT_PERSISTED, d
+    if len(oks) == len(attempted):
+        return PERSISTED, d
+    return PERSISTED_PARTIAL, d
+
+
+RESTORE_PRECHECK_ITEMS = (
+    "time_basis_ok", "time_order_ok", "restore_window", "tou_off_peak", "pcs_idle_state", "fault_clear",
+    "alarm_clear", "comm_ok", "fresh", "phase6_released", "authority_idle",
+    "probe_complete", "external_runtime_healthy", "pid_unchanged",
+    "external_still_paused")
+# 送出前一刻的快速重新確認：不收 loop 時間戳，因此不含 external_still_paused。
+RESTORE_RECHECK_ITEMS = tuple(k for k in RESTORE_PRECHECK_ITEMS
+                              if k != "external_still_paused")
+
+
+def _restore_time_checks(sample, now):
+    """
+    🔴 GAP-6：TOU 與時段同一時間基準。回傳 (time_basis_ok, time_order_ok,
+       restore_window)。
+
+    `sample["tou_sampled_between"]` 由 provider 在 `bundle.observe()`（TOU 判定處）
+    的**前後**各記錄一次：
+        before / after       : aware datetime（與 TOU 同一來源，Asia/Taipei）
+        mono_before / mono_after : time.monotonic()
+        host_before          : 主機本機 naive 時間（偵測 Windows 時區錯誤）
+    TOU 判定的時刻必落在 [before, after]；三個時間點（before / after / now）
+    全部在 00:00–05:30 內，且 00:00–05:30 完全落在 OFF_PEAK 內 ->
+    TOU 與時段在構造上一致。任一缺失 / 型別不符 / 倒退 / 漂移 -> False。
+    """
+    tb = sample.get("tou_sampled_between") if isinstance(sample, dict) else None
+    if not isinstance(tb, dict):
+        return False, False, False
+    b, a = tb.get("before"), tb.get("after")
+    pts = (b, a, now)
+    basis = all(isinstance(t, datetime.datetime) and t.tzinfo is not None
+                and t.utcoffset() == RESTORE_TIME_UTC_OFFSET for t in pts)
+    hb = tb.get("host_before")
+    if basis:
+        basis = (isinstance(hb, datetime.datetime) and hb.tzinfo is None
+                 and abs((hb - b.replace(tzinfo=None)).total_seconds())
+                 <= HOST_CLOCK_MAX_SKEW_SEC)
+    if not basis:
+        return False, False, False
+    mb, ma = tb.get("mono_before"), tb.get("mono_after")
+    order = (b <= a <= now
+             and isinstance(mb, (int, float)) and isinstance(ma, (int, float))
+             and not isinstance(mb, bool) and not isinstance(ma, bool)
+             and math.isfinite(mb) and math.isfinite(ma) and ma >= mb
+             and abs((a - b).total_seconds() - (ma - mb))
+             <= WALL_MONO_MAX_DRIFT_SEC)
+    window = all(in_restore_window(t) for t in pts)
+    return basis, bool(order), window
+
+
+def restore_precheck(sample, probe, pid0, lease_released, now,
+                     require_liveness=True):
+    """
+    C3 RESTORE_PRECHECK。**純函式**，回傳 (ok, checks)。
+
+    sample          : HandoffRunner 的 fresh 取樣（含 tou / pcs_state / authority /
+                      fault / critical_alarms / comm_ok / fresh /
+                      external_liveness_verdict）
+    probe           : fresh remote probe
+    pid0            : 交接前記錄的 controller pid（C7）
+    lease_released  : Phase 6 authority lease 是否已釋放
+    now             : 判定時段用的本機時間（與 sample 同一時刻取得）
+    require_liveness: False = 送出前快速重新確認（不含 loop 證據）
+
+    🔴 全部成立才可送出；單獨「離峰」或「PCS 非放電」都不足以送出。
+    🔴 external 必須**仍是我方的暫停**（NOT_RUNNING）：RUNNING 代表有人先恢復了，
+       UNKNOWN 代表無法判定，兩者都不送。
+    """
+    from phase6_remote_adapter import _as_remote_probe
+    s = sample if isinstance(sample, dict) else {}
+    pr = probe if isinstance(probe, dict) else {}
+    rp = _as_remote_probe(probe)
+    basis, order, window = _restore_time_checks(s, now)
+    checks = {
+        "time_basis_ok": basis,
+        "time_order_ok": order,
+        "restore_window": window and order,
+        "tou_off_peak": s.get("tou") == "OFF_PEAK",
+        "pcs_idle_state": s.get("pcs_state") in RESTORE_ALLOWED_PCS_STATES,
+        "fault_clear": s.get("fault") is False,
+        "alarm_clear": s.get("critical_alarms") == 0,
+        "comm_ok": s.get("comm_ok") is True,
+        "fresh": s.get("fresh") is True,
+        "phase6_released": lease_released is True,
+        "authority_idle": s.get("authority") == "IDLE",
+        "probe_complete": rp is not None and rp.known,
+        "external_runtime_healthy": rp is not None and rp.healthy,
+        "pid_unchanged": (pid0 is not None and pid0 != ""
+                          and pr.get("pid") == pid0),
+    }
+    if require_liveness:
+        checks["external_still_paused"] = (
+            s.get("external_liveness_verdict") == EXT_NOT_RUNNING_VERDICT)
+    return all(checks.values()), checks
+
+
+# ======================================================================
+# C4. 跨 Attempt 恢復責任阻擋 ＋ C5. 人工確認（2026-11-06）
+# ======================================================================
+# 🔴 C4 **只讀 journal**，不做任何設備 I/O，也**刻意不採用** `recover()`
+#    「遠端在跑就判定已解除」的規則 —— 人工恢復後也必須留下 C5 確認紀錄。
+# 🔴 C5 確認寫在**獨立**的 append-only 檔案，不修改原 journal，
+#    因此可綁定 journal 的 last seq 與 sha256；journal 之後若有任何新增，
+#    確認即失效。
+# 🔴 C5 只是**責任紀錄（accountability），不是身分驗證**；
+#    效果**只有**解除 C4 對該 journal 的阻擋：
+#      不解除 FIRST_LIVE_HOLD、不送 restore、不略過下一次 attempt 的任何檢查。
+DEFAULT_SCHEDULED_JOURNAL_DIR = os.path.join(
+    os.path.dirname(HERE), "output", "phase6_scheduled_first_live")
+MANUAL_RESOLUTION_PREFIX = "manual_resolution_"
+MANUAL_RESOLUTION_KIND = "MANUAL_RESOLUTION"
+MANUAL_RESOLUTION_EVIDENCE_MAX_AGE_SEC = 300.0
+MANUAL_RESOLUTION_MIN_REASON_LEN = 10
+
+PRIOR_CLEAR = "PRIOR_CLEAR"
+PRIOR_UNRESOLVED = "PRIOR_RESPONSIBILITY_UNRESOLVED"
+
+# journal 最後狀態落在這些 -> 責任可能仍在
+_PRIOR_BLOCKING_STATES = (PENDING_RESTORE_STATES | CRITICAL_STATES
+                          | frozenset({S_RESTORE_WITHHELD}))
+# 有 PAUSE INTENT 時，只有這些最後狀態代表責任已明確了結
+_PRIOR_PAUSE_SETTLED_STATES = frozenset({
+    S_COMPLETE, S_RESTORED, S_ABORTED_PREFLIGHT, S_ABORTED_PAUSE_FAILED})
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with io.open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_journal_strict(path):
+    """嚴格讀取：任何一行無法解析 -> (None, 原因)。不建立目錄、不寫檔。"""
+    recs = []
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    return None, "第 %d 行無法解析" % n
+                if not isinstance(rec, dict):
+                    return None, "第 %d 行不是物件" % n
+                recs.append(rec)
+    except (OSError, UnicodeDecodeError) as e:
+        return None, "讀取失敗：%s" % type(e).__name__
+    return recs, None
+
+
+def _journal_attempt_id(path):
+    name = os.path.basename(path)
+    if (name.startswith(ATTEMPT_JOURNAL_PREFIX)
+            and name.endswith(".jsonl")):
+        return name[len(ATTEMPT_JOURNAL_PREFIX):-len(".jsonl")] or None
+    return None
+
+
+def manual_resolution_path(base_dir, attempt_id):
+    """C5 確認紀錄路徑；與 journal 同目錄、由 attempt_id 決定。"""
+    jp = attempt_journal_path(base_dir, attempt_id)
+    return os.path.join(base_dir, MANUAL_RESOLUTION_PREFIX
+                        + os.path.basename(jp)[len(ATTEMPT_JOURNAL_PREFIX):])
+
+
+def evaluate_journal_responsibility(records):
+    """
+    單一 journal 的責任判定（純函式）。回傳 (blocking, last_state, why)。
+    """
+    last, paused = None, False
+    for rec in records:
+        if rec.get("state"):
+            last = rec["state"]
+        step, kind = rec.get("step"), rec.get("kind")
+        if kind == "INTENT" and step == "PAUSE":
+            paused = True
+        elif kind == "OUTCOME" and step == "RESTORE" and rec.get("ok") is True:
+            paused = False
+    if last in _PRIOR_BLOCKING_STATES:
+        return True, last, "最後狀態 %s -> 恢復責任未解除" % last
+    if paused and last not in _PRIOR_PAUSE_SETTLED_STATES:
+        return True, last, "有 PAUSE INTENT 但未完成歸還（最後狀態 %s）" % last
+    return False, last, "已收斂"
+
+
+def _valid_resolution(base_dir, attempt_id, target_kind, target_sha,
+                      last_seq=None):
+    """
+    該目標是否有**仍然有效**的 C5 確認。回傳 (ok, why)。
+
+    target_kind：JOURNAL / LEDGER / INDEX_ENTRY。確認必須綁定同一份目標的
+    sha256（JOURNAL 另外綁定 last seq）；目標之後有任何變動即失效。
+    🔴 INDEX_ENTRY 綁定 `_index_entry_digest()`（該 attempt 的**全部** index
+       紀錄 ＋ 其 ledger / journal sha256），且必須是同一個 digest scheme ——
+       舊版（整份 index sha256）的確認一律不再生效。
+    """
+    if not attempt_id:
+        return False, "沒有 attempt_id，無法對應確認紀錄"
+    try:
+        rp = manual_resolution_path(base_dir, attempt_id)
+    except ValueError:
+        return False, "attempt_id 不合法"
+    if not os.path.exists(rp):
+        return False, "沒有人工確認紀錄"
+    recs, err = _read_journal_strict(rp)
+    if recs is None:
+        return False, "人工確認紀錄損毀：%s" % err
+    for rec in reversed(recs):
+        if rec.get("kind") != MANUAL_RESOLUTION_KIND:
+            continue
+        kind = rec.get("target_kind") or ACK_TARGET_JOURNAL
+        if kind != target_kind:
+            continue
+        sha = (rec.get("journal_sha256") if kind == ACK_TARGET_JOURNAL
+               else rec.get("target_sha256"))
+        if (rec.get("attempt_id") == attempt_id and sha == target_sha
+                and (kind != ACK_TARGET_JOURNAL
+                     or rec.get("journal_last_seq") == last_seq)
+                and (kind != ACK_TARGET_INDEX_ENTRY
+                     or rec.get("target_digest_scheme")
+                     == INDEX_ENTRY_DIGEST_SCHEME)):
+            return True, "有效確認（%s @ %s）" % (rec.get("operator"),
+                                                rec.get("ack_at"))
+        return False, "最後一筆確認已與目標不一致（目標之後有變動）"
+    return False, "沒有人工確認紀錄"
+
+
+# ======================================================================
+# GAP-4（2026-11-06）：歷史清單 ＋ runtime index ＋ ledger 交叉比對
+# ======================================================================
+# 🔴 不依賴同一個 journal / ledger 目錄的兩個獨立來源：
+#    ① Git 追蹤的歷史清單（執行時唯讀）：列出所有既有歷史檔與 sha256。
+#       檔案缺失或 sha 不符 -> UNRESOLVED（目錄被清空也一定擋下）。
+#       #3 / #4 的歷史例外預設 PENDING_USER_APPROVAL，**只有**使用者改成
+#       APPROVED 並 commit 後才生效。
+#    ② runtime index（固定絕對路徑，不在 output、不在 Git 工作目錄）：
+#       不存在 / 損毀 / 身分或 ACL 不符 -> UNRESOLVED；**不會自動初始化**。
+#       launcher 在 build_dependencies 之前登錄 ATTEMPT_REGISTERED，
+#       結束時寫 ATTEMPT_CLOSED；CLOSED 只是需要交叉驗證的聲明。
+# 🔴 路徑是程式常數，**不接受**設定檔或環境變數覆寫。
+HISTORY_MANIFEST_PATH = os.path.join(HERE, "phase6_attempt_history.json")
+RUNTIME_INDEX_PATH = r"C:\ProgramData\Phase6FirstLive\attempt_index.jsonl"
+HISTORY_MANIFEST_KIND = "PHASE6_ATTEMPT_HISTORY_MANIFEST"
+INDEX_INIT = "INDEX_INIT"
+INDEX_REGISTERED = "ATTEMPT_REGISTERED"
+INDEX_CLOSED = "ATTEMPT_CLOSED"
+APPROVAL_PENDING = "PENDING_USER_APPROVAL"
+APPROVAL_APPROVED = "APPROVED"
+ACK_TARGET_JOURNAL = "JOURNAL"
+ACK_TARGET_LEDGER = "LEDGER"
+ACK_TARGET_INDEX_ENTRY = "INDEX_ENTRY"
+# 🔴 INDEX_ENTRY 確認的綁定方式（不綁整份 index：其他 attempt 追加不影響）
+INDEX_ENTRY_DIGEST_SCHEME = "INDEX_ENTRY_V2_ATTEMPT_RECORDS"
+# index ACL 允許的 SID：初始化帳號 ＋ SYSTEM ＋ Administrators
+ACL_BUILTIN_ALLOWED_SIDS = ("S-1-5-18", "S-1-5-32-544")
+# 🔴 必須與 `phase6_scheduled_first_live.OneShotLedger` 的紀錄種類一致
+#    （regression 斷言）；本模組不 import scheduled 模組，避免循環。
+LEDGER_KINDS = ("LIFECYCLE", "INTENT", "OUTCOME", "CONSUMED")
+LEDGER_PENDING_LIFECYCLE = ("EXTERNAL_PAUSE_RESPONSIBILITY",
+                            "PHASE6_AUTHORITY", "LIVE_LEG",
+                            "PHASE6_RELEASED", "RESTORE_PENDING")
+# CLOSED 結果本身就代表責任未解除
+CLOSED_BLOCKING_RESULTS = ("RESTORE_WITHHELD", "RESTORE_UNKNOWN",
+                           "RESTORE_FAILED", "PAUSE_UNKNOWN",
+                           "DISPATCH_UNKNOWN")
+
+
+def _hex64(v):
+    return (isinstance(v, str) and len(v) == 64
+            and all(c in "0123456789abcdef" for c in v))
+
+
+def _index_entry_digest(attempt_id, records, ledger_path, journal_path):
+    """
+    🔴 缺陷 A 修正：INDEX_ENTRY 確認的綁定對象。
+
+    該 attempt 在 index 中的**全部**紀錄（依檔案順序、canonical JSON）
+    ＋ 其登錄的 ledger / journal 目前的 sha256（不存在為 None）。
+    其他 attempt 追加紀錄不影響；同一 attempt 任何新增 / 修改 / 刪除、
+    或其 ledger / journal 變動都會改變 digest（確認失效）。
+    """
+    import hashlib
+
+    def _fsha(p):
+        return _sha256_file(p) if p and os.path.isfile(p) else None
+    body = json.dumps({"scheme": INDEX_ENTRY_DIGEST_SCHEME,
+                       "attempt_id": attempt_id,
+                       "records": list(records),
+                       "ledger_sha256": _fsha(ledger_path),
+                       "journal_sha256": _fsha(journal_path)},
+                      sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"), default=str)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _same_file(a, b):
+    """
+    🔴 缺陷 B 修正：以**實際檔案身分**比對（不是 attempt_id、不是字串）。
+    兩者都存在 -> os.path.samefile（同一檔案不同寫法 / 大小寫 / 相對路徑）；
+    兩者都不存在 -> 正規化後的絕對路徑；只有一方存在或無法判定 -> False。
+    """
+    if not a or not b:
+        return False
+    try:
+        ea, eb = os.path.exists(a), os.path.exists(b)
+        if ea and eb:
+            return os.path.samefile(a, b)
+        if ea or eb:
+            return False
+        return (os.path.normcase(os.path.realpath(os.path.abspath(a)))
+                == os.path.normcase(os.path.realpath(os.path.abspath(b))))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def load_history_manifest(path=None):
+    """回傳 (manifest, err)。任何格式問題 -> (None, 原因)。"""
+    p = path or HISTORY_MANIFEST_PATH
+    try:
+        with io.open(p, encoding="utf-8") as f:
+            m = json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        return None, "歷史清單無法讀取：%s" % type(e).__name__
+    if not isinstance(m, dict) or m.get("kind") != HISTORY_MANIFEST_KIND \
+            or m.get("schema_version") != 1:
+        return None, "歷史清單格式不符"
+    files = m.get("files")
+    if not isinstance(files, list):
+        return None, "歷史清單缺少 files"
+    for f in files:
+        if not (isinstance(f, dict) and isinstance(f.get("path"), str)
+                and f["path"] and os.path.basename(f["path"]) == f["path"]
+                and _hex64(f.get("sha256"))):
+            return None, "歷史清單 files 項目不合法：%r" % (f,)
+    exc = m.get("exceptions", [])
+    if not isinstance(exc, list):
+        return None, "歷史清單 exceptions 不合法"
+    for e in exc:
+        if not isinstance(e, dict):
+            return None, "歷史例外不合法"
+        for k in ("attempt_id", "correlation", "reason"):
+            if not isinstance(e.get(k), str) or not e[k].strip():
+                return None, "歷史例外缺少 %s" % k
+        if e.get("approval") not in (APPROVAL_PENDING, APPROVAL_APPROVED):
+            return None, "歷史例外 approval 不合法：%r" % (e.get("approval"),)
+        if not isinstance(e.get("evidence"), list) or not e["evidence"]:
+            return None, "歷史例外缺少 evidence"
+        for ev in e["evidence"]:
+            if not (isinstance(ev, dict) and isinstance(ev.get("path"), str)
+                    and _hex64(ev.get("sha256"))):
+                return None, "歷史例外 evidence 不合法"
+        if not isinstance(e.get("limitations"), list):
+            return None, "歷史例外缺少 limitations"
+        if e["approval"] == APPROVAL_APPROVED and not (
+                e.get("approved_by") and e.get("approved_at")):
+            return None, "APPROVED 必須附 approved_by / approved_at"
+    return m, None
+
+
+def _host():
+    """主機查詢模組（whoami / Get-Acl / icacls）。本模組維持零 subprocess 相依。"""
+    import importlib
+    return importlib.import_module("phase6_runtime_index_host")
+
+
+def _current_identity():
+    """目前執行帳號 SID ＋ 主機名稱。取不到 -> None（Fail Closed）。"""
+    try:
+        return _host().current_identity()
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def _read_acl_sids(path):
+    """檔案 ACL 的 (SID, Allow/Deny) 清單。讀不到 -> None（Fail Closed）。"""
+    try:
+        return _host().read_acl_sids(path)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def load_runtime_index(path=None, identity=None, acl_reader=None):
+    """
+    回傳 (records, err)。**不建立、不初始化、不修改** index。
+
+    🔴 不存在 / 損毀 / 第一筆不是唯一的 INDEX_INIT / 身分（SID、主機名稱）不符 /
+       ACL 有不允許的 Allow 項目或讀不到 -> (None, 原因)。
+    """
+    p = path or RUNTIME_INDEX_PATH
+    if not os.path.isfile(p):
+        return None, "runtime index 不存在（不會自動初始化）"
+    recs, err = _read_journal_strict(p)
+    if recs is None:
+        return None, "runtime index 損毀：%s" % err
+    inits = [r for r in recs if r.get("kind") == INDEX_INIT]
+    if not recs or recs[0].get("kind") != INDEX_INIT or len(inits) != 1:
+        return None, "runtime index 缺少唯一的初始化紀錄"
+    for r in recs[1:]:
+        if r.get("kind") not in (INDEX_REGISTERED, INDEX_CLOSED):
+            return None, "runtime index 有未知紀錄：%r" % (r.get("kind"),)
+        if not isinstance(r.get("attempt_id"), str) or not r["attempt_id"]:
+            return None, "runtime index 紀錄缺少 attempt_id"
+    ident = identity if identity is not None else _current_identity()
+    init = recs[0]
+    if not ident or init.get("sid") != ident.get("sid") \
+            or init.get("hostname") != ident.get("hostname"):
+        return None, "runtime index 身分不符（SID / 主機名稱）"
+    rows = (acl_reader or _read_acl_sids)(p)
+    if not rows:
+        return None, "runtime index ACL 無法讀取"
+    allowed = set(ACL_BUILTIN_ALLOWED_SIDS) | {init.get("sid")}
+    bad = [s for s, t in rows if t == "Allow" and s not in allowed]
+    if bad:
+        return None, "runtime index ACL 含不允許的帳號：%r" % (bad,)
+    return recs, None
+
+
+def _ledger_facts(recs):
+    """ledger 事實：(pause_responsibility, rv_resumed, consumed, pending_lc)。"""
+    pause = any((r.get("kind") == "INTENT" and r.get("verb") == "pause")
+                or (r.get("kind") == "OUTCOME" and r.get("verb") == "pause"
+                    and r.get("outcome") in ("SENT", "UNKNOWN"))
+                for r in recs)
+    rv = any(r.get("kind") == "OUTCOME" and r.get("verb") == "restore_verified"
+             and r.get("outcome") == "RV_RESUMED" for r in recs)
+    consumed = any(r.get("kind") == "CONSUMED" for r in recs)
+    lc = None
+    for r in recs:
+        if r.get("kind") == "LIFECYCLE":
+            lc = r.get("lifecycle")
+    return pause, rv, consumed, (lc in LEDGER_PENDING_LIFECYCLE)
+
+
+def _is_ledger(recs):
+    return bool(recs) and all(r.get("schema_version") == 1
+                              and r.get("kind") in LEDGER_KINDS
+                              for r in recs)
+
+
+def evaluate_ledger_responsibility(recs, journal_recs):
+    """
+    單一 ledger 的責任判定（純函式）。回傳 (blocking, why)。
+
+    journal_recs：同 attempt 的專屬 journal 紀錄；不存在為 None。
+    """
+    pause, rv, consumed, pending = _ledger_facts(recs)
+    if not consumed and (pause or pending):
+        return True, "ledger 未消耗授權且在責任狀態（執行中斷）"
+    if not pause:
+        if journal_recs and any(r.get("kind") == "INTENT"
+                                and r.get("step") == "PAUSE"
+                                for r in journal_recs):
+            return True, "ledger 沒有暫停責任，但 journal 有 PAUSE INTENT"
+        return False, "無暫停責任"
+    if not rv:
+        return True, "ledger 有暫停責任，但沒有 restore_verified=RV_RESUMED"
+    if journal_recs is None:
+        return True, "ledger 有暫停責任，但專屬 journal 不存在"
+    if not journal_recs:
+        return True, "ledger 有暫停責任，但專屬 journal 是空檔或損毀"
+    blocking, last, why = evaluate_journal_responsibility(journal_recs)
+    if blocking:
+        return True, "專屬 journal：%s" % why
+    if last not in (S_COMPLETE, S_RESTORED):
+        return True, "專屬 journal 最後狀態 %s（未 RESTORED / COMPLETE）" % last
+    return False, "已收斂（ledger RV_RESUMED ＋ journal %s）" % last
+
+
+def _closed_cross_check(closed, ledger_path, journal_path):
+    """
+    🔴 ATTEMPT_CLOSED 只是聲明：sha256、ledger、journal、restore verify、
+       持久化狀態全部交叉驗證才放行。回傳 (blocking, why)。
+    """
+    lsha = closed.get("ledger_sha256")
+    jsha = closed.get("journal_sha256")
+    has_l = bool(ledger_path) and os.path.isfile(ledger_path)
+    has_j = bool(journal_path) and os.path.isfile(journal_path)
+    if lsha is None and jsha is None and not has_l and not has_j:
+        # 🔴 結果本身代表責任未解除、或持久化失敗（可能是寫不進去而非未執行）
+        #    -> 不得以「未建立」放行
+        if closed.get("result") in CLOSED_BLOCKING_RESULTS:
+            return True, "CLOSED 結果 %s，但 ledger / journal 皆不存在" % (
+                closed.get("result"),)
+        bad = [k for k, v in (closed.get("persistence") or {}).items()
+               if str(v).startswith(JP_FAILED)]
+        if bad:
+            return True, "CLOSED：ledger / journal 皆不存在且持久化失敗 %r" % (
+                bad,)
+        # runner 從未建立 ledger -> 不可能有任何 field 動作
+        return False, "CLOSED：ledger / journal 皆未建立（未進入執行）"
+    if not has_l or lsha is None or _sha256_file(ledger_path) != lsha:
+        return True, "CLOSED：ledger 缺失或 sha256 不符"
+    if jsha is not None and (not has_j or _sha256_file(journal_path) != jsha):
+        return True, "CLOSED：journal 缺失或 sha256 不符"
+    if jsha is None and has_j:
+        return True, "CLOSED 未記錄 journal，但 journal 存在"
+    lrecs, _err = _read_journal_strict(ledger_path)
+    if lrecs is None or not _is_ledger(lrecs):
+        return True, "CLOSED：ledger 無法解析"
+    jrecs = None
+    if has_j:
+        jrecs, _jerr = _read_journal_strict(journal_path)
+        if jrecs is None:
+            return True, "CLOSED：journal 無法解析"
+    pause, _rv, consumed, _p = _ledger_facts(lrecs)
+    if not consumed:
+        return True, "CLOSED：ledger 未消耗授權"
+    res = closed.get("result")
+    if res in CLOSED_BLOCKING_RESULTS:
+        return True, "CLOSED 結果 %s（責任未解除）" % res
+    pers = closed.get("persistence") or {}
+    if pers.get("ledger") != JP_OK:
+        return True, "CLOSED：ledger 持久化狀態 %r" % (pers.get("ledger"),)
+    # 本次執行沒有寫 journal（例：ALREADY_CONSUMED）記 NOT_ATTEMPTED 可接受 ——
+    # journal 實際內容仍由下方 sha256 與 ledger / journal 規則交叉驗證。
+    # 寫入失敗（FAILED）或其他值一律阻擋。
+    if pause and pers.get("journal") not in (JP_OK, JP_NOT_ATTEMPTED):
+        return True, "CLOSED：journal 持久化狀態 %r" % (pers.get("journal"),)
+    blocking, why = evaluate_ledger_responsibility(lrecs, jrecs)
+    if blocking:
+        return True, "CLOSED 交叉驗證失敗：%s" % why
+    return False, "CLOSED 交叉驗證通過"
+
+
+def scan_prior_responsibility(journal_dir=None, manifest_path=None,
+                              index_path=None, identity=None,
+                              acl_reader=None, exclude_attempt_id=None,
+                              exclude_ledger_path=None):
+    """
+    C4：跨 attempt 責任掃描。回傳 (verdict, details)。
+
+    🔴 **只讀**：不連設備、不 probe、不建立目錄、不寫任何檔案。
+    🔴 任一項無法證明已收斂 -> UNRESOLVED（Fail Closed）：
+         歷史清單（缺失 / 損毀 / 歷史檔缺失或被修改 / 歷史例外未核准）
+         runtime index（不存在 / 損毀 / 身分或 ACL 不符 / 登錄未收斂 /
+                        同一 attempt_id 登錄不同 ledger / 已確認目標被刪除）
+         目錄內 journal / ledger / 未知 jsonl
+    🔴 本函式**沒有**呼叫 request_restore() 的路徑。
+    🔴 排除（缺陷 B 修正）：只供 scheduled runner 的縱深防禦檢查排除
+       **本次**已由 launcher 登錄、正在執行的 attempt（其 ledger 由既有
+       `recover(ledger)` 判定）。必須**同時**提供 `exclude_attempt_id` 與
+       `exclude_ledger_path`，且 attempt_id 相同、ledger 是**同一個實際檔案**
+       （`_same_file`）才排除；只給 attempt_id 不排除任何項目。
+       launcher 的主要檢查點不排除任何 attempt。
+    """
+    import glob as _glob
+    d = journal_dir or DEFAULT_SCHEDULED_JOURNAL_DIR
+    details = []
+
+    def _excluded(aid, ledger_path):
+        return (bool(exclude_attempt_id) and bool(exclude_ledger_path)
+                and aid == exclude_attempt_id
+                and _same_file(ledger_path, exclude_ledger_path))
+
+    def item(source, path, aid, blocking, why, ackable=False, ack_kind=None,
+             ack_sha=None, ack_seq=None):
+        it = {"source": source, "journal": path, "attempt_id": aid,
+              "blocking": blocking, "why": why, "resolved_by_ack": False,
+              "ackable": ackable}
+        if ackable and ack_kind == ACK_TARGET_INDEX_ENTRY:
+            # C5 以此 digest 綁定（不是整份 index 的 sha256）
+            it["ack_target_sha256"] = ack_sha
+        if blocking and ackable and aid:
+            ok, why2 = _valid_resolution(d, aid, ack_kind, ack_sha, ack_seq)
+            it["ack"] = why2
+            if ok:
+                it["blocking"] = False
+                it["resolved_by_ack"] = True
+        details.append(it)
+        return it
+
+    # ---- ① 歷史清單 ----
+    manifest, merr = load_history_manifest(manifest_path)
+    approved = set()
+    if manifest is None:
+        item("MANIFEST", manifest_path or HISTORY_MANIFEST_PATH, None, True,
+             merr)
+    else:
+        for f in manifest["files"]:
+            fp = os.path.join(d, f["path"])
+            if not os.path.isfile(fp):
+                item("MANIFEST", fp, f.get("attempt_id"), True,
+                     "歷史檔缺失（不得以 C5 解除，需由 Git / 備份還原）")
+            elif _sha256_file(fp) != f["sha256"]:
+                item("MANIFEST", fp, f.get("attempt_id"), True,
+                     "歷史檔 sha256 不符（被修改）")
+        for e in manifest.get("exceptions", []):
+            ok_ev = all(os.path.isfile(os.path.join(d, ev["path"]))
+                        and _sha256_file(os.path.join(d, ev["path"]))
+                        == ev["sha256"] for ev in e["evidence"])
+            if e["approval"] == APPROVAL_APPROVED and ok_ev:
+                approved.add(e["attempt_id"])
+
+    # ---- ② runtime index ----
+    ipath = index_path or RUNTIME_INDEX_PATH
+    irecs, ierr = load_runtime_index(ipath, identity, acl_reader)
+    index_aids = None
+    if irecs is None:
+        item("INDEX", ipath, None, True, ierr)
+    else:
+        regs = {}
+        for r in irecs[1:]:
+            regs.setdefault(r["attempt_id"], []).append(r)
+        index_aids = set(regs)
+        for aid, rs in regs.items():
+            reg = [r for r in rs if r.get("kind") == INDEX_REGISTERED]
+            if not reg or rs[0].get("kind") != INDEX_REGISTERED:
+                item("INDEX", ipath, aid, True, "CLOSED 沒有對應的 REGISTERED")
+                continue
+            if aid in approved:
+                continue
+            lp = reg[-1].get("ledger_path")
+            jp = reg[-1].get("journal_path")
+            if all(_excluded(aid, r.get("ledger_path")) for r in reg):
+                continue
+            kw = dict(ackable=True, ack_kind=ACK_TARGET_INDEX_ENTRY,
+                      ack_sha=_index_entry_digest(aid, rs, lp, jp))
+            # 🔴 缺陷 B：同一 attempt_id 登錄了不同的 ledger -> 無法判定
+            if any(not (r.get("ledger_path") == lp
+                        or _same_file(r.get("ledger_path"), lp))
+                   for r in reg):
+                item("INDEX", ipath, aid, True,
+                     "同一 attempt_id 登錄了不同的 ledger", **kw)
+                continue
+            # 🔴 以**最後一筆**判定：最後是 REGISTERED -> 尚未收尾
+            closed = ([rs[-1]] if rs[-1].get("kind") == INDEX_CLOSED else [])
+            if not closed:
+                if not (lp and os.path.isfile(lp)):
+                    item("INDEX", ipath, aid, True,
+                         "已登錄但未收尾，且 ledger 不存在", **kw)
+                    continue
+                lrecs, _e = _read_journal_strict(lp)
+                if lrecs is None or not _is_ledger(lrecs):
+                    item("INDEX", ipath, aid, True,
+                         "已登錄但未收尾，ledger 無法解析", **kw)
+                    continue
+                jrecs = None
+                if jp and os.path.isfile(jp):
+                    jrecs, _e2 = _read_journal_strict(jp)
+                    if jrecs is None:
+                        jrecs = []
+                b, why = evaluate_ledger_responsibility(lrecs, jrecs)
+                item("INDEX", ipath, aid, b, "已登錄但未收尾：%s" % why, **kw)
+                continue
+            b, why = _closed_cross_check(closed[-1], lp, jp)
+            item("INDEX", ipath, aid, b, why, **kw)
+
+    # ---- ③ 目錄內檔案 ----
+    if not os.path.isdir(d):
+        item("DIR", d, None, True, "掃描目錄不存在")
+        return PRIOR_UNRESOLVED, details
+    for p in sorted(_glob.glob(os.path.join(d, "*.jsonl"))):
+        name = os.path.basename(p)
+        if name.startswith(MANUAL_RESOLUTION_PREFIX):
+            # 🔴 缺陷 A：INDEX_ENTRY 確認的目標紀錄整組被刪除 -> 不得視為無事
+            if index_aids is not None:
+                mrecs, _me = _read_journal_strict(p)
+                for maid in sorted({
+                        r.get("attempt_id") for r in (mrecs or ())
+                        if r.get("kind") == MANUAL_RESOLUTION_KIND
+                        and r.get("target_kind") == ACK_TARGET_INDEX_ENTRY
+                        and isinstance(r.get("attempt_id"), str)
+                        and r.get("attempt_id") not in index_aids
+                        and r.get("attempt_id") not in approved}):
+                    item("INDEX", ipath, maid, True,
+                         "已確認的 index 目標紀錄已不存在（被刪除）",
+                         ackable=True, ack_kind=ACK_TARGET_INDEX_ENTRY,
+                         ack_sha=_index_entry_digest(maid, [], None, None))
+            continue
+        recs, err = _read_journal_strict(p)
+        if name.startswith("handoff_journal"):
+            aid = _journal_attempt_id(p)
+            if aid in approved:
+                continue
+            if recs is None:
+                item("JOURNAL", p, aid, True, "journal 無法解析：%s" % err)
+                continue
+            if not recs:
+                item("JOURNAL", p, aid, True, "journal 是空檔")
+                continue
+            blocking, last, why = evaluate_journal_responsibility(recs)
+            last_seq = max([int(r.get("seq") or 0) for r in recs] or [0])
+            it = item("JOURNAL", p, aid, blocking, why, ackable=True,
+                      ack_kind=ACK_TARGET_JOURNAL, ack_sha=_sha256_file(p),
+                      ack_seq=last_seq)
+            it["last_state"] = last
+            continue
+        aid = name[:-len(".jsonl")]
+        if _excluded(aid, p):
+            continue
+        if recs is None:
+            item("LEDGER", p, aid, True, "jsonl 無法解析：%s" % err)
+            continue
+        if not _is_ledger(recs):
+            item("UNKNOWN_FILE", p, aid, True,
+                 "無法辨識的 jsonl（不是 journal / ledger）")
+            continue
+        if aid in approved:
+            continue
+        jp = attempt_journal_path(d, aid)
+        jrecs = None
+        if os.path.isfile(jp):
+            jrecs, _e = _read_journal_strict(jp)
+            if jrecs is None:
+                jrecs = []          # 交由 journal 項目本身判定損毀
+        b, why = evaluate_ledger_responsibility(recs, jrecs)
+        item("LEDGER", p, aid, b, why, ackable=True,
+             ack_kind=ACK_TARGET_LEDGER, ack_sha=_sha256_file(p))
+    if any(x["blocking"] for x in details):
+        return PRIOR_UNRESOLVED, details
+    return PRIOR_CLEAR, details
+
+
+def _index_append(rec, path=None):
+    """runtime index 追加一筆（fsync）。**不建立目錄 / 檔案**：不存在即失敗。"""
+    p = path or RUNTIME_INDEX_PATH
+    if not os.path.isfile(p):
+        raise OSError("runtime index 不存在（不會自動初始化）")
+    with io.open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return rec
+
+
+def register_attempt(attempt_id, ledger_path, journal_path, path=None,
+                     identity=None):
+    """launcher 在 build_dependencies 之前登錄。失敗即拋例外（呼叫端拒絕執行）。"""
+    ident = identity if identity is not None else _current_identity()
+    return _index_append({
+        "kind": INDEX_REGISTERED, "attempt_id": attempt_id,
+        "ledger_path": os.path.abspath(ledger_path) if ledger_path else None,
+        "journal_path": (os.path.abspath(journal_path) if journal_path
+                         else None),
+        "sid": (ident or {}).get("sid"),
+        "hostname": (ident or {}).get("hostname"),
+        "at": datetime.datetime.now().astimezone().isoformat(
+            timespec="seconds")}, path)
+
+
+def close_attempt(attempt_id, result, ledger_path, journal_path,
+                  persistence, path=None):
+    """launcher 結束時收尾。回傳 OK / FAILED:<err>（不往上拋）。"""
+    try:
+        lsha = (_sha256_file(ledger_path)
+                if ledger_path and os.path.isfile(ledger_path) else None)
+        jsha = (_sha256_file(journal_path)
+                if journal_path and os.path.isfile(journal_path) else None)
+        _index_append({
+            "kind": INDEX_CLOSED, "attempt_id": attempt_id, "result": result,
+            "ledger_sha256": lsha, "journal_sha256": jsha,
+            "persistence": dict(persistence or {}),
+            "at": datetime.datetime.now().astimezone().isoformat(
+                timespec="seconds")}, path)
+        return JP_OK
+    except Exception as e:                                     # noqa: BLE001
+        return "%s:%s" % (JP_FAILED, type(e).__name__)
+
+
+def init_runtime_index(operator, statement, confirm_phrase, interactive,
+                       path=None, identity=None, acl_setter=None,
+                       acl_reader=None):
+    """
+    🔴 人工初始化 runtime index（只能在互動式終端機、輸入確認語句）。
+       正式程式沒有任何呼叫點（AST regression 驗證）。回傳 (ok, why)。
+    🔴 已存在 -> 拒絕（不覆寫、不重建）。
+    """
+    import getpass
+    if interactive is not True:
+        return False, "非互動式終端機 -> 拒絕"
+    if confirm_phrase != "INIT PHASE6 INDEX":
+        return False, "確認語句不符"
+    if not isinstance(operator, str) or not operator.strip():
+        return False, "operator 必填"
+    if not isinstance(statement, str) or len(statement.strip()) < 10:
+        return False, "statement 必填且至少 10 字"
+    p = path or RUNTIME_INDEX_PATH
+    if os.path.exists(p):
+        return False, "runtime index 已存在 -> 拒絕（不覆寫）"
+    ident = identity if identity is not None else _current_identity()
+    if not ident:
+        return False, "無法取得執行帳號 SID"
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    rec = {"kind": INDEX_INIT, "schema_version": 1, "sid": ident["sid"],
+           "hostname": ident["hostname"], "os_user": getpass.getuser(),
+           "operator": operator.strip(), "statement": statement.strip(),
+           "at": datetime.datetime.now().astimezone().isoformat(
+               timespec="seconds")}
+    with io.open(p, "x", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    (acl_setter or _restrict_index_acl)(p, ident["sid"])
+    rows = (acl_reader or _read_acl_sids)(p)
+    allowed = set(ACL_BUILTIN_ALLOWED_SIDS) | {ident["sid"]}
+    if not rows or [s for s, t in rows if t == "Allow" and s not in allowed]:
+        return False, "index 已建立但 ACL 驗證失敗（C4 會持續阻擋）"
+    return True, rec
+
+
+def _restrict_index_acl(path, sid):
+    """只有人工 init-index 會呼叫：限制 ACL（委派主機查詢模組）。"""
+    _host().restrict_index_acl(path, sid, ACL_BUILTIN_ALLOWED_SIDS)
+
+
+def acknowledge_manual_resolution(journal_path, attempt_id, operator, reason,
+                                  probe_evidence, pcs_evidence,
+                                  confirm_phrase, interactive, now=None,
+                                  target_kind=ACK_TARGET_JOURNAL,
+                                  scan_kwargs=None):
+    """
+    C5：人工確認某個目標的恢復責任已由人處理。回傳 (ok, record_or_reason)。
+
+    target_kind
+        JOURNAL     : 該 attempt 的專屬 journal（`journal_path`）
+        LEDGER      : 同目錄的 `<attempt_id>.jsonl`（GAP-4：journal 缺失時）
+        INDEX_ENTRY : runtime index 中該 attempt 的登錄（GAP-4）
+      確認綁定目標檔的 sha256（JOURNAL 另綁 last seq）；目標之後有任何變動即失效。
+      INDEX_ENTRY 綁定 `_index_entry_digest()`：只涵蓋**該 attempt** 的全部
+      index 紀錄與其 ledger / journal；其他 attempt 追加登錄不影響。
+      歷史清單的缺失 / 竄改、未核准的歷史例外**不能**以 C5 解除。
+
+    🔴 **只能由人工在互動式終端機呼叫**（`interactive` 必須為 True，
+       且 `confirm_phrase` 必須等於 "RESOLVE <attempt_id>"）。
+       正式程式沒有任何呼叫點（AST regression 驗證）。
+    🔴 這是**責任紀錄，不是身分驗證**：系統無法證明 operator 就是本人。
+    🔴 **不讀也不寫** FIRST_LIVE_HOLD；**不送** restore；
+       只解除 C4 對**這一個**目標的阻擋。
+    🔴 probe_evidence / pcs_evidence 必須是確認前 5 分鐘內以唯讀方式取得；
+       external liveness 為 UNKNOWN（或缺）一律拒絕。
+    """
+    import getpass
+    import platform
+    now = now or datetime.datetime.now().astimezone()
+    if interactive is not True:
+        return False, "非互動式終端機 -> 拒絕"
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        return False, "attempt_id 必填"
+    if confirm_phrase != "RESOLVE %s" % attempt_id:
+        return False, "確認語句不符"
+    if not isinstance(operator, str) or not operator.strip():
+        return False, "operator 必填"
+    if (not isinstance(reason, str)
+            or len(reason.strip()) < MANUAL_RESOLUTION_MIN_REASON_LEN):
+        return False, "reason 必填且至少 %d 字" % MANUAL_RESOLUTION_MIN_REASON_LEN
+    if target_kind not in (ACK_TARGET_JOURNAL, ACK_TARGET_LEDGER,
+                           ACK_TARGET_INDEX_ENTRY):
+        return False, "target_kind 不合法：%r" % (target_kind,)
+    if os.path.abspath(journal_path) != os.path.abspath(attempt_journal_path(
+            os.path.dirname(journal_path), attempt_id)):
+        return False, "journal 路徑與 attempt_id 不一致"
+    base = os.path.dirname(journal_path)
+
+    target = {"target_kind": target_kind}
+    if target_kind == ACK_TARGET_JOURNAL:
+        if not os.path.exists(journal_path):
+            return False, "journal 不存在"
+        recs, err = _read_journal_strict(journal_path)
+        if recs is None:
+            return False, "journal 無法解析：%s" % err
+        blocking, last, why = evaluate_journal_responsibility(recs)
+        if not blocking:
+            return False, "此 journal 沒有未解除的責任（%s）-> 不需確認" % why
+        target.update(
+            journal_path=os.path.abspath(journal_path),
+            journal_last_state=last,
+            journal_last_seq=max([int(r.get("seq") or 0) for r in recs]
+                                 or [0]),
+            journal_sha256=_sha256_file(journal_path),
+            target_path=os.path.abspath(journal_path))
+    else:
+        kw = dict(scan_kwargs or {})
+        _v, det = scan_prior_responsibility(base, **kw)
+        src = "LEDGER" if target_kind == ACK_TARGET_LEDGER else "INDEX"
+        hits = [x for x in det if x.get("source") == src
+                and x.get("attempt_id") == attempt_id and x.get("blocking")
+                and x.get("ackable")]
+        if not hits:
+            return False, "此目標沒有可由人工確認解除的阻擋"
+        tp = (os.path.join(base, "%s.jsonl" % attempt_id)
+              if target_kind == ACK_TARGET_LEDGER
+              else (kw.get("index_path") or RUNTIME_INDEX_PATH))
+        if not os.path.isfile(tp):
+            return False, "確認目標不存在"
+        if target_kind == ACK_TARGET_LEDGER:
+            target.update(target_path=os.path.abspath(tp),
+                          target_sha256=_sha256_file(tp),
+                          blocking_why=hits[0].get("why"))
+        else:
+            # 🔴 缺陷 A：綁定該 attempt 的 index 紀錄 digest（不是整份 index）
+            if len({x.get("ack_target_sha256") for x in hits}) != 1 \
+                    or not _hex64(hits[0].get("ack_target_sha256")):
+                return False, "INDEX_ENTRY 目標 digest 無法唯一確定"
+            target.update(target_path=os.path.abspath(tp),
+                          target_sha256=hits[0]["ack_target_sha256"],
+                          target_digest_scheme=INDEX_ENTRY_DIGEST_SCHEME,
+                          blocking_why=hits[0].get("why"))
+
+    def _fresh(ev, name):
+        if not isinstance(ev, dict):
+            return "%s 未提供" % name
+        at = ev.get("at")
+        try:
+            t = datetime.datetime.fromisoformat(str(at))
+        except (TypeError, ValueError):
+            return "%s 缺少可解析的取得時間" % name
+        if t.tzinfo is None:
+            t = t.astimezone()
+        age = (now - t).total_seconds()
+        if age < 0 or age > MANUAL_RESOLUTION_EVIDENCE_MAX_AGE_SEC:
+            return "%s 取得時間不在 %d 秒內（%.0f 秒）" % (
+                name, MANUAL_RESOLUTION_EVIDENCE_MAX_AGE_SEC, age)
+        return None
+
+    for ev, name in ((probe_evidence, "probe_evidence"),
+                     (pcs_evidence, "pcs_evidence")):
+        bad = _fresh(ev, name)
+        if bad:
+            return False, bad
+    lv = probe_evidence.get("liveness")
+    if lv not in (EXT_RUNNING_VERDICT, EXT_NOT_RUNNING_VERDICT):
+        return False, "external liveness=%r（UNKNOWN 或缺）-> 拒絕確認" % (lv,)
+    for k in ("pcs_state", "fault", "critical_alarms", "comm_ok"):
+        if k not in pcs_evidence:
+            return False, "pcs_evidence 缺少 %s" % k
+
+    rec = {
+        "kind": MANUAL_RESOLUTION_KIND,
+        "operator": operator.strip(),
+        "os_user": getpass.getuser(),
+        "hostname": platform.node(),
+        "ack_at": now.isoformat(timespec="seconds"),
+        "attempt_id": attempt_id,
+        "reason": reason.strip(),
+        "probe_evidence": dict(probe_evidence),
+        "pcs_evidence": dict(pcs_evidence),
+        "effect": "ONLY_CLEARS_C4_BLOCK_FOR_THIS_TARGET",
+        "not_authentication": True,
+        "hold_unchanged": True,
+        "restore_sent": False,
+    }
+    rec.update(target)
+    with io.open(manual_resolution_path(base, attempt_id), "a",
+                 encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return True, rec
 
 
 # ======================================================================
@@ -1080,7 +2233,8 @@ class HandoffRunner(object):
     def __init__(self, orchestrator, sample_source, probe_source,
                  loop_mark_source=None, dispatcher=None, config=None,
                  soc_max_pct=None, sleeper=None, dispatch_permit=None,
-                 deadline=None):
+                 deadline=None, now_fn=None, quick_sample_source=None,
+                 restore_precheck_max_age_sec=None):
         self.o = orchestrator
         self.sample_source = sample_source      # () -> dict（每次都要 fresh）
         self.probe_source = probe_source        # () -> dict
@@ -1108,6 +2262,37 @@ class HandoffRunner(object):
         self.restore_verifier_state = None
         self.release_before_restore = None
         self.post_check = None
+        # 🔴 C3 RESTORE_PRECHECK：時段判定需要本機時間；未注入 -> 時段不成立
+        #    -> WITHHELD（Fail Closed）。不預設為系統時間，避免測試誤用真實時鐘。
+        self._now = now_fn
+        # 送出前快速重新確認用的取樣（不收 loop 時間戳）；未注入時沿用 sample_source
+        self.quick_sample_source = quick_sample_source
+        self.restore_precheck_max_age_sec = (
+            RESTORE_PRECHECK_MAX_AGE_SEC
+            if restore_precheck_max_age_sec is None
+            else float(restore_precheck_max_age_sec))
+        self.restore_precheck = None
+        self.restore_recheck = None
+        self.restore_withheld_reason = None
+        # 🔴 C7：交接前記錄的 controller pid。之後每次 probe 都必須相同。
+        #    PID / exe / ppid / cwd / cmd 一致**只是必要條件**，
+        #    不代表已證明前景或唯一控制器。
+        self.pid0 = None
+        self.identity_preconditions_ok = None
+        # 🔴 GAP-2：最近一次 C3 判定時的 lease 釋放狀態
+        self.phase6_release_state = None
+        # 🔴 GAP-3：WITHHELD 紀錄是否真的寫入 journal（不得宣稱未寫入的已保存）
+        self.journal_persistence = (JP_NOT_ATTEMPTED
+                                    if getattr(orchestrator, "journal", None)
+                                    is None else JP_OK)
+        # 🔴 U-1：restore 送出前的 journal 寫入失敗（錯誤類型）；
+        #    `_withhold` 之後即使寫入成功也不得把它改回 OK
+        self.journal_write_failure = None
+
+    def _pid_changed(self, prb):
+        """C7：probe 的 pid 是否與 pid0 不同（取不到也算不同）。"""
+        return not (isinstance(prb, dict) and self.pid0
+                    and prb.get("pid") == self.pid0)
 
     def _log(self, step, ok, detail=None, **extra):
         rec = {"step": step, "ok": bool(ok), "detail": detail}
@@ -1147,7 +2332,23 @@ class HandoffRunner(object):
                 # 🔴 EXECUTION DEADLINE evidence（只外露，不重新判定）
                 "deadline_blocked_at": self.deadline_blocked_at,
                 "deadline": (self.deadline.as_dict()
-                             if self.deadline is not None else None)}
+                             if self.deadline is not None else None),
+                # 🔴 GAP-2：lease 釋放狀態（NEVER_HELD / RELEASED / RELEASE_UNKNOWN …）
+                "phase6_release_state": self.phase6_release_state,
+                # 🔴 GAP-3：journal 持久化狀態（OK / FAILED:<err> / NOT_ATTEMPTED）
+                "journal_persistence": self.journal_persistence,
+                # 🔴 C3 RESTORE_PRECHECK evidence
+                "restore_precheck": self.restore_precheck,
+                "restore_recheck": self.restore_recheck,
+                "restore_withheld_reason": self.restore_withheld_reason,
+                # 🔴 C7：只外露「必要條件是否成立」，**不得**宣稱
+                #    foreground_verified / sole_controller_verified。
+                "identity_preconditions": {
+                    "pid0": self.pid0,
+                    "identity_preconditions_ok":
+                        self.identity_preconditions_ok,
+                    "note": "PID/exe/ppid/cwd/cmd 一致只是必要條件；"
+                            "不代表已證明前景程序或唯一控制器"}}
 
     # ---- 主流程 ----
     def run(self):
@@ -1160,6 +2361,14 @@ class HandoffRunner(object):
         if not ok:
             bad = [k for k, v in checks.items() if not v]
             return self._bail("1_PRE_PAUSE_PREFLIGHT", f"未通過：{bad}")
+        # 🔴 C7：記錄交接前 pid。取不到 -> 之後無法比對 -> 交接前就中止。
+        _pid = prb.get("pid") if isinstance(prb, dict) else None
+        if not _pid:
+            self.identity_preconditions_ok = False
+            return self._bail("1_PRE_PAUSE_PREFLIGHT",
+                              "C7：取不到 controller pid，無法比對身分")
+        self.pid0 = _pid
+        self.identity_preconditions_ok = True
         self._log("1_PRE_PAUSE_PREFLIGHT", True)
 
         # 🔴 DEADLINE CHECKPOINT 1 —— before PAUSE
@@ -1209,7 +2418,16 @@ class HandoffRunner(object):
         n = 0
         while pv.state not in (PV_VERIFIED,) and n < 200:
             n += 1
-            st = pv.feed(self.sample_source(), self.probe_source())
+            _pv_smp = self.sample_source()
+            _pv_prb = self.probe_source()
+            if self._pid_changed(_pv_prb):
+                # 🔴 C7：暫停期間 controller pid 改變 -> 已不是我方暫停的那一個
+                self.identity_preconditions_ok = False
+                return self._bail("3_4_PAUSE_VERIFY",
+                                  "C7：controller pid 改變（%r -> %r）"
+                                  % (self.pid0, (_pv_prb or {}).get("pid")
+                                     if isinstance(_pv_prb, dict) else None))
+            st = pv.feed(_pv_smp, _pv_prb)
             # 🔴 loop mark 與 PauseVerifier 取樣同步收集 —— halt 判定沿用
             #    canonical `loop_active_from_marks`，**不新增規則**。
             if self.loop_mark_source is not None:
@@ -1229,6 +2447,15 @@ class HandoffRunner(object):
             self.normal_loop_halted = (None if act is None else (not act))
         if pv.state != PV_VERIFIED:
             return self._bail("3_4_PAUSE_VERIFY", "未於允許次數內完成驗證")
+        # 🔴 C6（2026-11-06）：loop 時間戳凍結是**必要條件**。
+        #    前進（False）或證據不足（None）一律中止 -> 走 C3。
+        #    🔴 凍結**不等於**控制權已釋放 —— 它只證明 controller 的主迴圈
+        #       不再輸出時間戳；PCS 側的事實仍由 PauseVerifier 證明。
+        if self.normal_loop_halted is not True:
+            return self._bail(
+                "3_4_PAUSE_VERIFY",
+                "C6：normal_loop_halted=%r（時間戳未凍結或證據不足）"
+                % (self.normal_loop_halted,))
         self._log("3_4_PAUSE_VERIFY", True, f"external_quiescent（{n} 筆）")
 
         # 5 OWNERSHIP = NEITHER
@@ -1253,6 +2480,12 @@ class HandoffRunner(object):
         if not ok2:
             bad2 = [k for k, v in checks2.items() if not v]
             return self._bail("6_POST_PAUSE_PRECHECK", f"未通過：{bad2}")
+        if self._pid_changed(prb2):
+            self.identity_preconditions_ok = False
+            return self._bail("6_POST_PAUSE_PRECHECK",
+                              "C7：controller pid 改變（%r -> %r）"
+                              % (self.pid0, (prb2 or {}).get("pid")
+                                 if isinstance(prb2, dict) else None))
         self._log("6_POST_PAUSE_PRECHECK", True)
 
         # 7 FIRST LIVE
@@ -1338,6 +2571,155 @@ class HandoffRunner(object):
         # 10~12
         return self._restore_phase(reason="正常收尾")
 
+    # ---- C3：restore 前的把關 ----
+    def _lease_state(self):
+        """
+        🔴 GAP-2（2026-11-06）：Phase 6 authority lease 的釋放狀態。
+
+        「從未持有」**只看 lease 自己的 `acquired_once`**，不以
+        `SVC.is_owner()`（程序內記帳）推定。取得過時只接受
+        `release_ok is True`（= ReleaseMutex 實際 BOOL 成功）；
+        回傳 False、拋例外或結果無法判定一律 RELEASE_UNKNOWN。
+        """
+        lease = getattr(self.dispatcher, "lease", None)
+        if lease is None:
+            return LS_NO_LEASE_OBJECT
+        held = getattr(lease, "held", None)
+        if getattr(lease, "acquired_once", False) is not True:
+            return LS_NEVER_HELD if held is False else LS_STILL_HELD
+        if held is not False:
+            return (LS_RELEASE_UNKNOWN
+                    if getattr(lease, "release_attempted", False) is True
+                    else LS_STILL_HELD)
+        ro = getattr(lease, "release_ok", None)
+        if ro is True:
+            return LS_RELEASED
+        if ro is None:
+            return LS_RELEASE_NOT_ATTEMPTED
+        return LS_RELEASE_UNKNOWN
+
+    def _lease_released(self):
+        """C3：只有 NEVER_HELD / RELEASED / NO_LEASE_OBJECT 視為已釋放。"""
+        st = self._lease_state()
+        self.phase6_release_state = st
+        return st in LS_RELEASED_OK
+
+    def _withhold(self, step, detail, checks=None):
+        """
+        不送 restore。🔴 restore_responsibility **保留**，需人工處理。
+
+        🔴 GAP-3（2026-11-06）：**先**在記憶體設為 WITHHELD，再寫 journal。
+           journal 寫入失敗**不往上拋**、也**不宣稱已保存** ——
+           以 `journal_persistence` 明示 OK / FAILED:<錯誤類型> / NOT_ATTEMPTED。
+        """
+        self.restore_withheld_reason = detail
+        failed = self.journal_write_failure
+        try:
+            self._log(step, False, detail, withheld=True)
+        except Exception as e:                                 # noqa: BLE001
+            # PLAN_STEP 寫不進去：步驟仍留在記憶體結果中
+            if not (self.steps and self.steps[-1].get("step") == step):
+                self.steps.append({"step": step, "ok": False,
+                                   "detail": detail, "withheld": True})
+            failed = type(e).__name__
+        try:
+            # `_to` 先改記憶體狀態、再寫 journal
+            self.o._to(S_RESTORE_WITHHELD, detail=detail,
+                       restore_precheck_checks=checks)
+        except Exception as e:                                 # noqa: BLE001
+            if self.o.state != S_RESTORE_WITHHELD:
+                self.o.state = S_RESTORE_WITHHELD
+                self.o.history.append(S_RESTORE_WITHHELD)
+            failed = failed or type(e).__name__
+        if self.o.journal is None:
+            self.journal_persistence = JP_NOT_ATTEMPTED
+        elif failed:
+            self.journal_persistence = "%s:%s" % (JP_FAILED, failed)
+        else:
+            self.journal_persistence = JP_OK
+        return self._result("RESTORE_WITHHELD", detail)
+
+    def _restore_gate(self):
+        """
+        回傳 `RestoreClearance` = 可以送出；否則回傳 WITHHELD 結果。
+
+        🔴 GAP-3：整個把關（取樣、時鐘、lease、age 計算）都在同一個 try 內；
+           任何例外一律 WITHHELD（絕不因為例外而送出，也不讓例外跳過紀錄）。
+        """
+        try:
+            return self._restore_gate_inner()
+        except Exception as e:                                 # noqa: BLE001
+            return self._withhold("10_RESTORE_GATE_EXCEPTION",
+                                  "restore 把關過程例外：%s" % type(e).__name__)
+
+    def _restore_gate_inner(self):
+        """
+        回傳 `RestoreClearance` = 可以送出；否則回傳 WITHHELD 結果。
+
+        ① 完整 precheck：fresh sample（含 loop 證據）＋ probe ＋ 本機時間
+        ② 送出前一刻快速重新確認：再取一次樣本與 probe（不收時間戳）
+        ③ ① 完成到 ② 結束不得超過 `restore_precheck_max_age_sec`（不重跑）
+        🔴 取樣過程拋例外 -> WITHHELD（不得因為取不到資料就送出）。
+        """
+        try:
+            smp, prb = self.sample_source(), self.probe_source()
+            now = self._now() if self._now is not None else None
+            ok, checks = restore_precheck(smp, prb, self.pid0,
+                                          self._lease_released(), now)
+        except Exception as e:                                 # noqa: BLE001
+            self.restore_precheck = {"ok": False, "checks": None,
+                                     "error": type(e).__name__}
+            return self._withhold("10_RESTORE_PRECHECK",
+                                  "precheck 取樣例外：%s" % type(e).__name__)
+        self.restore_precheck = {"ok": ok, "checks": dict(checks),
+                                 "phase6_release_state":
+                                     self.phase6_release_state,
+                                 "at": (now.isoformat(timespec="seconds")
+                                        if isinstance(now, datetime.datetime)
+                                        else None)}
+        if not ok:
+            bad = [k for k, v in checks.items() if not v]
+            return self._withhold("10_RESTORE_PRECHECK",
+                                  "RESTORE_PRECHECK 未通過：%s" % bad, checks)
+        t_full = self.o._clock()
+        try:
+            src = self.quick_sample_source or self.sample_source
+            smp2, prb2 = src(), self.probe_source()
+            now2 = self._now() if self._now is not None else None
+            ok2, checks2 = restore_precheck(smp2, prb2, self.pid0,
+                                            self._lease_released(), now2,
+                                            require_liveness=False)
+        except Exception as e:                                 # noqa: BLE001
+            self.restore_recheck = {"ok": False, "checks": None,
+                                    "error": type(e).__name__}
+            return self._withhold("10_RESTORE_RECHECK",
+                                  "送出前重新確認例外：%s" % type(e).__name__)
+        age = self.o._clock() - t_full
+        self.restore_recheck = {"ok": ok2, "checks": dict(checks2),
+                                "phase6_release_state":
+                                    self.phase6_release_state,
+                                "age_sec": age,
+                                "max_age_sec": self.restore_precheck_max_age_sec}
+        if not ok2:
+            bad2 = [k for k, v in checks2.items() if not v]
+            return self._withhold("10_RESTORE_RECHECK",
+                                  "送出前重新確認未通過：%s" % bad2, checks2)
+        # 🔴 GAP-3：age 必須是有限、非負數值；時鐘倒退 / NaN / None 一律 WITHHELD
+        if (isinstance(age, bool) or not isinstance(age, (int, float))
+                or not math.isfinite(age) or age < 0):
+            return self._withhold("10_RESTORE_RECHECK",
+                                  "precheck 時效無法判定（age=%r）" % (age,),
+                                  checks2)
+        if not (age <= self.restore_precheck_max_age_sec):
+            return self._withhold(
+                "10_RESTORE_RECHECK",
+                "precheck 結果逾時：%.1f s > %.1f s"
+                % (age, self.restore_precheck_max_age_sec), checks2)
+        self._log("10_RESTORE_PRECHECK", True)
+        # 🔴 GAP-5：兩次檢查都通過 -> 核發一次性 clearance（綁定檢查結果）
+        return self.o._issue_restore_clearance(
+            restore_checks_digest(checks, checks2))
+
     # ---- 10~12：歸還與驗證 ----
     def _restore_phase(self, reason):
         from phase6_remote_adapter import RestoreVerifier, RV_RESUMED, RV_UNKNOWN
@@ -1368,17 +2750,51 @@ class HandoffRunner(object):
                 self.release_before_restore = (
                     getattr(_lease, "held", True) is False)
 
-        if self.o.state not in (S_PHASE6_RELEASED, S_RESTORE_REQUESTED):
-            # 從任何持有責任的狀態都要能走到歸還
-            try:
+        _hist_n = len(self.o.history)
+        try:
+            if self.o.state not in (S_PHASE6_RELEASED, S_RESTORE_REQUESTED):
+                # 從任何持有責任的狀態都要能走到歸還
+                try:
+                    self.o._to(S_RESTORE_REQUESTED, detail=reason)
+                except RuntimeError:
+                    self.o.state = S_RESTORE_REQUESTED
+                    self.o.history.append(S_RESTORE_REQUESTED)
+            else:
                 self.o._to(S_RESTORE_REQUESTED, detail=reason)
-            except RuntimeError:
-                self.o.state = S_RESTORE_REQUESTED
-                self.o.history.append(S_RESTORE_REQUESTED)
-        else:
-            self.o._to(S_RESTORE_REQUESTED, detail=reason)
+        except Exception as e:                                 # noqa: BLE001
+            # 🔴 U-1：狀態已在記憶體轉入 RESTORE_REQUESTED，但 journal 寫不進去
+            #    -> 不送 restore（WITHHELD，責任保留，journal_persistence=FAILED）。
+            #    狀態沒有轉移（非法轉移等）-> 維持既有行為往上拋。
+            if len(self.o.history) == _hist_n:
+                raise
+            self.journal_write_failure = type(e).__name__
+            return self._withhold(
+                "10_RESTORE_REQUESTED",
+                "RESTORE_REQUESTED journal 寫入失敗：%s -> 不送 restore"
+                % type(e).__name__)
 
-        sent, why = self.o.request_restore()
+        # 🔴 C3 RESTORE_PRECHECK —— 全部成立才可送出；否則 WITHHELD（不送）。
+        gate = self._restore_gate()
+        if not isinstance(gate, RestoreClearance):
+            return gate                                        # WITHHELD 結果
+
+        try:
+            sent, why = self.o.request_restore(gate)
+        except Exception as e:                                 # noqa: BLE001
+            # 🔴 U-1：INTENT 寫入失敗發生在 mark_attempt / sender **之前**
+            #    -> restore 確定未送出 -> WITHHELD（journal_persistence=FAILED）。
+            #    已標記 attempted（之後才失敗，可能已送出）-> 維持既有行為往上拋，
+            #    不得宣稱未送出。
+            if not self.o.guard.may_attempt("RESTORE"):
+                raise
+            self.journal_write_failure = type(e).__name__
+            return self._withhold(
+                "10_RESTORE",
+                "restore INTENT journal 寫入失敗：%s -> 未送出"
+                % type(e).__name__)
+        if not sent and str(why).startswith(RESTORE_PRECHECK_REQUIRED):
+            # 🔴 GAP-5：clearance 未被接受 -> 沒有送出 -> WITHHELD（責任保留）
+            return self._withhold("10_RESTORE", why)
         if not sent and why == "SEND_OUTCOME_UNKNOWN_MUST_PROBE":
             # 🔴 restore 逾時同樣不得斷定失敗、更不得直接重送。
             #    恢復責任**保留**，狀態進入不確定，等 probe / recover。

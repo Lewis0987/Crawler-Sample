@@ -180,7 +180,22 @@ HANDOFF_OBSERVATION_CANONICAL_SOURCES = {
     "alarm_clear": "ControlObservation.alarm_rows（level 0 且 alarmStatus）",
     "external_runtime_healthy": "B2 guard probe（screen/process/identity）",
     "external_behaviour_known": EXTERNAL_BEHAVIOUR_KNOWN_CANONICAL_SOURCE,
+    # 🔴 C2（2026-11-06）：同一份 canonical 三態，但要求 == EXT_RUNNING
+    "external_loop_running": EXTERNAL_BEHAVIOUR_KNOWN_CANONICAL_SOURCE
+                             + " == EXT_RUNNING",
 }
+
+
+def controller_exe_ok(exe):
+    """C7：controller 執行檔必須是 python3（`/proc/<pid>/exe` 的 basename）。"""
+    return (isinstance(exe, str) and bool(exe.strip())
+            and os.path.basename(exe.strip()).startswith("python3"))
+
+
+def controller_ppid_ok(ppid):
+    """C7：ppid 必須是有效數字，且不是 0 / 1（被 init 收養代表已脫離原 screen）。"""
+    return (isinstance(ppid, str) and ppid.strip().isdigit()
+            and int(ppid.strip()) > 1)
 
 
 def canonical_soc_max_pct(bundle):
@@ -425,13 +440,19 @@ def build_field_dependencies(config, runtime_context=None):
         state["probe_raw"] = r.stdout or ""
         state["probe_fields"] = f
         cap_ok, _g = RA.capability_gate(RA.parse_capability(r.stdout))
+        # 🔴 C7（2026-11-06）：identity 另外要求 exe 是 python3、ppid 有效。
+        #    guard B2 的 probe 本來就輸出 exe / ppid，這裡只是不再忽略。
+        #    🔴 全部成立也**只是必要條件**：不證明前景、不證明唯一控制器。
         return {"ssh_ok": r.outcome == RA.SSH_OK,
                 "screen_alive": f.get("screen_count") == "1",
                 "process_alive": bool(f.get("pid")),
                 "process_identity_ok": (f.get("cwd") == RA.EXPECTED_CWD
-                                        and f.get("cmd") == RA.EXPECTED_CMD),
+                                        and f.get("cmd") == RA.EXPECTED_CMD
+                                        and controller_exe_ok(f.get("exe"))
+                                        and controller_ppid_ok(f.get("ppid"))),
                 "guard_variant": f.get("guard_variant"),
-                "capability_ok": bool(cap_ok), "pid": f.get("pid")}
+                "capability_ok": bool(cap_ok), "pid": f.get("pid"),
+                "exe": f.get("exe"), "ppid": f.get("ppid")}
 
     def loop_mark():
         return _kv(_run("loopcheck").stdout).get("mark2")
@@ -560,7 +581,13 @@ def build_field_dependencies(config, runtime_context=None):
         #    反過來（先 observe 再 sample）會讓 chain 讀落在續期之前，
         #    401 只能 Fail Closed 而無法恢復。
         base = sample()
+        # 🔴 GAP-6（2026-11-06）：TOU 在 `bundle.observe()` 內判定。前後各記錄
+        #    一次與 TOU **同一來源**的 aware 時間（Asia/Taipei）＋ monotonic ＋
+        #    主機本機時間，供 C3 證明「TOU 判定時刻」落在 restore 時段內。
+        _tb = {"host_before": _host_now(), "mono_before": time.monotonic(),
+               "before": _local_now()}
         res = bundle.observe()
+        _tb.update(after=_local_now(), mono_after=time.monotonic())
         arb = getattr(res, "arbitration", None) or res
         band = _canonical_soc_band()
         d = {"decision": getattr(arb, "fresh_decision_action", None),
@@ -573,6 +600,7 @@ def build_field_dependencies(config, runtime_context=None):
              "tou_state": getattr(arb, "tou_state", None),
              "soc_band": band}
         base.update(d)
+        base["tou_sampled_between"] = _tb
         base["authority"] = getattr(arb, "authority_state", base["authority"])
         base["pcs_state"] = getattr(res, "pcs_state", base["pcs_state"])
         if post:
@@ -582,6 +610,11 @@ def build_field_dependencies(config, runtime_context=None):
     # ---- 4. Scheduled runner 相依 ----
     def now_fn():
         return datetime.datetime.now()
+
+    # 🔴 GAP-6：C3 的時間來源與 TOU **相同**（`PRD.build_local_now()`，
+    #    Asia/Taipei aware）。ctx 可覆寫僅供離線測試注入；設定檔無此欄位。
+    _local_now = ctx.get("local_now") or PRD.build_local_now()
+    _host_now = ctx.get("host_now") or datetime.datetime.now
 
     def source_state_check():
         R = importlib.import_module("phase6_first_live_runner")
@@ -655,6 +688,15 @@ def build_field_dependencies(config, runtime_context=None):
         return build_handoff_observation(
             _decision_sample(),
             external_liveness_verdict=_external_liveness())
+
+    def _restore_quick_sample():
+        """
+        🔴 C3：restore 送出前一刻的快速重新確認取樣。
+           與 `_handoff_sample` 同一條 canonical path，但**不收 loop 時間戳**
+           （loop 證據已由完整 RESTORE_PRECHECK 取得）。
+        """
+        return build_handoff_observation(_decision_sample(post=True),
+                                         external_liveness_verdict=None)
 
     def register_pause_intent_hook(fn):
         """由 scheduled runner 註冊；在 pause sender 呼叫**前一刻**回呼。"""
@@ -867,7 +909,9 @@ def build_field_dependencies(config, runtime_context=None):
             # ctx 可覆寫僅供離線測試注入（與 soc_max_pct 同一慣例）；
             # production 未注入時仍為真實 time.sleep
             sleeper=(ctx.get("sleeper") or time.sleep),
-            deadline=deadline)
+            deadline=deadline,
+            # 🔴 C3：restore 時段判定用的本機時間（與 scheduled runner 同一來源）
+            now_fn=_local_now, quick_sample_source=_restore_quick_sample)
         holder["handoff_runner"] = hrunner
         return hrunner.run()
 

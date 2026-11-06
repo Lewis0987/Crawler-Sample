@@ -405,10 +405,15 @@ LIVE_LEG_RESULTS = (LLR_NOT_ATTEMPTED, LLR_SUCCESS, LLR_FAILED, LLR_UNKNOWN)
 EXTERNAL_TAKEOVER_VERIFIED = "EXTERNAL_TAKEOVER_VERIFIED"
 EXTERNAL_TAKEOVER_UNCONFIRMED = "EXTERNAL_TAKEOVER_UNCONFIRMED"
 EXTERNAL_TAKEOVER_NOT_APPLICABLE = "EXTERNAL_TAKEOVER_NOT_APPLICABLE"
+# 🔴 C3（2026-11-06）：RESTORE_PRECHECK 未通過、restore **沒有送出**。
+#    restore 沒送出就不可能「接手已驗證」，也不是「未能確認」——
+#    external 仍由我方暫停，必須人工處理。
+EXTERNAL_TAKEOVER_WITHHELD = "EXTERNAL_TAKEOVER_WITHHELD"
 
 TAKEOVER_RESULTS = (EXTERNAL_TAKEOVER_VERIFIED,
                     EXTERNAL_TAKEOVER_UNCONFIRMED,
-                    EXTERNAL_TAKEOVER_NOT_APPLICABLE)
+                    EXTERNAL_TAKEOVER_NOT_APPLICABLE,
+                    EXTERNAL_TAKEOVER_WITHHELD)
 
 #: reconciliation 必須 fresh 取得的唯讀觀測項（取不到一律 None，不得省略）
 RECONCILIATION_ITEMS = (
@@ -463,6 +468,10 @@ def evaluate_manual_attention(live_leg_result=None, takeover=None,
     unresolved = bool(charge_sent) and not bool(stop_sent)
     if unresolved:
         reasons.append("Phase 6 已送出方向指令但未由 Phase 6 執行 cleanup STOP")
+    if takeover == EXTERNAL_TAKEOVER_WITHHELD:
+        # 🔴 C3：external 仍被我方暫停、restore 未送出 -> 一律需人工
+        reasons.append("RESTORE_WITHHELD：restore 未送出，external 仍暫停")
+        return MA_REQUIRED, reasons
     if takeover == EXTERNAL_TAKEOVER_UNCONFIRMED:
         reasons.append("external takeover 未能確認")
     if live_leg_result == LLR_UNKNOWN:
@@ -675,6 +684,59 @@ class FirstLiveDispatchPermit(object):
                     self.ordering_events())}
 
 
+# ======================================================================
+# 2026-11-06 C1 / C4：供 scheduled 層使用的整合層入口
+# ======================================================================
+# 🔴 scheduled runner 只相依本整合層（既有分層契約），因此 HOLD 與
+#    跨 attempt 責任掃描由這裡轉呼叫 orchestrator 的**唯一**實作，不另立規則。
+PRIOR_CLEAR = "PRIOR_CLEAR"
+
+
+def first_live_hold_active():
+    """C1：委派 `phase6_handoff_orchestrator.first_live_hold_active()`。"""
+    import phase6_handoff_orchestrator as _HO
+    return _HO.first_live_hold_active()
+
+
+def scan_prior_responsibility(journal_dir=None, exclude_attempt_id=None,
+                              exclude_ledger_path=None):
+    """
+    C4：委派 `phase6_handoff_orchestrator.scan_prior_responsibility()`。
+    排除需同時符合 attempt_id 與 ledger 實際檔案身分（只給 ID 不排除）。
+    """
+    import phase6_handoff_orchestrator as _HO
+    return _HO.scan_prior_responsibility(
+        journal_dir, exclude_attempt_id=exclude_attempt_id,
+        exclude_ledger_path=exclude_ledger_path)
+
+
+def register_attempt(attempt_id, ledger_path, journal_path):
+    """GAP-4：委派 orchestrator.register_attempt()（runtime index 登錄）。"""
+    import phase6_handoff_orchestrator as _HO
+    return _HO.register_attempt(attempt_id, ledger_path, journal_path)
+
+
+def close_attempt(attempt_id, result, ledger_path, journal_path, persistence):
+    """GAP-4：委派 orchestrator.close_attempt()（回傳 OK / FAILED:<err>）。"""
+    import phase6_handoff_orchestrator as _HO
+    return _HO.close_attempt(attempt_id, result, ledger_path, journal_path,
+                             persistence)
+
+
+def attempt_journal_path_default(attempt_id):
+    """正式 journal 目錄下該 attempt 的 journal 路徑（與 provider 預設相同）。"""
+    import phase6_handoff_orchestrator as _HO
+    return _HO.attempt_journal_path(_HO.DEFAULT_SCHEDULED_JOURNAL_DIR,
+                                    attempt_id)
+
+
+def persistence_summary(journal="NOT_ATTEMPTED", ledger="NOT_ATTEMPTED",
+                        index="NOT_ATTEMPTED"):
+    """GAP-3：委派 `phase6_handoff_orchestrator.persistence_summary()`。"""
+    import phase6_handoff_orchestrator as _HO
+    return _HO.persistence_summary(journal, ledger, index)
+
+
 def dispatch_flags_at_rest():
     """rest state 事實檢查。回傳 (ok, flags)。"""
     import phase6_handoff_orchestrator as _HO
@@ -702,6 +764,11 @@ def first_live_dispatch_scope(permit, now_fn=None, on_event=None):
     """
     import phase6_handoff_orchestrator as _HO
     now = now_fn or (lambda: datetime.datetime.now())
+    # 🔴 C1：FIRST_LIVE_HOLD 生效 -> STAGE B 一律拒絕，**不改動任何旗標**
+    if _HO.first_live_hold_active():
+        if permit is not None:
+            permit.state = PERMIT_DENIED
+        raise FirstLivePermitDenied("%s -> 不得 dispatch" % _HO.HOLD_REASON)
     if permit is None:
         raise FirstLivePermitDenied("未提供 permit -> 不得 dispatch")
     rest_ok, flags = dispatch_flags_at_rest()
@@ -891,6 +958,9 @@ class Phase6AuthorityLease(object):
         # 🔴 Attempt #3 postmortem：只有 acquire() **真的被呼叫過**，
         #    才允許把終態分類成 AUTHORITY_ACQUIRE_FAILED。
         self.acquire_attempted = False
+        # 🔴 2026-11-06 GAP-2：持有中曾呼叫過 release（即使中途拋例外）。
+        #    供 C3 區分「從未釋放」與「釋放結果未知」；既有欄位語意不變。
+        self.release_attempted = False
 
     def acquire(self):
         self.acquire_attempted = True
@@ -914,6 +984,7 @@ class Phase6AuthorityLease(object):
             if self.rec is not None and not self.rec.happened(EV_AUTHORITY_RELEASED):
                 self.rec.record(EV_AUTHORITY_RELEASED, "not_held_noop")
             return True
+        self.release_attempted = True
         ok = bool(self._release())
         self.held = False
         self.release_ok = ok
@@ -1454,6 +1525,9 @@ HANDOFF_ARTIFACT_FIELDS = (
     "external_takeover_checks", "external_takeover_verified",
     "manual_attention", "manual_attention_required",
     "manual_attention_reasons", "pcs_state_warning",
+    # --- 2026-11-06 C3 RESTORE_PRECHECK ＋ C7 identity（必要條件）---
+    "restore_precheck", "restore_recheck", "restore_withheld",
+    "restore_withheld_reason", "identity_preconditions",
 )
 
 ARTIFACT_KIND = "PHASE6_10_HANDOFF_EXECUTION_ARTIFACT"
@@ -1899,7 +1973,20 @@ def collect_handoff_artifact(runner_result, orchestrator=None, dispatcher=None,
     _charge_sent = int(_c2.get("phase6_charge", 0) or 0) > 0
     _stop_sent = int(_c2.get("phase6_pcs_stop", 0) or 0) > 0
     _recon = reconciliation if reconciliation is not None else None
-    if _charge_sent and not _stop_sent:
+    # 🔴 C3：restore 被扣住（未送出）-> takeover 一律 WITHHELD，
+    #    不論是否送過 CHARGE（restore 沒送出就不可能有人接手）。
+    _withheld = res.get("outcome") == "RESTORE_WITHHELD"
+    art.set(restore_precheck=res.get("restore_precheck"),
+            restore_recheck=res.get("restore_recheck"),
+            restore_withheld=_withheld,
+            restore_withheld_reason=res.get("restore_withheld_reason"),
+            identity_preconditions=res.get("identity_preconditions"))
+    if _withheld:
+        _tk, _tkc = (EXTERNAL_TAKEOVER_WITHHELD,
+                     {"restore_sent": False,
+                      "restore_withheld_reason":
+                          res.get("restore_withheld_reason")})
+    elif _charge_sent and not _stop_sent:
         # 🔴 `external_liveness_final` 由 provider 在本函式**之後**才寫入
         #    artifact，因此這裡必須由呼叫端顯式傳入 canonical verdict；
         #    未傳入時才退回 artifact 既有欄位（兩者皆無 -> UNCONFIRMED）。

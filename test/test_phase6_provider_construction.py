@@ -86,8 +86,10 @@ class FakeSshRunner(object):
     def __call__(self, verb, connect_timeout_sec, command_timeout_sec):
         self.calls.append(verb)
         if verb == "probe":
+            # 🔴 2026-11-06 C7：guard B2 probe 本來就輸出 exe / ppid
             out = ("pid=99001\n"
                    "cwd=%s\ncmd=%s\n"
+                   "exe=/usr/bin/python3.8\nppid=99000\n"
                    "screen_count=1\nguard_variant=B2\n"
                    # 🔴 五個 capability 動詞缺一即 CAPABILITY_MALFORMED
                    "capability_probe=true\ncapability_loopcheck=true\n"
@@ -268,6 +270,12 @@ def build_ctx(state=None, marks=None, reader=None):
         "target_date": "2026-10-01",
         "window_start": "00:05:00",
         "window_end": "00:30:00",
+        # 🔴 2026-11-06 C3 P-1 / GAP-6：restore 時段內的固定時間（離線注入）。
+        #    local_now 與 TOU 同一基準（Asia/Taipei aware）；host_now 為主機 naive。
+        "local_now": (lambda: datetime.datetime(
+            2026, 10, 1, 0, 10, 0,
+            tzinfo=datetime.timezone(datetime.timedelta(hours=8)))),
+        "host_now": (lambda: datetime.datetime(2026, 10, 1, 0, 10, 0)),
     }, bundle
 
 
@@ -741,4 +749,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))

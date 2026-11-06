@@ -312,8 +312,12 @@ def build_dependencies(provider, cfg, runtime_context=None):
 # ======================================================================
 # Exit 分類
 # ======================================================================
-REFUSED_RESULTS = frozenset({SC.R_ALREADY_CONSUMED, SC.R_NOT_ENABLED})
+REFUSED_RESULTS = frozenset({SC.R_ALREADY_CONSUMED, SC.R_NOT_ENABLED,
+                             SC.R_FIRST_LIVE_HOLD})
 MANUAL_RESULTS = frozenset({SC.R_EXCEPTION, SC.R_RESTORE_UNKNOWN,
+                            SC.R_RESTORE_WITHHELD,
+                            SC.R_PRIOR_RESPONSIBILITY_UNRESOLVED,
+                            SC.R_RUNTIME_INDEX_UNAVAILABLE,
                             SC.R_RESTORE_FAILED, SC.R_PAUSE_UNKNOWN,
                             SC.R_DISPATCH_UNKNOWN,
                     # 🔴 未提供 artifact 時保守視為需人工處理；
@@ -426,6 +430,47 @@ def main(argv=None):
             summary["field_side_effects"] = 0
             return _finish(summary, EXIT_HANDLED)
 
+        # 🔴 C1 FIRST_LIVE_HOLD —— **主要檢查點**（2026-11-06）
+        #    位於 build_dependencies()（HMI 登入 / 電表連線 / SSH）與
+        #    OneShotLedger 之前：HOLD 時不建 provider、不建 ledger、
+        #    沒有任何設備 I/O，也**不消耗**授權。validate-only 在上方，不受影響。
+        if SC.FL.first_live_hold_active():
+            summary["scheduled_result"] = SC.R_FIRST_LIVE_HOLD
+            summary["field_side_effects"] = 0
+            summary["one_shot_consumed"] = False
+            return _finish(summary, EXIT_REFUSED)
+
+        # 🔴 C4 —— 先前 attempt 的恢復責任（只讀 journal，無設備 I/O）
+        #    掃描目錄**固定**為正式 journal 目錄（與 provider 預設相同），
+        #    不接受 config 指定 —— 否則 config 可以把掃描導向空目錄而繞過。
+        _pv, _pdet = SC.FL.scan_prior_responsibility(None)
+        summary["prior_responsibility"] = _pv
+        if _pv != SC.FL.PRIOR_CLEAR:
+            summary["scheduled_result"] = SC.R_PRIOR_RESPONSIBILITY_UNRESOLVED
+            summary["prior_responsibility_blocking"] = [
+                x["journal"] for x in _pdet if x["blocking"]]
+            summary["field_side_effects"] = 0
+            summary["one_shot_consumed"] = False
+            return _finish(summary, EXIT_MANUAL)
+
+        # 🔴 GAP-4 —— runtime index 登錄（build_dependencies 之前，只寫本機檔）
+        #    登錄失敗 -> 拒絕執行：不得在沒有獨立登錄的情況下跑 attempt。
+        #    之後**所有**離開路徑都由 `_finish()` 寫 ATTEMPT_CLOSED。
+        _jpath = SC.FL.attempt_journal_path_default(cfg["attempt_id"])
+        try:
+            SC.FL.register_attempt(cfg["attempt_id"], cfg["ledger_path"],
+                                   _jpath)
+        except Exception as e:                                 # noqa: BLE001
+            summary["scheduled_result"] = SC.R_RUNTIME_INDEX_UNAVAILABLE
+            summary["problems"].append("runtime index 登錄失敗：%s"
+                                       % type(e).__name__)
+            summary["field_side_effects"] = 0
+            summary["one_shot_consumed"] = False
+            return _finish(summary, EXIT_MANUAL)
+        summary["_index_reg"] = {"attempt_id": cfg["attempt_id"],
+                                 "ledger_path": cfg["ledger_path"],
+                                 "journal_path": _jpath}
+
         try:
             # 🔴 FIRST LIVE permit 的授權事實一律來自**正式 config**，
             #    不是 provider 自行假定，也沒有任何 force / bypass 入口。
@@ -480,6 +525,9 @@ def main(argv=None):
         evidence = runner.run()
         summary["scheduled_result"] = evidence.get("result")
         summary["artifact_path"] = _write_artifact(cfg, evidence)
+        # 持久化最終判定在 `_finish()` 寫完 ATTEMPT_CLOSED 後才計算（含 index）
+        summary["persistence"] = {"detail": dict(
+            ((evidence or {}).get("persistence") or {}).get("detail") or {})}
         # 🔴 exit classification 依 artifact 的 manual_attention 判定
         #    （未提供時沿用舊的 result-based 判定，Fail Closed）。
         return _finish(summary, classify_exit(
@@ -510,7 +558,48 @@ def _write_artifact(cfg, evidence):
         return None
 
 
+def _report_persistence(summary, evidence, index=None):
+    """
+    🔴 GAP-3（2026-11-06）：如實回報 journal / ledger / runtime index 三者的
+       持久化結果。寫入失敗的項目**一律**記 FAILED，不得宣稱已保存；
+       三者皆未成功 -> CRITICAL_NOT_PERSISTED（同時輸出到 stderr）。
+    """
+    d = dict(((evidence or {}).get("persistence") or {}).get("detail") or {})
+    j = d.get("journal", "NOT_ATTEMPTED")
+    lg = d.get("ledger", "NOT_ATTEMPTED")
+    ix = index if index is not None else d.get("index", "NOT_ATTEMPTED")
+    overall, det = SC.FL.persistence_summary(journal=j, ledger=lg, index=ix)
+    summary["persistence"] = {"overall": overall, "detail": det,
+                              "artifact_written": bool(
+                                  summary.get("artifact_path"))}
+    if overall == "CRITICAL_NOT_PERSISTED":
+        summary["critical"] = "CRITICAL_NOT_PERSISTED"
+        try:
+            sys.stderr.write("[CRITICAL_NOT_PERSISTED] journal / ledger / "
+                             "index 皆未保存：%r\n" % (det,))
+        except Exception:                                      # noqa: BLE001
+            pass
+    return overall
+
+
+def _close_index(summary, code):
+    """GAP-4：已登錄的 attempt 一律寫 ATTEMPT_CLOSED，並把 index 結果併入持久化回報。"""
+    reg = summary.pop("_index_reg", None)
+    if not reg:
+        return
+    det = ((summary.get("persistence") or {}).get("detail") or {})
+    st = SC.FL.close_attempt(
+        reg["attempt_id"],
+        summary.get("scheduled_result") or ("LAUNCHER_EXIT_%d" % code),
+        reg["ledger_path"], reg["journal_path"],
+        {"journal": det.get("journal", "NOT_ATTEMPTED"),
+         "ledger": det.get("ledger", "NOT_ATTEMPTED")})
+    summary["runtime_index_closed"] = st
+    _report_persistence(summary, {"persistence": {"detail": det}}, index=st)
+
+
 def _finish(summary, code):
+    _close_index(summary, code)
     summary["exit_code"] = code
     summary["exit_classification"] = EXIT_NAMES.get(code, "UNKNOWN")
     summary["launcher_end_time"] = datetime.datetime.now().isoformat(

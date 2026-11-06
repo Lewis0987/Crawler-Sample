@@ -105,8 +105,10 @@ class EntrySshRunner(object):
         self.calls.append(verb)
         code = 0
         if verb == "probe":
+            # 🔴 2026-11-06 C7：guard B2 probe 本來就輸出 exe / ppid
             out = ("pid=99001\n"
                    "cwd=%s\ncmd=%s\n"
+                   "exe=/usr/bin/python3.8\nppid=99000\n"
                    "screen_count=1\nguard_variant=B2\n"
                    "capability_probe=true\ncapability_loopcheck=true\n"
                    "capability_status=true\n"
@@ -235,7 +237,13 @@ def build_entry_env(state=None, pause_result=0, restore_result=0,
 
     def observe():
         if chain_state["dispatched"] > 0:
-            bundle.state["authority"] = "OWNED_BY_PHASE6"
+            # 🔴 2026-11-06 C3：依 `control_authority.evaluate` 的既有規則建模 ——
+            #    PCS 仍在 CHARGING 時為 OWNED_BY_PHASE6；cleanup STOP 讓 PCS
+            #    真的回到 STANDBY / STOPPED 之後才是 IDLE。
+            #    （舊模型讓 OWNED 永遠黏著，與實機不符；不是直接注入 IDLE。）
+            bundle.state["authority"] = (
+                "IDLE" if dev.state in ("STANDBY", "STOPPED")
+                else "OWNED_BY_PHASE6")
         return PCS.FakeBundle.observe(bundle)
 
     bundle.observe = observe
@@ -773,4 +781,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 🔴 2026-11-06 C1：FIRST_LIVE_HOLD 只在本測試程序內暫時解除，
+    #    finally 改回 True（見 _phase6_hold_override）。
+    import _phase6_hold_override as _HOLD
+    sys.exit(_HOLD.run_main(main))
