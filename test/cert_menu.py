@@ -34,6 +34,9 @@ CHOICES = {
     "27": "查詢請求結果",
 }
 SERVICE_STALE_SEC = 15
+# pick_cert() 的「返回」哨兵。認證資料夾一律 CERT_ 開頭 →
+# 這個值不可能是合法 cert_id，不會與真實選擇混淆。
+BACK = "__BACK__"
 
 
 def enabled():
@@ -105,6 +108,9 @@ class UI:
             self.out(f"  所屬認證：{res['cert_id']}｜請求 {res['request_id']}｜處理時間 {res.get('processed_at')}")
 
     def pick_cert(self, allow_ended=True):
+        """認證紀錄選擇。23 階段標記／24 事後補拍／25 重新產生報告共用同一套：
+        0＝返回 → 回傳 BACK，呼叫端一律不執行任何動作；Enter＝第 1 項（最新）；選不到 → None。
+        """
         cid = REQ.active_on_disk(self.root)
         if cid and not allow_ended:
             return cid
@@ -118,10 +124,21 @@ class UI:
         for i, c in enumerate(certs[:9], 1):
             st = REQ.read_json(os.path.join(self.root, c, "cert_state.json")) or {}
             self.out(f"  {i}. {c}（{'記錄中' if st.get('status') == 'recording' else '已結束'}）")
-        v = self.ask("選擇認證（Enter＝第 1 項）：", "1")
+        self.out("  0. 返回")
+        v = self.ask("選擇認證（0=返回，Enter=第 1 項）：", "1")
+        if v == "0":
+            return BACK
         try:
-            return certs[int(v) - 1]
-        except (ValueError, IndexError):
+            n = int(v)
+        except ValueError:
+            return v if v in certs else None
+        # 🔴 0／負數絕不可落到 certs[n - 1]：Python 負數索引會從尾端取值
+        #    （0 → certs[-1] → 清單最舊一筆），會變成「按 0 卻選到最舊那次認證」。
+        if n < 1:
+            return None
+        try:
+            return certs[n - 1]
+        except IndexError:
             return v if v in certs else None
 
     # ---- 21 開始 --------------------------------------------------------------
@@ -202,6 +219,9 @@ class UI:
 
     def mark(self):
         cid = self.pick_cert()
+        if cid == BACK:                                 # 0＝返回：不標記、不送請求
+            self.out("已返回「認證測試」選單，未進行任何標記。")
+            return None
         if not cid:
             return None
         kind = self.ask("1. 階段標記（滿充／滿放／未滿／中止）　2. 不確定項目確認：", "1")
@@ -285,14 +305,22 @@ class UI:
         return SUP.candidates(folder, res, stage_names(res.stages), select_stage_shot, load_manifest)
 
     def post_supplement(self):
-        """沒有進行中的認證：已結束認證的事後補拍（post_test_supplement）。先說明、再選認證與階段，輸入 YES 才送出。"""
+        """沒有進行中的認證：已結束認證的事後補拍（post_test_supplement）。先說明、再選認證與階段，輸入 YES 才送出。
+        兩個階段都支援 0＝返回：① 前置確認 ② 認證紀錄選擇（pick_cert）；任一階段返回都不建立請求、不改認證資料。
+        ① 採 fail safe：只有明確輸入 Y／YES 才進入，0／Enter／任何其他輸入一律返回，不存在「預設進入補拍」的路徑。
+        """
         self.out("目前沒有進行中的認證 → 可使用「已結束認證的事後補拍」（post_test_supplement）：")
         self.out("  只補拍 6161 即時熱度（獨立櫃 110），只限原始階段結束截圖失敗或缺少的階段；")
         self.out("  ⚠ 事後補拍不代表階段結束時的設備狀態，不取代原始截圖失敗紀錄（照片另存 supplements）。")
-        if self.ask("進入事後補拍？（Y＝進入，Enter＝取消）：", "n").upper() not in ("Y", "YES"):
-            self.out("已取消。")
+        # fail safe：只有明確的 Y／YES 才往下走；0／Enter／誤觸／任何其他輸入一律返回，
+        # 不留「按錯就進入補拍」的縫隙。返回訊息與 pick_cert 階段完全一致。
+        if self.ask("進入事後補拍？（Y=進入，0=返回）：", "0").upper() not in ("Y", "YES"):
+            self.out("已返回「認證測試」選單，未送出事後補拍。")
             return None
         cid = self.pick_cert()
+        if cid == BACK:                                 # 0＝返回：不送補拍請求
+            self.out("已返回「認證測試」選單，未送出事後補拍。")
+            return None
         if not cid:
             return None
         st = REQ.read_json(os.path.join(self.root, cid, "cert_state.json")) or {}
@@ -329,6 +357,9 @@ class UI:
     # ---- 25 重產 --------------------------------------------------------------
     def regenerate(self):
         cid = self.pick_cert()
+        if cid == BACK:                                 # 0＝返回：不建立請求、不產生報告
+            self.out("已返回「認證測試」選單，未重新產生報告。")
+            return None
         return self.submit("regenerate", cert_id=cid) if cid else None
 
     # ---- 26 狀態 --------------------------------------------------------------

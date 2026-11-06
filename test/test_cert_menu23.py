@@ -9,6 +9,7 @@ stage_start 由程式帶入，不需手動輸入。全部使用合成資料與 F
 """
 
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -285,6 +286,76 @@ try:
               == ["250KW 第1次放電", "250KW 第1次充電", "250KW 第2次放電（滿放）", "250KW 第2次充電"])
     else:
         print("  （略過：本機沒有 CERT_20261029_082805）")
+    print("\n== 認證紀錄選擇：0＝返回（與選單 25 統一；本次新增）==")
+    _P23 = []
+
+    def mark_ui(answers, record_prompt=False):
+        """跑一次選單 23；record_prompt=True 時把提示文字收進 _P23。"""
+        it = iter(answers)
+
+        def inp(prompt=""):
+            if record_prompt:
+                _P23.append(prompt)
+            try:
+                return next(it)
+            except StopIteration:                   # 答案用完 → 視為使用者中斷（ask 回預設值）
+                raise KeyboardInterrupt
+        o = []
+        r = cert_menu.UI(root, inp=inp, out=o.append, wait_sec=0.1).mark()
+        return o, r
+
+    def pick23(ans):
+        return cert_menu.UI(root, inp=lambda p="": ans,
+                            out=lambda *_: None).pick_cert()
+
+    def snap23():
+        """認證資料夾下每個檔案的 (size, mtime_ns, sha256)；用來證明「什麼都沒改」。"""
+        snap = {}
+        for cid_ in sorted(d for d in os.listdir(root) if d.startswith("CERT_")):
+            for dp, _d, fs in os.walk(os.path.join(root, cid_)):
+                for fn in sorted(fs):
+                    p_ = os.path.join(dp, fn)
+                    stt_ = os.stat(p_)
+                    with open(p_, "rb") as fh:
+                        snap[os.path.relpath(p_, root)] = (stt_.st_size, stt_.st_mtime_ns,
+                                                           hashlib.sha256(fh.read()).hexdigest())
+        return snap
+
+    n23, snap_b = n_requests(root), snap23()
+    dec_b = {c: len(_read_jsonl(os.path.join(root, c, "decisions.jsonl"))) for c in (END, REC)}
+    outs, res = mark_ui(["0"], record_prompt=True)
+    check("認證清單新增「  0. 返回」", "  0. 返回" in outs)
+    check("提示文字與選單 25 統一：選擇認證（0=返回，Enter=第 1 項）：",
+          _P23[-1] == "選擇認證（0=返回，Enter=第 1 項）：")
+    check("輸入 0 → mark() 直接返回（不再往下問階段標記／不確定項目）", res is None)
+    check("輸入 0 → 明確告知已返回、未進行任何標記",
+          any("已返回" in o and "未進行任何標記" in o for o in outs))
+    check("輸入 0 → 不建立任何請求", n_requests(root) == n23)
+    check("輸入 0 → 不新增任何階段標記（decisions.jsonl 筆數不變）",
+          {c: len(_read_jsonl(os.path.join(root, c, "decisions.jsonl"))) for c in (END, REC)} == dec_b)
+    check("輸入 0 → 既有認證紀錄一個 byte 都沒變（size / mtime_ns / sha256 全部相同）",
+          snap23() == snap_b)
+    check("🔴 迴歸：輸入 0 不再經 Python 負索引選到最舊一筆（回 BACK 哨兵，不是任何 cert_id）",
+          pick23("0") == cert_menu.BACK)
+
+    check(f"輸入 1 → 最新一次認證（{REC}）", pick23("1") == REC)
+    check(f"輸入 2 → 第 2 項（{END}）", pick23("2") == END)
+    check(f"直接按 Enter → 維持預設第 1 項（{REC}）", pick23("") == REC)
+    for ans, lab in (("3", "剛好超出清單筆數（3 / 共 2 筆）"), ("99", "遠超出清單範圍（99）"),
+                     ("-1", "負數（-1，不得經負索引取到最舊一筆）"), ("xyz", "非數字且非 cert_id")):
+        check(f"{lab} → 回 None（維持原本退出行為）", pick23(ans) is None)
+    n23b, snap_c = n_requests(root), snap23()
+    for ans in ("3", "99", "-1", "xyz"):
+        mark_ui([ans])
+    check("超出範圍／負數／亂輸入 → 不建立請求，且認證紀錄未被修改",
+          n_requests(root) == n23b and snap23() == snap_c)
+
+    outs, res = mark_ui(["2", "1", "0"])
+    check("選 2 後仍可正常進入階段標記流程（階段清單照常列出）",
+          any("1. 第1次充電" in o for o in outs) and n_requests(root) == n23b)
+    outs, res = mark_ui(["2", "1", "1", "1"])
+    check("選 2 → 階段 1 → 滿充：正常送出請求（0＝返回不影響正常路徑）",
+          n_requests(root) == n23b + 1)
 finally:
     shutil.rmtree(TMP, ignore_errors=True)
 

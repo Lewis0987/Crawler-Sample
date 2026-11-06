@@ -227,6 +227,8 @@ Phase 6.10 Ownership Handoff               ← OFFLINE COMPLETE / FIELD IN VALID
 | `phase6_decision_simulator.py` / `phase6_decision_replay_runner.py` | 離線決策模擬器 / 虛擬時鐘 replay runner |
 | `run_phase3_regression.py` | Phase 2~5 Regression 總表 |
 | `run_all.py` | 一鍵執行全部**擷取腳本**（⚠️ **不是** Phase 6 regression 入口） |
+| `run_offline_regression.py` | **純離線 Regression 正式入口**：預設不連實機（排除清單 ＋ socket 阻擋兩道防線） |
+| `_offline_guard/sitecustomize.py` | 經 `PYTHONPATH` 注入的網路阻擋器；受測行程與其 python 子行程一律攔截 `socket.connect` |
 
 ---
 
@@ -237,6 +239,7 @@ python device_control_scraper.py     # 產生 device_control_readonly.json + 摘
 python dashboard_scraper.py --once   # Dashboard 抓一次
 python device_control_menu.py        # CLI 設備控制選單
 python run_phase3_regression.py      # Phase 2~5 Regression
+python run_offline_regression.py     # 純離線 Regression（預設不連實機）
 ```
 
 - **登入設定**放在 `test/` 下的 `*.env`（例如 `login.env`），依 `.env.example` 建立。
@@ -245,6 +248,7 @@ python run_phase3_regression.py      # Phase 2~5 Regression
   `output/`。任何名稱不明的 `run_all.py` / `main.py` / `service.py` / `runner.py`，
   執行前必須先確認 I/O side effects。
 - Phase 6 regression 以**逐檔執行** `test_phase6*.py` 為準（見 [§14](#14-regression)）。
+- 純離線 Regression 請用 `run_offline_regression.py`（預設排除需實機的套件，並以 socket 阻擋攔下意外連線）。入口分類見 [`TEST_ENTRY_POINTS.md`](TEST_ENTRY_POINTS.md)。
 
 ---
 
@@ -1051,6 +1055,7 @@ provider interface shape / path resolution / static dependency declaration。
 | Phase 2~5 | **1802 / 1802 PASS**，0 FAIL / 0 SKIP | `python run_phase3_regression.py` |
 | Phase 6 | **6797 / 6797 PASS**，**63 檔**，0 FAIL | 逐檔執行 `test_phase6*.py` |
 | Phase 6.10 dedicated | **1173 / 1173 PASS**，**11 檔**，0 FAIL | 逐檔執行 `test_phase6_610*.py` |
+| 純離線全量 | 見 `run_offline_regression.py` 輸出；`test_pcs_modes` 5 項為既有失敗 | `python run_offline_regression.py` |
 
 主要 dedicated 基準：
 
@@ -1082,6 +1087,7 @@ provider interface shape / path resolution / static dependency declaration。
 > 逐檔執行前請設 `PYTHONIOENCODING=utf-8` —— 這是**輸出編碼**問題，
 > 不是測試失敗。
 > ⚠️ **`run_all.py` 不是 regression 入口**（見 [§5](#5-快速使用)）。
+> 純離線全量 Regression 用 `run_offline_regression.py`：預設排除需實機的套件（`test_cert_p2_live`、`test_sm2_login`），並以 socket 阻擋攔下意外的對外連線；`test_pcs_modes` 的 5 項既有失敗會獨立列示、不隱藏。入口分類見 [`TEST_ENTRY_POINTS.md`](TEST_ENTRY_POINTS.md)。
 
 ---
 
