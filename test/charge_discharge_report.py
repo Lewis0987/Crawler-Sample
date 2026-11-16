@@ -43,6 +43,7 @@ import math
 import time
 import shutil
 import argparse
+import threading
 import contextlib
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
@@ -426,14 +427,56 @@ def _pcs_metric_map(pcs_data):
 # ======================================================================
 # 取樣：一次讀取所有唯讀來源，解析成統一 reading dict
 # ======================================================================
+#: read_all 的請求順序（9 次 GET；PCS 英文／zh-TW 各 1 次）。只供測試與文件對照，不影響行為。
+READ_ALL_ENDPOINTS = (EP_MAINCTL, EP_RACKEXT, EP_RACKCAP, EP_PCS, EP_PCS, EP_RUNMODE, EP_SCHEDULE, EP_DODI, EP_ALARM)
+#: M-S2 r2c O-1：認證專用讀取的請求順序（5 次 GET）。
+READ_CERT_ENDPOINTS = (EP_MAINCTL, EP_RACKEXT, EP_PCS, EP_PCS, EP_DODI)
+_READ_TIMING_TLS = threading.local()
+
+
+def last_read_timing():
+    """
+    同一執行緒最近一次 read_all／read_cert 的逐端點耗時：[(端點, 毫秒), ...]（依請求順序；量測用，不新增請求）。
+    尚未讀取過 → []。只記端點與耗時，不含回應內容。
+    """
+    return list(getattr(_READ_TIMING_TLS, "last", None) or [])
+
+
 def read_all(client):
     """
     一次取樣（全部 GET 唯讀）。回傳 reading dict；任何關鍵來源失敗則 communication_ok=False。
     不丟例外（單支失敗以 None 表示），確保長時間監測不中斷。
+    M-S2 r2c O-1：本體移到 _read_hmi（與 read_cert 共用同一份解析）；請求順序、次數（9 次）、回傳內容與原本完全相同。
     """
+    return _read_hmi(client, cert_only=False)
+
+
+def read_cert(client):
+    """
+    M-S2 r2c O-1：認證報告專用讀取 —— 每次固定 5 次 GET（READ_CERT_ENDPOINTS）：
+      mainControlCollectsInformation、rackExtremeValueInformation、envCon/pcs（英文）、envCon/pcs（zh-TW）、getDOAndDIMsg。
+    解析與 read_all 為同一份程式（_read_hmi），認證用到的欄位與 read_all 逐一相同：
+      8 個數值、PCS 旗標×5、pcs_status、battery_power_status、communication_ok、raw_source_time、
+      _fail（格式相同；只含實際讀取的端點）。
+    不讀 rackCapacity、getRunMode、getScheduleSwitch、alarm/list（認證不使用）→ 回傳中沒有那些鍵。
+    只供認證（cert_service._reader）使用；單次報告、監看層（含登入態失效偵測）、Phase 6 仍用 read_all。不丟例外。
+    """
+    return _read_hmi(client, cert_only=True)
+
+
+def _read_hmi(client, cert_only):
     r = {"raw_source_time": "", "communication_ok": True, "_fail": []}
+    _ep_ms = []
+    _READ_TIMING_TLS.last = _ep_ms
 
     def _get(path, **kw):
+        t0 = time.perf_counter()
+        try:
+            return _get_inner(path, **kw)
+        finally:
+            _ep_ms.append((path, round((time.perf_counter() - t0) * 1000, 1)))
+
+    def _get_inner(path, **kw):
         """
         單支 GET，失敗一律記入 r["_fail"]（不丟例外）。_fail 元素格式：
             "<path>"                  取回 None
@@ -503,11 +546,12 @@ def read_all(client):
 
     # 1c) 設備今日累計充/放電量（guest；overview/rackCapacityInformation，與 Dashboard「當日」同源同值）
     #     直接取 API 值、不重新積分；僅供 Summary 對照，不進 samples.csv、不影響能量統計。
-    rcap = _get(EP_RACKCAP)
-    r["device_daily_charge_kwh"] = (_to_float(rcap.get("accumulatedDailyChargingEnergy"))
-                                    if isinstance(rcap, dict) else None)
-    r["device_daily_discharge_kwh"] = (_to_float(rcap.get("accumulatedDailyDisChargingEnergy"))
-                                       if isinstance(rcap, dict) else None)
+    if not cert_only:                                   # 認證不使用（O-1：cert_only 不讀）
+        rcap = _get(EP_RACKCAP)
+        r["device_daily_charge_kwh"] = (_to_float(rcap.get("accumulatedDailyChargingEnergy"))
+                                        if isinstance(rcap, dict) else None)
+        r["device_daily_discharge_kwh"] = (_to_float(rcap.get("accumulatedDailyDisChargingEnergy"))
+                                           if isinstance(rcap, dict) else None)
 
     # 2) PCS 有功/無功/直流/狀態（guest）
     #    - 英文 enum（不帶語言）：供數值與 parse_pcs_modes 解析（gridTied/ac/dc 等）
@@ -552,19 +596,20 @@ def read_all(client):
     r["daily_discharged_kwh"] = _mv("dailyDischargedEnergyThroughAcPort")
     r["pcs_status"] = parse_pcs_current_status(_pcs_metrics_list(pcs_data_tw)) or "未知"
 
-    # 3) PCS 模式（authed；重用 parse_pcs_modes）
-    runmode = _get(EP_RUNMODE)
-    schedule = _get(EP_SCHEDULE)
-    pcs_raw = {mk: md.get("value") for mk, md in marks.items()}
-    modes = parse_pcs_modes(runmode if isinstance(runmode, str) else "", schedule, pcs_raw)
-    r["pcs_control_mode"] = _CONTROL_MODE_DISPLAY.get(modes["control_mode"], "未知")
-    # 機器語意（語言無關）：smart / manual / none / unknown。供監看層判斷用，
-    # 不要拿上面的中文顯示字串做比較（同 pcs_fault_flag 的理由：語系/文案可能調整）。
-    r["pcs_control_mode_code"] = modes["control_mode"]
-    r["pcs_work_mode"] = _GRID_MODE_DISPLAY.get(modes["grid_mode"], "未知")
-    r["pcs_power_control_mode"] = modes["power_control_mode"]
-    r["pcs_schedule_enabled"] = modes["schedule_enabled"]
-    r["pcs_manual_switch"] = (schedule.get("manualModeSwitch") if isinstance(schedule, dict) else None)
+    # 3) PCS 模式（authed；重用 parse_pcs_modes）—— 認證不使用（O-1：cert_only 不讀）
+    if not cert_only:
+        runmode = _get(EP_RUNMODE)
+        schedule = _get(EP_SCHEDULE)
+        pcs_raw = {mk: md.get("value") for mk, md in marks.items()}
+        modes = parse_pcs_modes(runmode if isinstance(runmode, str) else "", schedule, pcs_raw)
+        r["pcs_control_mode"] = _CONTROL_MODE_DISPLAY.get(modes["control_mode"], "未知")
+        # 機器語意（語言無關）：smart / manual / none / unknown。供監看層判斷用，
+        # 不要拿上面的中文顯示字串做比較（同 pcs_fault_flag 的理由：語系/文案可能調整）。
+        r["pcs_control_mode_code"] = modes["control_mode"]
+        r["pcs_work_mode"] = _GRID_MODE_DISPLAY.get(modes["grid_mode"], "未知")
+        r["pcs_power_control_mode"] = modes["power_control_mode"]
+        r["pcs_schedule_enabled"] = modes["schedule_enabled"]
+        r["pcs_manual_switch"] = (schedule.get("manualModeSwitch") if isinstance(schedule, dict) else None)
 
     # 4) 電池上下電（authed）
     dodi = _get(EP_DODI)
@@ -574,20 +619,22 @@ def read_all(client):
     # 5) 告警（guest；抓第一頁，取 total 與 rows；完整去重在 AlarmTracker）
     #    帶 Accept-Language: zh-TW → 後端把 typeMark/targetMark/val/triggerVal 直接中文化
     #    （與 HMI 一致：device.type.bcu→電池、1838F4.soc.underAlarm→SOC過低報警、1838F4.minorAlarm→輕微報警）。
-    alarm = _get(EP_ALARM, params={"pageNo": 1, "pageSize": 100}, headers=_PCS_LANG_HEADER)
-    rows = []
-    total = None
-    if isinstance(alarm, dict):
-        rows = alarm.get("rows") or alarm.get("list") or alarm.get("records") or []
-        total = alarm.get("total")
-    r["alarm_rows"] = rows if isinstance(rows, list) else []
-    r["alarm_total"] = total if total is not None else len(r["alarm_rows"])
-    # ⚠️ alarm_total 在後端未回 total 時會以 len(rows) 補值 —— 該補值**不可**用來判斷
-    #    「告警清單是否完整」，否則「後端真的回 total=N」與「後端沒回、我們自己補 N」
-    #    會變得無法區分。alarm_total_raw 保留後端**實際提供**的值（未提供即 None），
-    #    供 Phase 6 Safety Gate 的 alarm_source_complete 判定使用。
-    #    alarm_total 的原行為刻意不變，維持 Phase 1~5 相容。
-    r["alarm_total_raw"] = total
+    #    認證不使用（O-1：cert_only 不讀）
+    if not cert_only:
+        alarm = _get(EP_ALARM, params={"pageNo": 1, "pageSize": 100}, headers=_PCS_LANG_HEADER)
+        rows = []
+        total = None
+        if isinstance(alarm, dict):
+            rows = alarm.get("rows") or alarm.get("list") or alarm.get("records") or []
+            total = alarm.get("total")
+        r["alarm_rows"] = rows if isinstance(rows, list) else []
+        r["alarm_total"] = total if total is not None else len(r["alarm_rows"])
+        # ⚠️ alarm_total 在後端未回 total 時會以 len(rows) 補值 —— 該補值**不可**用來判斷
+        #    「告警清單是否完整」，否則「後端真的回 total=N」與「後端沒回、我們自己補 N」
+        #    會變得無法區分。alarm_total_raw 保留後端**實際提供**的值（未提供即 None），
+        #    供 Phase 6 Safety Gate 的 alarm_source_complete 判定使用。
+        #    alarm_total 的原行為刻意不變，維持 Phase 1~5 相容。
+        r["alarm_total_raw"] = total
 
     # 通訊判定：關鍵來源（電池主資訊 + PCS 有功）任一失敗 → 通訊異常
     if main is None or pcs_data is None:

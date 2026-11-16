@@ -492,8 +492,9 @@ try:
     desc = wb.properties.description or ""
     check("報告標題用輸入的電櫃規格與循環數（【340KW】電櫃充放2個循環溫度曲線）",
           "【340KW】電櫃充放2個循環溫度曲線" in titles_)
-    check("來源說明（取樣週期 5 秒＝正式設定、其他暫用參數、指令快照限制、服務中斷期間）寫入活頁簿屬性，不改動已確認版面",
-          "取樣週期 5 秒為正式設定" in desc and "其他參數（G、確認門檻" in desc and "暫用測試值" in desc
+    # 2026-11-11 M-S2（G-1 授權）：正式取樣週期 5 → 1 秒 → 來源說明文字的期待值依新設定更新（其餘條件不變）
+    check("來源說明（取樣週期 1 秒＝正式設定、其他暫用參數、指令快照限制、服務中斷期間）寫入活頁簿屬性，不改動已確認版面",
+          "取樣週期 1 秒為正式設定" in desc and "其他參數（G、確認門檻" in desc and "暫用測試值" in desc
           and "參數（取樣週期" not in desc and "只保留最近一次" in desc and "服務中斷" in desc and "Summary" in wb.sheetnames[0])
     check("階段頁籤依操作人員標記命名（1.第1次放電(滿放)）", any(n.startswith("1.第1次放電(滿放)") for n in wb.sheetnames))
     z.close()
@@ -924,13 +925,14 @@ try:
           raised is None and len(obs_t2) >= n_before + 9 and rtT.timing_errors >= 9 and rtT.is_active()
           and json.load(open(os.path.join(fold_t, "cert_state.json"), encoding="utf-8"))["sample_count"] == len(obs_t2))
     import charge_discharge_report as _CDR
-    _bak_c, _bak_r = RM._report.get("client"), _CDR.read_all
+    # r2c O-1：服務 reader 改用認證專用讀取 read_cert（5 GET）→ 注入點由 read_all 改為 read_cert（斷言不變）
+    _bak_c, _bak_r = RM._report.get("client"), _CDR.read_cert
     try:
         RM._report["client"] = object()
-        _CDR.read_all = lambda c_: {"_fail": [], "soc_percent": 50}
+        _CDR.read_cert = lambda c_: {"_fail": [], "soc_percent": 50}
         r_ok = cert_service._reader()
         tm_ok = dict(cert_service._READ_TIMING)
-        _CDR.read_all = lambda c_: 1 / 0
+        _CDR.read_cert = lambda c_: 1 / 0
         try:
             cert_service._reader()
             raised_r = False
@@ -941,15 +943,16 @@ try:
         r_none = cert_service._reader()
         tm_none = dict(cert_service._READ_TIMING)
     finally:
-        RM._report["client"], _CDR.read_all = _bak_c, _bak_r
+        RM._report["client"], _CDR.read_cert = _bak_c, _bak_r
     check("T8 服務 reader 計時：等 _CLIENT_LOCK 與 read_all 毫秒（perf_counter）；read_all 例外照原本行為往外丟、仍記錄計時；"
           "沒有 client → None（不留舊計時）",
           r_ok == {"_fail": [], "soc_percent": 50} and set(tm_ok) == {"lock_wait_ms", "read_ms"}
           and raised_r and set(tm_err) == {"lock_wait_ms", "read_ms"} and r_none is None and tm_none == {})
-    # 2026-11-03 正式需求由 10 秒改為 5 秒（Phase 1 實機 PASS）→ 期待值依新需求更新（舊 10 秒期待已過時）
-    check("T7 取樣間隔＝正式設定：SAMPLE_INTERVAL_SEC = 5，下一次取樣 = 寫入時間 + 5 秒",
-          CFG.SAMPLE_INTERVAL_SEC == 5 and rtT.next_sample == datetime.strptime(obs_t2[-1]["t"], "%Y-%m-%dT%H:%M:%S")
-          + timedelta(seconds=5))
+    # 2026-11-03 正式需求由 10 秒改為 5 秒；2026-11-11 M-S2（G-1 授權）由 5 秒改為 1 秒 → 期待值依新需求更新
+    #   （tick 模擬路徑：下一次 = 寫入時間 + 週期；背景服務另以 1 秒固定格點排程，見 test_cert_1hz_s2）
+    check("T7 取樣間隔＝正式設定：SAMPLE_INTERVAL_SEC = 1，下一次取樣 = 寫入時間 + 1 秒",
+          CFG.SAMPLE_INTERVAL_SEC == 1 and rtT.next_sample == datetime.strptime(obs_t2[-1]["t"], "%Y-%m-%dT%H:%M:%S")
+          + timedelta(seconds=1))
 
     print("\n== Idle-only 認證／Menu 22 最後取樣／認證結束（最後狀態）截圖 ==")
     import threading

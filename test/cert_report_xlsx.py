@@ -18,7 +18,7 @@
 import os
 import re
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from openpyxl import Workbook
 from openpyxl.chart import LineChart, Reference
@@ -800,12 +800,22 @@ def overall_phase(o, names):
     return o.stage_no, o.direction, o.state, status_text(o, names)
 
 
-def is_report_valid(o, p, names):
-    """正式報表有效觀測（Raw Data 與 4 張階段頁每分鐘選樣共用的唯一定義；條件見 raw_rows_obs）。
-    必要欄位規則修改只改這裡，兩邊不會再出現「Raw Data 排除、階段頁仍選用」的情況。"""
+def raw_measurement_valid(o, p):
+    """
+    r2c：量測有效性（只看本筆讀值本身）：HMI 讀取成功（ok 且 has_hmi_values）且 RAW_REQUIRED 全部有有效數值。
+    不看「狀態能否判定」。1 秒格點 Raw Data 每秒列以此判定本秒是否有真正的新量測（LIVE）；
+    讀取失敗、HMI 全無值、必要欄位缺值 → 不是新量測（不會成為 LIVE）。
+    例：階段結束後電流已歸零、PCS 充放電旗標尚未歸零 → 狀態無法判定（N/A），但量測本身有效 → Raw Data 照列真實讀值。
+    """
     return (o.ok and has_hmi_values(o)
-            and all(field_value(o, k, p) is not None for k in RAW_REQUIRED)
-            and status_text(o, names) != NA)
+            and all(field_value(o, k, p) is not None for k in RAW_REQUIRED))
+
+
+def is_report_valid(o, p, names):
+    """正式報表有效觀測（4 張階段頁／整體頁每分鐘選樣；5 秒歷史認證的 Raw Data 也用此定義；條件見 raw_rows_obs）
+    ＝量測有效（raw_measurement_valid）且狀態可判定。r2c：1 秒格點 Raw Data 每秒列只用量測有效性（見 raw_second_rows）
+    → 該頁可能多列出「狀態 N/A」的真實量測；階段頁／整體頁／判定的選樣規則不變。"""
+    return raw_measurement_valid(o, p) and status_text(o, names) != NA
 
 
 def _write_raw(ws, res, names, p):
@@ -990,8 +1000,199 @@ def build_workbook(res, meta):
     _write_heat(ws_heat, res.stages, names, shots, show_final)
     _write_summary(wb, ws_sum, res, names_full, sheet_of, n_rows, meta, p)
     # 「控制紀錄」頁已自報告移除；commands.jsonl 仍由 cert_runtime 照常記錄（不影響控制流程／稽核）
-    _write_raw(wb.create_sheet("Raw Data"), res, names_full, p)
+    grid = (meta.get("sampling_slots") or {}).get("grid")
+    rs = raw_second_rows(res, grid, names_full) if grid else None
+    if rs is None:
+        _write_raw(wb.create_sheet("Raw Data"), res, names_full, p)
+        if grid:
+            wb._cert_raw_note = ("Raw Data：本認證的格點不是全部 1 秒間隔（或沒有任何格點）→ 維持只列實際有效觀測的格式"
+                                 "（不補秒、不沿用）。")
+    else:
+        write_raw_seconds(wb, rs, p, names_full)            # M-S2 r2：每秒一列（整筆沿用）；取代 Sampling Slots 工作表
+        wb._cert_raw_note = raw_seconds_note(rs)
     return wb
+
+
+# =============================================================================
+# M-S2 r2：Raw Data 每秒一列（1 秒格點認證；有 slots.jsonl 且全部段落間隔 1 秒時才使用）
+#   整筆沿用：沒有新的有效觀測 → 沿用最近一筆有效觀測的整列（不同欄位不混用不同時間）；只供 Raw Data 顯示，
+#   階段頁／整體頁／圖表／Summary／判定仍只使用實際觀測（不讀本頁）。歷史認證 → 上方 _write_raw（原格式）。
+# =============================================================================
+RAW_SHEET = "Raw Data"
+RAW_MAX_ROWS = 1048576              # Excel 單一工作表列數上限（含標題）；超過 → 「Raw Data (2)」…（測試可調小）
+RAW_VALUE_HEADERS = RAW_HEADERS[RAW_COL["SOC"] - 1:RAW_NOTE_COL - 1]     # SOC～功率 kW（與原 Raw Data 相同順序）
+# r2b：Excel 只顯示時間／狀態／數值／說明（13 欄）；內部資料狀態、來源、資料年齡與品質統計不變（描述與原始紀錄保留）
+RAW1_HEADERS = ["時間", "狀態"] + RAW_VALUE_HEADERS + ["說明"]
+RAW1_COL = {h: i for i, h in enumerate(RAW1_HEADERS, 1)}
+RAW1_WIDTHS = {"時間": 20, "狀態": 11, "說明": 46}
+RAW1_FONT = Font(color="FF000000")              # r2b：所有資料列一律黑色 #000000（ARGB 不透明；不依資料狀態區分顏色）
+RAW1_HEAD_FONT = Font(bold=True, color="FF000000")
+
+
+def _obs_by_ref(obs, raw_items):
+    """
+    原始紀錄（raw_ref＝observations.jsonl 實體行號）→ 分析用 Obs。兩者來自同一份 observations.jsonl，但分析端會略過
+    無法解析的行（索引錯位），且觀測順序可能依時間重排（時鐘被調整時）→ 不用索引或順序，改以「時間＋數值＋旗標」
+    內容對應（完全相同的紀錄依出現順序配對）。找不到 → 不對應（該格不算 LIVE、不作為沿用來源）。
+    回傳 (dict, 無法對應筆數)。
+    """
+    def key(t, vals, flags):
+        return (t, repr(sorted(vals.items())), repr(sorted(flags.items())))      # repr：NaN 也能比對
+    pool = {}
+    for o in obs:
+        pool.setdefault(key(o.t, o.values or {}, o.flags or {}), []).append(o)
+    out, miss = {}, 0
+    for it in raw_items:
+        rec = it.get("record") or {}
+        try:
+            t = datetime.strptime(rec.get("t") or "", "%Y-%m-%dT%H:%M:%S")
+        except (TypeError, ValueError):
+            miss += 1
+            continue
+        cand = pool.get(key(t, rec.get("values") or {}, rec.get("flags") or {}))
+        if cand:
+            out[it.get("raw_ref")] = cand.pop(0)
+        else:
+            miss += 1
+    return out, miss
+
+
+def raw_second_rows(res, grid, names=None):
+    """
+    Raw Data 每秒列（純資料，不寫檔）。不適用（沒有格點、或格點間隔不是 1 秒）→ None。
+    每列另附 obs（來源觀測；N/A → None）。
+    r2c：本秒是否有新量測＝量測有效性（raw_measurement_valid），不含狀態可判定性 → 階段結束後旗標延遲期間的
+    真實讀值（例：電流 0.0 A）照常列出（狀態欄 N/A），不再整筆沿用前一階段的讀值。階段頁仍用 is_report_valid。
+    """
+    import report_display as RD     # 補值模組只在本函式使用（階段頁／整體頁／判定不使用）
+    if not grid:
+        return None
+    if names is None:
+        nm = stage_names(res.stages)
+        names = {st.no: _stage_title(nm, st) for st in res.stages}
+    p = res.params
+    ref2obs, miss = _obs_by_ref(res.obs, grid.get("raw") or [])
+    cache = {}
+
+    def valid(ref):
+        if ref not in cache:
+            o = ref2obs.get(ref)
+            cache[ref] = o is not None and raw_measurement_valid(o, p)
+        return cache[ref]
+    out = RD.build_raw_seconds(grid.get("result"), grid.get("raw") or [], valid,
+                               started_at=grid.get("started_at"), interruptions=grid.get("interruptions"))
+    if out is None:
+        return None
+    for r in out["rows"]:
+        r["obs"] = ref2obs.get(r["src"]) if r["src"] is not None else None
+    out["stats"]["unmatched_raw"] = miss
+    check_raw_continuity(out["rows"])
+    return out
+
+
+def check_raw_continuity(rows):
+    """每秒一列、時間連續且不重複；不成立 → 例外（報告產生失敗、原始資料不動，可重新產生），不輸出錯誤的 Raw Data。"""
+    one = timedelta(seconds=1)
+    for a, b in zip(rows, rows[1:]):
+        if a["time"] is None or b["time"] is None or b["time"] - a["time"] != one:
+            raise RuntimeError(f"Raw Data 每秒列不連續：{a['time']} → {b['time']}")
+
+
+def _raw1_note(r, p):
+    """說明欄（r2b）：只放來源觀測本身的設備資訊（分析狀態、電池上下電、傳感器、PCS 模組溫度說明）；
+    沿用列＝來源列的說明（整筆沿用）；沒有來源（N/A）→ 空白。不顯示取樣品質／沿用等技術文字（統計在報告描述）。"""
+    o = r.get("obs")
+    parts = []
+    if o is not None:
+        if o.state not in ("充電", "放電"):
+            parts.append(f"分析狀態：{o.state}")
+            parts.append(f"電池上下電：{(o.flags or {}).get('battery_power_status') or '未保存'}")
+            # r2c：狀態無法判定（N/A）時附上設備回報的 PCS 狀態原文（例：電流已歸零但 PCS 仍回報放電）；不另做推論
+            if device_state(o) == NA and (o.flags or {}).get("pcs_status"):
+                parts.append(f"PCS 狀態：{o.flags['pcs_status']}")
+        if o.sensor_ok is False:
+            parts.append("傳感器關閉或異常")
+        parts.append(pcs_display(o, p)[1])
+    return _join_notes(*parts)
+
+
+def write_raw_seconds(wb, rs, p, names, max_rows=None):
+    """M-S2 r2：Raw Data 每秒一列（超過列數上限 → 「Raw Data (2)」…）。回傳工作表名稱清單。"""
+    max_rows = max_rows or RAW_MAX_ROWS
+    col = RAW1_COL
+    vcol = col["SOC"]
+    ncol = len(RAW1_HEADERS)
+    keys = LOG_KEYS + ["power_kw"]
+    sheets = []
+    pg = {"ws": None, "row": 0}
+
+    def new_page():
+        title = RAW_SHEET if not sheets else f"{RAW_SHEET} ({len(sheets) + 1})"
+        ws = wb.create_sheet(title)
+        sheets.append(ws)
+        for c, h in enumerate(RAW1_HEADERS, 1):
+            cell = ws.cell(1, c, h)
+            cell.font = RAW1_HEAD_FONT
+            cell.fill = HDR_FILL
+        pg["ws"], pg["row"] = ws, 1
+
+    def finish(ws, last_row):
+        widths = dict(RAW1_WIDTHS, **dict(zip(RAW_VALUE_HEADERS, [7, 9, 13, 13, 13, 13, 9, 11, 13, 9])))
+        for h, i in col.items():
+            ws.column_dimensions[get_column_letter(i)].width = widths[h]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(ncol)}{max(last_row, 1)}"
+
+    new_page()
+    for r in rs["rows"]:
+        if pg["row"] >= max_rows:
+            finish(pg["ws"], pg["row"])
+            new_page()
+        ws = pg["ws"]
+        rr = pg["row"] + 1
+        pg["row"] = rr
+        o = r.get("obs")
+        cells = [ws.cell(rr, col["時間"], r["time"])]
+        cells[0].number_format = "yyyy-mm-dd hh:mm:ss"
+        if o is not None:
+            cells.append(ws.cell(rr, col["狀態"], status_text(o, names)))
+            pcs, _note = pcs_display(o, p)
+            for c, k in enumerate(keys, vcol):
+                v = field_value(o, k, p)
+                cell = ws.cell(rr, c, pcs if k == "pcs_module_c" else _v(v))
+                if k in LOG_FORMATS and v is not None:
+                    cell.number_format = LOG_FORMATS[k]
+                cells.append(cell)
+        else:
+            cells.append(ws.cell(rr, col["狀態"], NA))
+            cells.extend(ws.cell(rr, c) for c in range(vcol, vcol + len(keys)))     # 數值格空白（不虛構），字型仍統一黑色
+        cells.append(ws.cell(rr, col["說明"], _raw1_note(r, p) or None))
+        for cell in cells:
+            cell.font = RAW1_FONT
+    finish(pg["ws"], pg["row"])
+    return [ws.title for ws in sheets]
+
+
+def raw_seconds_note(rs):
+    """報告描述（活頁簿屬性）用的一行摘要。"""
+    import report_display as RD
+    s, rows = rs["stats"], rs["rows"]
+    c = s["counts"]
+    span = f"{rows[0]['time']:%Y-%m-%d %H:%M:%S}～{rows[-1]['time']:%Y-%m-%d %H:%M:%S}" if rows else "—"
+    txt = (f"Raw Data（1 秒格點認證）：每秒一列，共 {len(rows)} 列（{span}），秒數連續不重複；"
+           "沒有新的有效量測時整筆沿用最近一筆有效量測（沿用值不是新量測；Excel 不另外標示，各狀態秒數如下；"
+           "讀值有效但狀態無法判定者照列真實讀值、狀態顯示 N/A）；"
+           + "／".join(f"{k} {c.get(k, 0)}" for k in RD.RAW_STATES)
+           + f"；最長資料年齡 {'—' if s['max_age'] is None else str(s['max_age']) + ' 秒'}")
+    if s.get("age_unknown"):
+        txt += f"；資料年齡無法計算（時鐘異常）{s['age_unknown']} 列"
+    if s.get("overlap_slots"):
+        txt += (f"；時鐘回撥：{s['overlap_slots']} 個格點與前段時間重疊（{s['overlap_from']:%H:%M:%S}～"
+                f"{s['overlap_to']:%H:%M:%S}），不產生列、其觀測不採用（原始紀錄保留）")
+    if s.get("unmatched_raw"):
+        txt += f"；{s['unmatched_raw']} 筆原始紀錄無法對應分析觀測（不採用）"
+    return txt + ("。資料年齡＝本列秒－來源列秒（同一段落內以單調時鐘推算；跨服務停止以電腦時鐘計算，停止期間的時鐘調整"
+                  "若未造成時間重疊則無法偵測）。階段頁、整體頁、圖表與判定只使用實際觀測，不使用本頁沿用值。")
 
 
 def save_report(res, meta, path):
@@ -1000,7 +1201,11 @@ def save_report(res, meta, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     wb = build_workbook(res, meta)
     # 來源說明（暫用參數、中斷、未完成等）寫入活頁簿屬性「描述」：不改動已確認的頁面版面
-    notes = meta.get("source_notes") or []
+    notes = list(meta.get("source_notes") or [])
+    raw_note = getattr(wb, "_cert_raw_note", None)
+    if raw_note:                                   # M-S2 r2：Raw Data 每秒列摘要放在格點品質之後（避免描述長度上限截掉）
+        at = next((i + 1 for i, n in enumerate(notes) if str(n).startswith("格點品質：")), len(notes))
+        notes.insert(at, raw_note)
     if notes:
         wb.properties.description = "\n".join(str(n) for n in notes)[:3000]
         wb.properties.title = "充／放電認證測試報告"

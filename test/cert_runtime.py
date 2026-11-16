@@ -25,6 +25,10 @@
   screenshots.jsonl、screenshots/   P2 截圖紀錄
   reports/             認證測試報告（每次新檔：認證測試報告_<cert_id>_NN.xlsx）
   cert_timing.jsonl    取樣 Cycle 計時（診斷／量測用，不是 Historical Evidence；寫入失敗不影響取樣 → Fail Open）
+  slots.jsonl          M-S2（1 秒格點）：每個預定格點一筆（ATTEMPTED_OK／PARTIAL／FAIL、MISSED）；
+                       背景服務取樣時才寫（report_quality.SlotSegment）。補值（LIVE／CARRIED／NO_DATA）**不寫入**
+                       任何原始檔，只在產生報告時由 report_display 從已保存的原始紀錄推導
+                       （M-S2 r2：Raw Data 每秒一列、整筆沿用；不另設 Sampling Slots 工作表）。
 """
 
 import json
@@ -39,6 +43,8 @@ import cert_env as ENV
 import cert_heat_link as HL
 import cert_supplement as SUP
 import cert_requests as REQ
+import report_quality as RQ
+import sample_scheduler as SS
 from cert_controls import describe as describe_action
 from cert_stage_engine import Obs, analyze, classify, stage_names
 
@@ -90,6 +96,22 @@ def _new_status_stat():
             "cache_hits": 0, "cache_misses": 0}
 
 
+def _new_bg_stat():
+    return {"n": 0, "ms_max": 0.0, "ms_sum": 0.0}
+
+
+def _obs_copy(o):
+    """Obs 淺複製（新物件；values／flags／notes 與範本共用 —— 分析與報告只讀不改）。比 dataclasses.replace 快。"""
+    c = Obs.__new__(Obs)
+    c.__dict__.update(o.__dict__)
+    return c
+
+
+def _ver_ge(a, b):
+    """分析版本 a 是否不比 b 舊（records／decisions／commands 筆數逐項 ≥）。"""
+    return all(x >= y for x, y in zip(a, b))
+
+
 def _read_jsonl(path):
     if not os.path.exists(path):
         return []
@@ -120,6 +142,33 @@ FIELD_SRC = {           # 引擎欄位 ← read_all 欄位
     "cell_vmax_v": "rack_cell_max_voltage_v", "cell_vmin_v": "rack_cell_min_voltage_v",
     "voltage_v": "battery_voltage_v",
 }
+
+
+HMI_READER_DESC = {
+    "read_cert": "認證專用讀取 read_cert（每次 5 支 GET：主控資訊、Rack 極值、PCS 英文／中文、電池上下電）",
+    "read_all": "完整讀取 read_all（每次 9 支 GET，另含當日電量、PCS 模式、排程開關、告警）",
+}
+
+
+def hmi_reader_note(st):
+    """
+    r2c O-1：報告資料來源說明（一行）。只依 cert_state.json 既有 metadata（hmi_reader／hmi_reader_changes）；
+    兩者皆無（r2c O-1 之前的 Session）→ None（報告維持原樣，不推測）。不影響任何判定與統計。
+    """
+    st = st or {}
+    cur, chg = st.get("hmi_reader"), st.get("hmi_reader_changes") or []
+    if not cur and not chg:
+        return None
+    desc = lambda m: HMI_READER_DESC.get(m, str(m))       # noqa: E731
+    if chg:
+        parts = [f"開始時為 {desc(chg[0].get('from'))}"
+                 + ("（未記錄，依程式版本推定）" if not chg[0].get("from_recorded", True) else "")]
+        parts += [f"{c.get('at')} 起改為 {desc(c.get('to'))}" for c in chg]
+        head = "HMI 資料來源：" + "；".join(parts) + "。"
+    else:
+        head = f"HMI 資料來源：{desc(cur)}。"
+    return head + ("格點判定規則不變；「部分端點失敗」只計實際讀取的端點；"
+                   "read_cert 不讀 PCS 模式／排程／告警（認證不使用），因此 401 次數減少是端點數減少，不代表登入狀態改善。")
 
 
 def build_record(t, reading, read_err, heat, heat_err):
@@ -163,6 +212,104 @@ def build_record(t, reading, read_err, heat, heat_err):
                                             "pcs_status", "communication_ok", "raw_source_time")}}
 
 
+# =============================================================================
+# M-S2：格點品質與 Raw Data 每秒列的輸入（報告產生時推導；只讀已保存的原始層，不寫任何原始檔）
+# =============================================================================
+NOT_ATTEMPTED = (RQ.MISSED, RQ.INFERRED_MISSED)
+
+
+def _pct(a, b):
+    return None if not b else round(100.0 * a / b, 2)
+
+
+def build_sampling_slots(folder):
+    """
+    M-S2：格點品質指標＋Raw Data 每秒列的輸入。沒有 slots.jsonl（歷史 5 秒認證等）→ None（Raw Data 維持原格式）。
+    來源只有**已保存**的 observations.jsonl、slots.jsonl 與 cert_state.json（started_at、interruptions）：
+      - 格點：report_quality.reconstruct（依段落起點與已知格點重建；SLOT 遺失 → ATTEMPTED_SLOT_LOST／INFERRED_MISSED）
+      - 品質指標：report_display.quality_metrics（覆蓋率、M-1、完整即時資料率等；寫入報告描述）
+    回傳 {"metrics", "grid"}；grid 交給 cert_report_xlsx 產生 Raw Data 每秒列（report_display.build_raw_seconds）。
+    """
+    import report_display as RD
+    path = os.path.join(folder, RQ.SLOT_LOG_FILE)
+    if not os.path.exists(path):
+        return None
+    recs, san = RQ.read_slot_log(path)
+    raw, ran = RQ.load_cert_raw(os.path.join(folder, "observations.jsonl"))
+    result = RQ.reconstruct(recs, raw, san, ran)
+    if not result.get("has_slot_log"):
+        return None
+    disp = RD.build_display(result, raw, "cert")
+    qm = RD.quality_metrics(result, raw, "cert", display=disp)
+    slots = result.get("slots", [])
+    expected = len(slots)
+    cnt = {}
+    for e in slots:
+        cnt[e["status"]] = cnt.get(e["status"], 0) + 1
+    logged = sum(1 for e in slots if e.get("source") == "logged")
+    obs_fail = sum(1 for e in slots if e.get("obs_write_failed"))
+    hmi_ok = (qm.get("hmi") or {}).get("hmi_valid") or 0
+    an = dict(qm.get("anomaly_counts") or {})
+    unterminated = qm.get("unterminated_segments") or 0
+    raw_bad = qm.get("incomplete_raw_records") or 0
+    slot_bad = an.get(RQ.AN_TAIL_INCOMPLETE, 0) + an.get(RQ.AN_LINE_UNPARSEABLE, 0)
+    certain = (unterminated == 0 and raw_bad == 0 and slot_bad == 0 and cnt.get(RQ.INFERRED_MISSED, 0) == 0
+               and cnt.get(RQ.ATTEMPTED_SLOT_LOST, 0) == 0 and cnt.get(RQ.ATTEMPTED_CONFLICT, 0) == 0)
+    cov = _pct(logged, expected)
+    if cov is None:
+        cov_text = "N/A（沒有格點）"
+    elif unterminated:
+        cov_text = f"不確定（{cov:.2f}%；有 {unterminated} 個段落未正常結束，尾端格點未知）"
+    elif certain and logged == expected:
+        cov_text = "100%"
+    else:
+        cov_text = f"{cov:.2f}%（有紀錄遺失或異常，見下方）" if not certain else f"{cov:.2f}%"
+    # 段落：SEGMENT_END 的 end_wall（服務停止／重啟統計的起點）
+    seg_end_wall = {r.get("seg_id"): r.get("end_wall") for r in (recs or []) if r.get("rec") == RQ.REC_SEGMENT_END}
+    seg_info = {s["seg_id"]: s for s in result.get("segments", [])}
+    seg_order = []
+    for e in slots:
+        if not seg_order or seg_order[-1] != e["seg_id"]:
+            seg_order.append(e["seg_id"])
+    last_evidence = {}
+    for e in slots:
+        t = e.get("read_done") or e.get("scheduled_time")
+        if t:
+            last_evidence[e["seg_id"]] = t
+    down_total, down_n = 0.0, 0
+    prev_sid = None
+    for sid in seg_order:
+        if prev_sid is not None:
+            t_from = seg_end_wall.get(prev_sid) or last_evidence.get(prev_sid)
+            t_to = (seg_info.get(sid) or {}).get("anchor_wall")
+            sec = None
+            a, b = RD.parse_time(t_from), RD.parse_time(t_to)
+            if a is not None and b is not None:
+                sec = round((b - a).total_seconds(), 1)
+                if sec >= 0:
+                    down_total += sec
+            down_n += 1
+        prev_sid = sid
+    fq_all = qm.get("field_quality") or {}
+    m = {"expected_slots": expected, "logged_slots": logged, "coverage_pct": cov, "coverage_text": cov_text,
+         "coverage_certain": certain and not unterminated,
+         "attempted_slots": qm.get("attempted_slots"), "attempt_pct": _pct(qm.get("attempted_slots") or 0, expected),
+         "hmi_success_slots": hmi_ok, "m1_pct": _pct(hmi_ok, expected),
+         "complete_live_slots": qm.get("complete_live_slots"),
+         "complete_live_pct": _pct(qm.get("complete_live_slots") or 0, expected),
+         "status_counts": cnt, "missed": cnt.get(RQ.MISSED, 0), "inferred_missed": cnt.get(RQ.INFERRED_MISSED, 0),
+         "slot_lost": cnt.get(RQ.ATTEMPTED_SLOT_LOST, 0), "read_fail": cnt.get(RQ.ATTEMPTED_FAIL, 0),
+         "obs_write_failed": obs_fail, "segments": len(seg_order), "unterminated_segments": unterminated,
+         "service_down_count": down_n, "service_down_sec": round(down_total, 1),
+         "raw_unparseable": raw_bad, "slot_log_unparseable": slot_bad, "anomaly_counts": an,
+         "field_quality": {f: {"name": d.get("name"), "counts": d.get("counts"),
+                               "max_carried_age_sec": d.get("max_carried_age_sec")} for f, d in fq_all.items()}}
+    st = REQ.read_json(os.path.join(folder, "cert_state.json")) or {}
+    grid = {"result": result, "raw": raw, "started_at": st.get("started_at"),
+            "interruptions": list(st.get("interruptions") or [])}
+    return {"metrics": m, "grid": grid}
+
+
 def record_to_obs(rec, n):
     return Obs(t=_parse(rec["t"]), ok=bool(rec.get("ok")), values=dict(rec.get("values") or {}),
                src=f"observations.jsonl:{n}", fail_reason=rec.get("fail_reason", ""),
@@ -182,12 +329,22 @@ class CertRuntime:
     clock           → 現在時間（模擬測試注入）
     read_timing()   → reader 最近一次的計時 dict（例：等鎖／讀取毫秒）；只寫入 cert_timing.jsonl，None = 不提供
     env_reader()    → 開始認證時讀一次環控（cert_env.read_env 的結果；None＝無 client）；None = 不讀（不產生起始環控快照）
+    hmi_reader      → r2c O-1：reader 的讀取模式（"read_cert"／"read_all"）→ cert_state.json 的 hmi_reader；
+                      None（測試／模擬）＝不記錄。舊 Session 沒有此欄位＝當時使用 read_all。只記錄，不影響判定與報告。
     """
 
     def __init__(self, root, reader, heat_reader=None, single_state=None, cmd_file=None,
                  params=None, shot_params=None, capturer=None, enable_shots=None, clock=datetime.now,
-                 log=print, read_timing=None, env_reader=None):
+                 log=print, read_timing=None, env_reader=None, mono=None, hmi_reader=None):
         self.root = root
+        self.hmi_reader = hmi_reader
+        # M-S2：格點排程用的單調時鐘（正式＝time.monotonic；離線縮放測試可注入）
+        self._mono = mono or time.monotonic
+        self._mono_injected = mono is not None
+        self._slot_seg = None               # 目前的格點段落（report_quality.SlotSegment；只由取樣迴圈／結束認證使用）
+        self._seg_reason_next = "start"
+        self._last_after_analysis = None    # 上一次「取樣後截圖觸發分析」的時間（runtime clock；節流用）
+        self._last_status_analysis = None   # 上一次 status 重算分析的時間（runtime clock）
         self.reader = reader
         self.env_reader = env_reader
         self._env_thread = None
@@ -214,6 +371,16 @@ class CertRuntime:
         self._lock = threading.RLock()
         self._sample_lock = threading.Lock()   # 一次只跑一個取樣 Cycle（背景取樣與 Menu 22 最後取樣互斥，不會同時讀 HMI）
         self._supp_workers = {}     # 已結束認證的事後補拍：認證資料夾 → ScreenshotWorker（寫 supplements 子資料夾）
+        # r2c（FAIL-1）：完整分析移出取樣關鍵路徑。run()（正式執行）設 True → 截圖觸發分析改由「cert-analysis」執行緒
+        # 每 CERT_ANALYSIS_INTERVAL_SEC 秒執行（計算不持 runtime 鎖），取樣迴圈不再分析；tick()（模擬）維持同步（False）。
+        self._async_analysis = False
+        self._gen = 0                       # 認證工作階段世代：_reset／_load 遞增；舊世代的分析結果一律丟棄
+        self._bg_stat = _new_bg_stat()      # 背景分析耗時（併入下一筆 Cycle 計時）
+        # r2c（I）：增量轉換快取：records（只會 append）→ Obs 範本；records 換成新 list（新認證／續接重載）→ 重建
+        self.incremental_obs = True         # False＝每次全部重新轉換（測試比對用）
+        self._tpl_lock = threading.Lock()
+        self._tpl_src = None
+        self._tpl = []
         self._reset()
         os.makedirs(root, exist_ok=True)
 
@@ -233,6 +400,26 @@ class CertRuntime:
         self._report_busy = False
         self._hl = None             # 6161 連線狀態（由 records 重播；重啟／新認證後於下一筆取樣時重建）
         self._hl_keys = set()       # 已記錄的 6161 連線事件 key（避免重複提醒）
+        self._cur_slot = None       # 取樣迴圈設定的本格（tick 模擬時為 None → 不寫格點）
+        self._obs_lines = 0         # observations.jsonl 目前的實體行數（SLOT raw_ref 用；_load 時重新計算）
+        self._obs_write_failures = 0
+        self._last_after_analysis = None
+        self._last_status_analysis = None
+        self._gen += 1                      # r2c：新世代（進行中的背景分析結果不得套用到新認證）
+        self._applied_ver = None            # 最近一次已套用截圖觸發的分析版本（筆數）；較舊的結果不得覆蓋
+        self._release_analysis_memory()
+
+    def _release_analysis_memory(self):
+        """
+        r2c O-2：認證結束／切換／重載時釋放分析記憶體（呼叫端持 runtime 鎖，且已遞增 _gen）。
+          分析快取（版本鍵持有 records／decisions／commands list → 整份原始紀錄）與增量範本都只屬於「目前這份」認證；
+          已結束認證的報告重產（Menu 25）、事後補拍（Menu 24）、標記走 _offline（另建 runtime 從檔案讀）→ 不使用這裡的快取。
+          範本以 _tpl_lock 清除：與進行中的轉換互斥；舊世代的轉換之後也不會再寫回範本（見 _obs_list）。
+          鎖順序固定為 runtime 鎖 → _tpl_lock（_obs_list 內不取 runtime 鎖）→ 不會死結。
+        """
+        self._analysis_cache = None
+        with self._tpl_lock:
+            self._tpl_src, self._tpl = None, []
 
     # ---- 檔案 ---------------------------------------------------------------
     def _f(self, name, folder=None):
@@ -266,19 +453,42 @@ class CertRuntime:
             self._event("resume", detail, now)
             self.cert.setdefault("interruptions", []).append(
                 {"from": _iso(last), "to": _iso(now), "seconds": gap, "reason": "服務停止或重啟（期間無取樣）"})
+            self._note_hmi_reader(now)
             self._save_state()
             if self.worker:
                 n = self.worker.mark_unfinished("服務中斷，截圖未完成（服務重啟前已登記的截圖工作）")
                 if n:
                     self._event("screenshot_interrupted", f"{n} 個截圖目標因服務中斷未完成，已如實記錄為失敗", now)
             self.next_sample = now
+            self._seg_reason_next = "restart"           # M-S2：續接 → 新的格點段落（停機期間不產生格點）
             self.log(f"[CERT] 接續認證 {cid}（{detail}）")
             return cid
 
+    def _note_hmi_reader(self, now):
+        """
+        r2c O-1：續接時讀取模式與 cert_state 記錄不同（例：舊 Session 沒有 hmi_reader＝read_all，續接後改用 read_cert）
+        → 在 hmi_reader_changes 加一筆（時間、前、後）並更新 hmi_reader；只記錄，不改任何既有欄位與判定。
+        """
+        if not self.hmi_reader:
+            return
+        prev = self.cert.get("hmi_reader") or "read_all"
+        if "hmi_reader" in self.cert and prev == self.hmi_reader:
+            return
+        if prev != self.hmi_reader:
+            self.cert.setdefault("hmi_reader_changes", []).append(
+                {"at": _iso(now), "from": prev, "to": self.hmi_reader,
+                 "from_recorded": "hmi_reader" in self.cert})
+            self._event("hmi_reader", f"HMI 讀取模式：{prev} → {self.hmi_reader}（服務續接）", now)
+        self.cert["hmi_reader"] = self.hmi_reader
+
     def _load(self, cid):
+        self._gen += 1
+        self._applied_ver = None
+        self._release_analysis_memory()
         self.folder = os.path.join(self.root, cid)
         self.cert = REQ.read_json(self._f("cert_state.json"))
         self.records = _read_jsonl(self._f("observations.jsonl"))
+        self._obs_lines = RQ.count_physical_lines(self._f("observations.jsonl"))
         self.decisions = _read_jsonl(self._f("decisions.jsonl"))
         self.commands = _read_jsonl(self._f("commands.jsonl"))
         self._last_cmd_sig = self.cert.get("last_cmd_sig")
@@ -318,7 +528,10 @@ class CertRuntime:
 
     # ---- 主迴圈（正式執行用；測試直接呼叫 tick）-------------------------------
     def run(self, stop_event):
-        """兩條執行緒：請求處理（每 CERT_LOOP_SEC）與取樣（到期才取）。取樣慢不會擋住請求處理。"""
+        """三條執行緒：請求處理（每 CERT_LOOP_SEC）、取樣（到期才取）、截圖觸發分析（r2c；每 CERT_ANALYSIS_INTERVAL_SEC）。
+        取樣慢不會擋住請求處理；完整分析不在取樣執行緒內執行，計算期間不持 runtime 鎖。"""
+        self._async_analysis = True
+
         def req_loop():
             while not stop_event.is_set():
                 try:
@@ -329,18 +542,120 @@ class CertRuntime:
                     self.log(f"[CERT] 請求處理例外（繼續）：{type(e).__name__}: {e}")
                 stop_event.wait(CFG.CERT_LOOP_SEC)
 
-        def sample_loop():
-            while not stop_event.is_set():
-                try:
-                    self.maybe_sample()
-                except Exception as e:                  # noqa: BLE001
-                    self.log(f"[CERT] 取樣例外（繼續）：{type(e).__name__}: {e}")
-                stop_event.wait(CFG.CERT_LOOP_SEC)
         ths = [threading.Thread(target=req_loop, name="cert-requests", daemon=True),
-               threading.Thread(target=sample_loop, name="cert-sampler", daemon=True)]
+               threading.Thread(target=self._slot_sample_loop, args=(stop_event,), name="cert-sampler", daemon=True),
+               threading.Thread(target=self._analysis_loop, args=(stop_event,), name="cert-analysis", daemon=True)]
         for th in ths:
             th.start()
         return ths
+
+    def _analysis_loop(self, stop_event):
+        """r2c：截圖觸發分析執行緒。每 CERT_ANALYSIS_INTERVAL_SEC 秒一次；例外只記錄，下一輪照常。"""
+        while not stop_event.wait(CFG.CERT_ANALYSIS_INTERVAL_SEC):
+            try:
+                self.bg_analysis_once()
+            except Exception as e:                      # noqa: BLE001
+                self.log(f"[CERT] 背景分析例外（繼續；不影響取樣）：{type(e).__name__}: {e}")
+
+    def bg_analysis_once(self):
+        """
+        r2c：一次背景分析＋截圖觸發。① 持鎖取快照（只取參照與筆數）② 不持鎖計算 ③ 持鎖套用：
+          認證世代已改變（結束／新認證／續接重載）或已不在記錄中 → 丟棄（"stale"）；
+          版本（records／decisions／commands 筆數）比已套用的舊 → 丟棄（"older"）；否則套用既有截圖觸發邏輯（"applied"）。
+        截圖去重沿用既有的 _cands／_resolved／_paused_jobs（全部在 runtime 鎖內讀寫）。回傳結果字串（測試用）。
+        """
+        with self._lock:
+            if not self.is_active():
+                return "inactive"
+            gen = self._gen
+        t0 = time.perf_counter()
+        res, ver, _hit = self._analysis_core()
+        ms = _ms(t0, time.perf_counter())
+        with self._lock:
+            self._note_bg(ms)
+            if self._gen != gen or not self.is_active():
+                return "stale"
+            if self._applied_ver is not None and not _ver_ge(ver, self._applied_ver):
+                return "older"
+            self._applied_ver = ver
+            now = self.clock()
+            self._last_after_analysis = now
+            if self.worker:
+                self._apply_shots(res, now)
+            return "applied"
+
+    # ---- M-S2：1 秒固定格點取樣 ------------------------------------------------
+    def _slot_sample_loop(self, stop_event):
+        """
+        固定時間格點（monotonic）：第 k 格期限＝起點＋k×週期。單一執行緒同步取樣 → 不重疊、每格最多一筆。
+        讀取超過週期 → 排程器跳到下一個未來格，被跳過的格點各寫一筆 MISSED（確定沒有讀取）；
+        **不補造量測、不沿用數值**（補值只在報告產生時推導）。服務停止 → 本段落結束；重啟續接 → 新段落。
+        """
+        sch = None
+        while not stop_event.is_set():
+            try:
+                if not self.is_active():
+                    sch = None                          # 認證未進行 → 下次開始時重新起算
+                    self._slot_seg_end("finalize")      # 保底（正常由結束認證寫入；已結束則無作用）
+                    stop_event.wait(CFG.CERT_LOOP_SEC)
+                    continue
+                if sch is None:
+                    sch = SS.SlotScheduler(self.p["SAMPLE_INTERVAL_SEC"], mono=self._mono,
+                                           max_sleep=0.005 if self._mono_injected else None)
+                    self._slot_seg_new()
+                slot = sch.wait(stop_event)
+                if slot is None:
+                    break
+                if not self.is_active():
+                    continue
+                seg = self._slot_seg
+                if seg is not None:
+                    try:
+                        seg.begin_from_slot(slot)
+                        slot["seg_id"] = seg.seg_id
+                    except Exception:                   # noqa: BLE001
+                        pass
+                self._cur_slot = slot
+                try:
+                    with self._sample_lock:
+                        self._sample_cycle("schedule")
+                except Exception as e:                  # noqa: BLE001
+                    # 例：原始紀錄寫入失敗（已記 SLOT ATTEMPTED_FAIL＋obs_write_failed）→ 照常前進到下一格
+                    self.log(f"[CERT] 取樣例外（繼續下一格）：{type(e).__name__}: {e}")
+                missed = sch.complete()
+                if missed and seg is not None:
+                    try:
+                        seg.write_missed_after(slot["index"], missed, RQ.MISSED_READ_OVERRUN,
+                                               "前一格讀取耗時 %.0f ms" % ((self._mono() - slot["start_mono"]) * 1000.0))
+                    except Exception:                   # noqa: BLE001
+                        pass
+            except Exception as e:                      # noqa: BLE001
+                self.log(f"[CERT] 取樣例外（繼續）：{type(e).__name__}: {e}")
+                stop_event.wait(CFG.CERT_LOOP_SEC)
+        self._slot_seg_end("stop")                      # 服務停止（認證仍進行中）→ 本段落結束；重啟後另起新段落
+
+    def _slot_seg_new(self):
+        try:
+            with self._lock:
+                folder, cid = self.folder, (self.cert or {}).get("cert_id")
+            self._slot_seg_end("stop")                  # 理論上不會有殘留；保險
+            self._slot_seg = RQ.SlotSegment(folder, "cert", cid, self.p["SAMPLE_INTERVAL_SEC"],
+                                            reason=self._seg_reason_next, mono=self._mono)
+            self._seg_reason_next = "resume"
+        except Exception as e:                          # noqa: BLE001
+            self._slot_seg = None
+            self.log(f"[CERT] 格點段落建立失敗（取樣照常；本段落沒有 slots.jsonl 紀錄）：{type(e).__name__}: {e}")
+        return self._slot_seg
+
+    def _slot_seg_end(self, reason):
+        seg = self._slot_seg
+        if seg is None:
+            return
+        try:
+            seg.end(reason)
+        except Exception:                               # noqa: BLE001
+            pass
+        self._slot_seg = None
 
     def tick(self):
         """模擬測試用：一輪 = 處理請求 → 快照指令 → 到期取樣 → 寫狀態。"""
@@ -383,13 +698,21 @@ class CertRuntime:
         finally:
             box["ms"] = _ms(t0, time.perf_counter())
 
-    def _sample_cycle(self, trigger):
+    _SLOT_FROM_SCHEDULER = object()     # 哨兵：一般排程取樣 → 取用取樣迴圈設定的 _cur_slot
+
+    def _sample_cycle(self, trigger, slot=_SLOT_FROM_SCHEDULER):
         """
         一個正常取樣 Cycle（呼叫端須持 _sample_lock）。trigger 只寫入計時檔：schedule＝背景排程、cert_end＝Menu 22 最後取樣。
         HMI 與 6161 平行讀取（各一次，不新增請求）：6161 逾時不再拖延 HMI。
-        取樣時間（observation t）＝ HMI 讀取完成時間；下一筆仍為「取樣時間 + 取樣週期」。
+        取樣時間（observation t）＝ HMI 讀取完成時間（語意不變）；下一筆（tick 模擬路徑）＝「取樣時間 + 取樣週期」。
         本 Cycle 一定等 6161 讀取結束（受 CERT_HEAT_API_TIMEOUT_SEC 限制）才寫入與返回 → 不留背景執行緒、不重疊取樣。
+        M-S2：有格點（背景格點取樣、或 Menu 22 最後一筆）→ 原始紀錄多帶 slot_seg_id／slot_index，並寫一筆 SLOT
+          （寫入順序：原始紀錄 → SLOT）。原始紀錄寫入失敗 → SLOT 記 ATTEMPTED_FAIL＋obs_write_failed，
+          該筆**不**加入記憶體 records（之後的分析、報告與補值都只用已保存的資料）。
+          slot：Menu 22 最後一筆由呼叫端直接傳入（可為 None），不經共用的 _cur_slot。
         """
+        if slot is CertRuntime._SLOT_FROM_SCHEDULER:
+            slot, self._cur_slot = self._cur_slot, None
         reading, rerr = None, ""
         box, th = {}, None
         pc = {"start": time.perf_counter()}
@@ -397,6 +720,7 @@ class CertRuntime:
         if self.heat_reader is not None:
             th = threading.Thread(target=self._read_heat, args=(box,), name="cert-heat-read", daemon=True)
             th.start()
+        read_start = SS.wall_now()
         try:
             reading = self.reader()
             if reading is None:
@@ -404,6 +728,7 @@ class CertRuntime:
         except Exception as e:                          # noqa: BLE001
             rerr = f"{type(e).__name__}: {e}"
         pc["hmi"] = time.perf_counter()
+        read_done = SS.wall_now()
         t_hmi = self.clock()                            # HMI 實際讀取完成時間＝這筆取樣的時間
         if th is not None:
             th.join()
@@ -417,8 +742,46 @@ class CertRuntime:
                 return None
             now = t_hmi
             rec = build_record(now, reading, rerr, heat, herr)
-            _append_jsonl(self._f("observations.jsonl"), rec)
+            seg = self._slot_seg
+            k = slot.get("index") if slot else None
+            use_slot = (seg is not None and k is not None and slot.get("seg_id") is not None
+                        and slot.get("seg_id") == seg.seg_id and not seg.closed)
+            if use_slot:
+                rec.update(seg.ident(k))                # 只多兩個鍵（slot_seg_id、slot_index）；原有鍵與值不變
+            obs_path = self._f("observations.jsonl")
+            try:
+                try:                                    # 檔尾半行（行程中斷）→ 先補換行，新紀錄才不會黏在半行後面
+                    RQ.ensure_newline_terminated(obs_path)
+                except OSError:
+                    pass
+                _append_jsonl(obs_path, rec)
+            except Exception as e:                      # noqa: BLE001
+                self._obs_write_failures += 1
+                if use_slot:
+                    try:
+                        seg.write_slot(k, RQ.ATTEMPTED_FAIL, raw_ref=None,
+                                       read_start=SS.iso_ms(read_start), read_done=SS.iso_ms(read_done),
+                                       timeout=(read_done - read_start).total_seconds() > seg.interval,
+                                       extra={"obs_write_failed": True,
+                                              "obs_write_error": f"{type(e).__name__}: {e}"[:120]})
+                    except Exception:                   # noqa: BLE001
+                        pass
+                self._write_timing(wall, pc, None, reading, rerr, herr, trigger)
+                raise
+            self._obs_lines += 1
             pc["obs"] = time.perf_counter()
+            if use_slot:                                # 寫入順序：原始紀錄 → SLOT
+                try:
+                    seg.write_slot(k, RQ.classify_cert_attempt(rec, rerr, reading), raw_ref=self._obs_lines,
+                                   read_start=SS.iso_ms(read_start), read_done=SS.iso_ms(read_done),
+                                   failed_endpoints=[str(x) for x in ((reading or {}).get("_fail") or [])]
+                                   if isinstance(reading, dict) else [],
+                                   communication_ok=(reading.get("communication_ok")
+                                                     if isinstance(reading, dict) else None),
+                                   timeout=(read_done - read_start).total_seconds() > seg.interval,
+                                   extra={"read_error": rerr[:120] or None})
+                except Exception:                       # noqa: BLE001
+                    self.timing_errors += 1
             self.records.append(rec)
             self.cert["sample_count"] = len(self.records)
             self.cert["last_sample_time"] = rec["t"]
@@ -429,7 +792,7 @@ class CertRuntime:
             self._last_analysis_ms = self._last_analysis_hit = None
             self._heat_link_update(now)
             try:
-                self._after_sample(now)
+                self._after_sample(now, force=(trigger == "cert_end"))
             except Exception as e:                      # noqa: BLE001
                 self._event("analysis_error", f"{type(e).__name__}: {e}", now)
             pc["after"] = time.perf_counter()
@@ -466,6 +829,7 @@ class CertRuntime:
         try:
             end = pc.get("after") or pc.get("lock") or time.perf_counter()
             st, self._status_stat = self._status_stat, _new_status_stat()
+            bg, self._bg_stat = self._bg_stat, _new_bg_stat()
             t = {"wall_start": wall, "wall_end": _wall_ms(), "trigger": trigger, "obs_t": rec["t"] if rec else None,
                  "written": rec is not None, "n_obs": len(self.records),
                  "cycle_ms": _ms(pc["start"], end),
@@ -486,11 +850,24 @@ class CertRuntime:
                  "status_analysis_ms_avg": round(st["analysis_ms_sum"] / st["n"], 1) if st["n"] else None,
                  "status_interval_ms_max": round(st["interval_ms_max"], 1),
                  "status_cache_hits": st["cache_hits"], "status_cache_misses": st["cache_misses"],
+                 # r2c：背景分析（cert-analysis 執行緒）自上一筆 Cycle 以來的次數與耗時（不在取樣關鍵路徑）
+                 "bg_analysis_n": bg["n"], "bg_analysis_ms_max": round(bg["ms_max"], 1),
+                 "bg_analysis_ms_avg": round(bg["ms_sum"] / bg["n"], 1) if bg["n"] else None,
                  "timing_errors": self.timing_errors}
             if self.read_timing is not None:
                 t["reader"] = dict(self.read_timing() or {})
             self._last_cycle_end = end
             _append_jsonl(self._f(TIMING_FILE), t)
+        except Exception:                               # noqa: BLE001
+            self.timing_errors += 1
+
+    def _note_bg(self, ms):
+        """背景分析耗時（呼叫端持 runtime 鎖）；Fail Open。"""
+        try:
+            b = self._bg_stat
+            b["n"] += 1
+            b["ms_max"] = max(b["ms_max"], ms)
+            b["ms_sum"] += ms
         except Exception:                               # noqa: BLE001
             self.timing_errors += 1
 
@@ -515,34 +892,124 @@ class CertRuntime:
           版本＝三個 list 物件本身＋筆數：三者只會 append（取樣／選單決策／指令快照），或在 _reset／_load 整個換新
           （換新＝不同物件 → 失效）；Cache 持有舊 list 參照，不會因物件 id 重用而誤判。參數另比內容。
           回傳的 Result 由所有呼叫端共用 → 呼叫端只能讀，不可修改。
-        全程持 runtime 鎖（RLock，與 append 同一把）：讀版本、重算、寫 Cache 為同一步，不會讀到舊結果或半成品。
+        r2c：持鎖只做「讀版本＋快照」與「寫 Cache」；計算不持鎖（呼叫端自己持鎖時仍在鎖內，與舊版相同）。
+          快照＝筆數＋list 參照（只會 append → 前 n 筆不變）；寫 Cache 只在同一世代、同一組 list 且版本不比現有舊時才寫
+          → 舊結果不會覆蓋新結果，也不會寫到另一份認證。
         """
+        res, _ver, hit = self._analysis_core(update_attrs=True)
+        return res
+
+    def _analysis_core(self, update_attrs=False):
+        """回傳 (Result, 版本＝(records 筆數, decisions 筆數, commands 筆數), 是否命中 Cache)。"""
         with self._lock:
             a0 = time.perf_counter()
             key = (self.records, len(self.records), self.decisions, len(self.decisions),
                    self.commands, len(self.commands))
+            ver = (key[1], key[3], key[5])
             c = self._analysis_cache
             hit = (self.analysis_cache_enabled and c is not None and c[2] == self.p
                    and all(x is y if isinstance(x, list) else x == y for x, y in zip(c[0], key)))
             if hit:
                 res = c[1]
             else:
-                obs = [record_to_obs(r, i + 1) for i, r in enumerate(self.records)]
-                cmds = [{"t": _parse(c_["t"]), "cmd": c_["cmd"]} for c_ in self.commands
-                        if c_.get("cmd") and c_.get("control_success") is True]
-                res = analyze(obs, self.p, self.decisions, cmds)
-                self._analysis_cache = (key, res, dict(self.p)) if self.analysis_cache_enabled else None
-            self._last_analysis_hit = hit
-            self._last_analysis_ms = _ms(a0, time.perf_counter())     # 量測用（cert_timing.jsonl）
-            return res
+                gen, recs, p = self._gen, self.records, dict(self.p)
+                decs = list(self.decisions)
+                cmd_src = list(self.commands)
+        if not hit:
+            obs = self._obs_list(recs, ver[0], gen)
+            cmds = [{"t": _parse(c_["t"]), "cmd": c_["cmd"]} for c_ in cmd_src
+                    if c_.get("cmd") and c_.get("control_success") is True]
+            res = analyze(obs, p, decs, cmds)
+            with self._lock:
+                if self.analysis_cache_enabled and self._gen == gen and self.records is recs and self.p == p:
+                    c = self._analysis_cache
+                    same = (c is not None and c[0][0] is key[0] and c[0][2] is key[2] and c[0][4] is key[4]
+                            and c[2] == p)
+                    if not same or _ver_ge(ver, (c[0][1], c[0][3], c[0][5])):
+                        self._analysis_cache = (key, res, p)
+                elif not self.analysis_cache_enabled:
+                    self._analysis_cache = None
+        if update_attrs:
+            with self._lock:
+                self._last_analysis_hit = hit
+                self._last_analysis_ms = _ms(a0, time.perf_counter())     # 量測用（cert_timing.jsonl）
+        return res, ver, hit
+
+    def _obs_list(self, recs, n, gen=None):
+        """
+        records 前 n 筆 → Obs list。每次分析都回傳新的 Obs 物件（Stage Engine 會寫入 seq／direction／state／stage_no，
+        且會在分析開始時全部重設 → 舊結果的 Obs 不會被之後的分析改寫）。
+        r2c（I）：增量轉換 —— 已轉換過的紀錄保留「範本」（時間解析、values／flags／notes 複本），之後只轉換新增的筆數，
+          每次分析以淺複製產生新物件（values／flags／notes 共用範本；分析與報告只讀不改）。
+          範本只對應同一個 records list 物件（list 只會 append）；換成新 list → 整個重建。多執行緒以 _tpl_lock 保護。
+        O-2：gen＝取快照時的認證世代。世代已改變（認證已結束／切換／重載）→ 只轉換、不寫回範本
+          （否則舊認證的 list 會被重新掛回，直到下一份認證才釋放）。世代在 _tpl_lock 內比對：_reset 先遞增世代再取此鎖清除。
+        """
+        if not self.incremental_obs:
+            return [record_to_obs(r, i + 1) for i, r in enumerate(recs[:n])]
+        with self._tpl_lock:
+            stale = gen is not None and gen != self._gen
+            if not stale:
+                if self._tpl_src is not recs or len(self._tpl) > len(recs):
+                    self._tpl_src, self._tpl = recs, []
+                tpl = self._tpl
+                for i in range(len(tpl), n):
+                    tpl.append(record_to_obs(recs[i], i + 1))
+                base = tpl[:n]
+        if stale:                                       # 結果之後也會因世代不符被丟棄；只為讓呼叫端照常完成
+            return [record_to_obs(r, i + 1) for i, r in enumerate(recs[:n])]
+        return [_obs_copy(o) for o in base]
+
+    def _status_analysis(self):
+        """
+        狀態顯示（status.json／選單 26）用的分析結果。M-S2：1 秒取樣時快取幾乎每秒失效 →
+        記錄中且上一次結果未超過 CERT_STATUS_ANALYSIS_MAX_AGE_SEC 秒 → 沿用上一次結果（顯示最多落後數秒），
+        否則重算。不影響截圖觸發、結束與報告（那些路徑一律呼叫 analysis()）。
+        r2c：背景分析模式（run）記錄中 → 一律沿用背景分析最近一次的結果（同一份認證的 list；最多落後一個分析週期），
+          不在狀態路徑重算；尚無結果才計算一次（計算不持 runtime 鎖）。
+        """
+        with self._lock:
+            c = self._analysis_cache
+            now = self.clock()
+            last = self._last_status_analysis
+            same = (c is not None and c[0][0] is self.records and c[0][2] is self.decisions
+                    and c[0][4] is self.commands)
+            if self.is_active() and same and (
+                    self._async_analysis or (last is not None and 0 <= (now - last).total_seconds()
+                                             < CFG.CERT_STATUS_ANALYSIS_MAX_AGE_SEC)):
+                self._last_analysis_hit = True
+                return c[1]
+        res = self.analysis()
+        with self._lock:
+            self._last_status_analysis = now
+        return res
 
     # ---- 截圖事件（方案 B v3 → P2）--------------------------------------------
-    def _after_sample(self, now):
+    def _after_sample(self, now, force=False):
+        """
+        截圖觸發分析（呼叫端持 runtime 鎖）。M-S2：最多每 CERT_ANALYSIS_INTERVAL_SEC 秒一次（以 runtime clock 計），
+        force=True（Menu 22 最後一筆）一定執行。截圖時效固定 CERT_SHOT_FRESH_SEC（40 秒），不隨取樣週期改變。
+        r2c：背景分析模式 → 一般取樣不在此分析（由 cert-analysis 執行緒負責）；Menu 22 最後一筆（force）仍同步執行，
+          確保最後階段在結束前完成判定。已套用版本較新的結果不會被較舊的覆蓋（_applied_ver）。
+        """
         if not self.worker:
             return
-        res = self.analysis()
+        if self._async_analysis and not force:
+            return
+        last = self._last_after_analysis
+        if (not force and last is not None
+                and 0 <= (now - last).total_seconds() < CFG.CERT_ANALYSIS_INTERVAL_SEC):
+            return                                      # 時間倒退（< 0）→ 不跳過，立即分析
+        self._last_after_analysis = now
+        res, ver, _hit = self._analysis_core(update_attrs=True)
+        if self._applied_ver is None or _ver_ge(ver, self._applied_ver):
+            self._applied_ver = ver
+        self._apply_shots(res, now)
+
+    def _apply_shots(self, res, now):
+        """截圖觸發（呼叫端持 runtime 鎖）：依分析結果送出候選／停頓／階段結束截圖（既有規則與去重，不變）。"""
         names = stage_names(res.stages)
-        fresh = timedelta(seconds=2 * self.p["SAMPLE_INTERVAL_SEC"] + self.p["GAP_G_SEC"])
+        fresh = timedelta(seconds=CFG.CERT_SHOT_FRESH_SEC)
         for st in res.stages:
             key = _iso(st.start.t)
             name = names[st.no]
@@ -696,6 +1163,7 @@ class CertRuntime:
                 cid = f"CERT_{now:%Y%m%d_%H%M%S}_{k}"
                 k += 1
             self._reset()
+            self._seg_reason_next = "start"             # M-S2：新認證的第一個格點段落
             self.folder = os.path.join(self.root, cid)
             os.makedirs(os.path.join(self.folder, "reports"), exist_ok=True)
             self.cert = {
@@ -708,6 +1176,8 @@ class CertRuntime:
                 "reports": [], "last_report_error": None,
                 "params": {k2: self.p[k2] for k2 in self.p},
                 "params_note": params_note(self.p)}
+            if self.hmi_reader:                         # r2c O-1：讀取模式（None＝測試／模擬，不記錄）
+                self.cert["hmi_reader"] = self.hmi_reader
             self._save_state()
             self._set_active(cid)
             self._open_worker()
@@ -759,9 +1229,15 @@ class CertRuntime:
         #    取樣失敗照一般失敗規則寫入（ok=False）；任何例外只記事件，不阻擋結束。
         with self._sample_lock:
             try:
-                self._sample_cycle("cert_end")
+                seg = self._slot_seg                    # M-S2：最後一筆也有格點身分（目前時間所在格；中間未讀取的格記 MISSED）
+                final_slot = seg.claim_extra_slot() if seg is not None else None
+            except Exception:                           # noqa: BLE001
+                final_slot = None
+            try:
+                self._sample_cycle("cert_end", slot=final_slot)
             except Exception as e:                      # noqa: BLE001
                 self._event("final_poll_error", f"結束前最後取樣例外（不影響結束）：{type(e).__name__}: {e}")
+            self._slot_seg_end("finalize")              # 冪等：段落已結束 → _slot_seg 為 None
             worker, cid = self._end_locked(req)
         # B：「認證結束（最後狀態）」截圖：在最後一筆取樣之後擷取；等待有上限、不持 runtime 鎖；失敗／逾時照實呈現，不阻擋結束
         if worker:
@@ -892,8 +1368,8 @@ class CertRuntime:
         if not self.worker:
             REQ.write_result(self.root, req, "rejected", "截圖功能未啟用（CERT_SCREENSHOT_ENABLED=False）")
             return
+        res = self.analysis()                           # r2c：分析不持 runtime 鎖（不擋取樣）；排入截圖才持鎖
         with self._lock:
-            res = self.analysis()
             names = stage_names(res.stages)
             pl = req.get("payload") or {}
             st = None
@@ -1014,6 +1490,9 @@ class CertRuntime:
                      params_note(st.get("params")) + "。",
                      "傳感器溫度／PCS 模組溫度取自 6161 /api/temperature（st／pt.moduleTemperature），對應關係待實機確認。",
                      "停止指令時間（Tc）取自控制結果檔的快照（寫檔時間；該檔只保留最近一次，非完整歷史）。"]
+            rd_note = hmi_reader_note(st)                   # r2c O-1：只在 cert_state 有讀取模式紀錄時加註（舊 Session 不變）
+            if rd_note:
+                notes.append(rd_note)
             for it in st.get("interruptions") or []:
                 notes.append(f"服務中斷：{it.get('from')}～{it.get('to')}（約 {it.get('seconds') or 0:.0f} 秒）"
                              f"{it.get('reason')} → 期間無資料")
@@ -1043,6 +1522,24 @@ class CertRuntime:
                                        "heat_link": {"runs": hl.all_runs(), "gap_sec": rt.p["GAP_G_SEC"]}}
                 if supp:
                     meta["screenshots"]["supplements"] = {"folder": SUP.folder_of(folder), "records": SUP.load(folder)}
+            # M-S2 r2：有 slots.jsonl（1 秒格點認證）→ Raw Data 每秒一列（整筆沿用）＋格點品質指標寫入描述；
+            #          歷史認證（沒有 slots.jsonl）Raw Data 維持原格式、不推算
+            ss = build_sampling_slots(folder)
+            if ss is not None:
+                meta["sampling_slots"] = ss
+                mm = ss["metrics"]
+                pct = lambda v: "N/A" if v is None else f"{v}%"
+                q_note = (f"格點品質：預定格點 {mm['expected_slots']}；格點紀錄覆蓋率 {mm['coverage_text']}；"
+                          f"實際執行讀取率 {pct(mm['attempt_pct'])}；"
+                          f"HMI 實際成功率（M-1，分母＝預定格點）{pct(mm['m1_pct'])}；"
+                          f"完整即時資料率 {pct(mm['complete_live_pct'])}；讀取失敗 {mm['read_fail']} 格；"
+                          f"未執行讀取（MISSED）{mm['missed']} 格；推定缺格 {mm['inferred_missed']} 格；"
+                          f"格點紀錄遺失 {mm['slot_lost']} 格；原始紀錄寫入失敗 {mm['obs_write_failed']} 格；"
+                          f"段落 {mm['segments']}（未正常結束 {mm['unterminated_segments']}）；"
+                          f"服務停止／重啟 {mm['service_down_count']} 次共 {mm['service_down_sec']} 秒；"
+                          f"無法解析的紀錄行 {mm['raw_unparseable']}／{mm['slot_log_unparseable']}。")
+                notes.insert(min(len(notes), 3 + len(self.extra_notes) + (1 if st.get("incomplete") else 0)
+                                 + (1 if st.get("status") == "recording" else 0)), q_note)
             save_report(res, meta, part)
             os.replace(part, path)
             if supp:
@@ -1082,6 +1579,19 @@ class CertRuntime:
 
     # ---- 狀態 ----------------------------------------------------------------
     def write_status(self, owner_role="service"):
+        # r2c：分析在取 runtime 鎖之前完成（計算不持鎖 → 不擋取樣）；期間認證世代改變 → 本次不輸出階段資訊（不混用）
+        res = an_err = None
+        with self._lock:
+            gen, has_cert = self._gen, self.cert is not None
+        a0 = a1 = time.perf_counter()
+        hit = None
+        if has_cert:
+            try:
+                res = self._status_analysis()
+                hit = self._last_analysis_hit
+            except Exception as e:                      # noqa: BLE001
+                an_err = e
+            a1 = time.perf_counter()
         with self._lock:
             s = {"updated_at": REQ.now_str(self.clock()), "pid": os.getpid(), "owner_role": owner_role,
                  "active": self.is_active(), "cert_id": self.cert["cert_id"] if self.cert else None}
@@ -1094,17 +1604,18 @@ class CertRuntime:
                 if self._hl is not None and self.is_active():
                     s["heat_link"] = self._hl.status()
                 try:
-                    a0 = time.perf_counter()
-                    res = self.analysis()
-                    if self.is_active():
-                        self._note_status(a0, time.perf_counter(), self._last_analysis_hit)
-                    names = stage_names(res.stages)
-                    s["stages"] = [{"no": st.no, "name": names[st.no], "start": _iso(st.start.t),
-                                    "end_by": st.end_by, "label": st.label} for st in res.stages]
-                    s["uncertain"] = [{"item_id": pz.item_id, "stage_no": pz.stage_no,
-                                       "A": _iso(pz.A.t), "R": _iso(pz.R.t),
-                                       "decided": (pz.decision or {}).get("choice")}
-                                      for pz in res.pauses if not pz.certain]
+                    if an_err is not None:
+                        raise an_err
+                    if res is not None and self._gen == gen:     # 期間切換認證 → 本次略過階段資訊（下一輪補上）
+                        if self.is_active():
+                            self._note_status(a0, a1, hit)
+                        names = stage_names(res.stages)
+                        s["stages"] = [{"no": st.no, "name": names[st.no], "start": _iso(st.start.t),
+                                        "end_by": st.end_by, "label": st.label} for st in res.stages]
+                        s["uncertain"] = [{"item_id": pz.item_id, "stage_no": pz.stage_no,
+                                           "A": _iso(pz.A.t), "R": _iso(pz.R.t),
+                                           "decided": (pz.decision or {}).get("choice")}
+                                          for pz in res.pauses if not pz.certain]
                     if self.records:
                         d = classify(self.records[-1]["values"], self.p) if self.records[-1]["ok"] else None
                         s["last_direction"] = {"C": "充電", "D": "放電", "I": "待機"}.get(d, "未知")

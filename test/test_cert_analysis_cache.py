@@ -273,13 +273,17 @@ try:
             for c in cnt.values():
                 c.n = 0
         rt._analysis_cache = None
+        # r2c（I）：增量轉換 —— 已轉換過的紀錄保留範本，清掉分析 Cache 後重算只轉換「尚未轉換」的筆數
+        #   （tick 期間每次分析已轉換全部紀錄 → 0）；關閉增量（incremental_obs=False）→ 全部重新轉換（原行為）
+        pending_conv = (len(rt.records) - len(getattr(rt, "_tpl", []))
+                        if getattr(rt, "incremental_obs", False) else len(rt.records))
         r1 = rt.analysis()
         first = calls()
         reset()
         rs = [rt.analysis() for _ in range(5)]
-        check(f"輸入沒變：第一次重算（analyze {first['analyze']}、record_to_obs {first['record_to_obs']}），"
-              f"之後 5 次全部命中（analyze／record_to_obs／strptime 都 0 次）",
-              first["analyze"] == 1 and first["record_to_obs"] == len(rt.records)
+        check(f"輸入沒變：第一次重算（analyze {first['analyze']}、record_to_obs {first['record_to_obs']}"
+              f"＝尚未轉換 {pending_conv} 筆），之後 5 次全部命中（analyze／record_to_obs／strptime 都 0 次）",
+              first["analyze"] == 1 and first["record_to_obs"] == pending_conv
               and calls() == {"analyze": 0, "record_to_obs": 0, "_parse": 0}
               and all(r is r1 for r in rs) and rt._last_analysis_hit is True)
         for _ in range(3):

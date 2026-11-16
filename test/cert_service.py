@@ -22,6 +22,13 @@ import cert_requests as REQ
 _runtime = None
 
 
+# M-S2 r2c O-1：認證專用讀取（CDR.read_cert，5 次 GET）。cert_state.json 的 hmi_reader 記錄此值
+#（舊 Session 沒有此欄位 ＝ 當時使用 read_all）。
+HMI_READER = "read_cert"
+# 逐端點耗時的簡稱（依 READ_CERT_ENDPOINTS 順序；PCS 英文／zh-TW 各一次）
+_EP_SHORT = ("main", "rack_ext", "pcs", "pcs_zh", "dodi")
+
+
 def _reader():
     import report_monitor as RM
     import charge_discharge_report as CDR
@@ -30,20 +37,28 @@ def _reader():
         _READ_TIMING.clear()
         return None
     t0 = time.perf_counter()
-    with RM._CLIENT_LOCK:
+    with RM._CLIENT_LOCK:                               # O-1：鎖的範圍與原本相同（只包一次讀取）
         t1 = time.perf_counter()
         try:
-            return CDR.read_all(client)
+            CDR._READ_TIMING_TLS.last = None            # 本次讀取的逐端點耗時（不沿用上一次）
+        except Exception:                               # noqa: BLE001
+            pass
+        try:
+            return CDR.read_cert(client)
         finally:
-            try:                                        # 量測用（cert_timing.jsonl）；Fail Open
+            try:                                        # 量測用（cert_timing.jsonl）；Fail Open；不新增請求
                 t2 = time.perf_counter()
                 _READ_TIMING.clear()
                 _READ_TIMING.update(lock_wait_ms=round((t1 - t0) * 1000, 1), read_ms=round((t2 - t1) * 1000, 1))
+                eps = CDR.last_read_timing()
+                if eps:
+                    _READ_TIMING["ep_ms"] = [[_EP_SHORT[i] if i < len(_EP_SHORT) else str(p_).rsplit("/", 1)[-1], ms]
+                                             for i, (p_, ms) in enumerate(eps)]
             except Exception:                           # noqa: BLE001
                 pass
 
 
-_READ_TIMING = {}       # 最近一次 HMI 讀取：等 _CLIENT_LOCK 毫秒、read_all 毫秒（perf_counter）
+_READ_TIMING = {}       # 最近一次 HMI 讀取：等 _CLIENT_LOCK 毫秒、read_cert 毫秒（perf_counter；鍵名 read_ms 不變）、逐端點 ep_ms
 
 
 def _env_reader():
@@ -90,7 +105,7 @@ def start_if_enabled(stop_event, log=print):
     root = REQ.cert_root(RM.OUTPUT_DIR)
     rt = CertRuntime(root, reader=_reader, heat_reader=_heat_reader, single_state=single_report_state,
                      cmd_file=os.path.join(RM.OUTPUT_DIR, "device_control_action_result.json"), log=log,
-                     read_timing=lambda: dict(_READ_TIMING), env_reader=_env_reader)
+                     read_timing=lambda: dict(_READ_TIMING), env_reader=_env_reader, hmi_reader=HMI_READER)
     # 認證進行中 → 單次報告所有建立入口一律拒絕；記憶體狀態之外再看磁碟（續接失敗時也不會誤建單次報告）
     RM.set_cert_active_provider(lambda: rt.active_id() or REQ.active_on_disk(root))
     try:

@@ -1035,9 +1035,9 @@ try:
     check("N17 Raw Data 原始值不被分鐘彙整覆寫：10:01 六筆 Rack 最大仍為 33／34／33／32／33／34、SOC 80／80／80／80／79／79",
           [raw_a[o_.seq + 1][RHa.index("Rack 最大溫度")] for o_ in m01] == [33, 34, 33, 32, 33, 34]
           and [raw_a[o_.seq + 1][RHa.index("SOC")] for o_ in m01] == [80, 80, 80, 80, 79, 79])
-    # 2026-11-03 正式需求由 10 秒改為 5 秒（Phase 1 實機 PASS）→ 期待值依新需求更新（舊 10 秒期待已過時）
-    check("N18 取樣間隔＝正式設定：SAMPLE_INTERVAL_SEC = 5",
-          CFG.SAMPLE_INTERVAL_SEC == 5 and p["SAMPLE_INTERVAL_SEC"] == 5)
+    # 2026-11-03 正式需求由 10 秒改為 5 秒；2026-11-11 M-S2（G-1 授權）由 5 秒改為 1 秒 → 期待值依新需求更新
+    check("N18 取樣間隔＝正式設定：SAMPLE_INTERVAL_SEC = 1",
+          CFG.SAMPLE_INTERVAL_SEC == 1 and p["SAMPLE_INTERVAL_SEC"] == 1)
     check("V1 Raw Data 與階段頁／整體頁共用同一 predicate：raw_rows_obs = is_report_valid 過濾",
           RXv.raw_rows_obs(ares, p, anames) == [o_ for o_ in ares.obs if avalid(o_)])
     _iv = RXv.is_report_valid

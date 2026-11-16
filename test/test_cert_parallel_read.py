@@ -175,7 +175,12 @@ try:
     sw = T0 + timedelta(seconds=75)                                    # 充電 → 待機（發生在 6161 逾時期間）
     pl = Plant(clk, True, "timeout", direction=lambda t: "C" if t < sw else "I")
     root = os.path.join(TMP, "long")
-    rt = runtime(root, pl, clk)
+    # M-S2（2026-11-11）：背景取樣改為單調時鐘固定格點（SlotScheduler），不再用 runtime clock 計算下一筆。
+    #   本情境驗證的是「6161 逾時不拖長取樣間隔」→ 維持原本的 5 秒週期，並注入與 SimClock 同倍率的模擬單調時鐘
+    #   （真實 1 秒＝模擬 10 秒）。斷言門檻不變。1 秒週期的行為另見 test_cert_1hz_s2。
+    rt = CertRuntime(root, reader=pl.read, heat_reader=pl.heat, enable_shots=False, clock=clk,
+                     log=lambda *a: None, params=CFG.params(SAMPLE_INTERVAL_SEC=5),
+                     mono=lambda: time.perf_counter() * SCALE)
     cid = start(rt, root, clk)
     stop = threading.Event()
     ths = rt.run(stop)

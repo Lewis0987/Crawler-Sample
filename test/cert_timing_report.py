@@ -63,6 +63,40 @@ def trend(vals):
     return statistics.median(v[-k:]) - statistics.median(v[:k])
 
 
+# r2c O-1：HMI 讀取模式（cert_timing 的 reader.ep_ms 逐端點耗時筆數；舊版計時沒有 ep_ms → 依程式版本推定為 read_all）
+READ_MODE_GETS = {"read_all": 9, "read_cert": 5}
+AUTH_EPS_BY_MODE = {"read_all": "RunMode／Schedule／DODI 共 3 支", "read_cert": "DODI 1 支"}
+INFERRED_ALL = "read_all（推定：舊版計時無逐端點資料）"
+
+
+def cycle_mode(x):
+    """單筆計時 → 讀取模式。ep_ms 5 筆＝read_cert、9 筆＝read_all；沒有 ep_ms＝舊版（推定 read_all）。"""
+    ep = (x.get("reader") or {}).get("ep_ms")
+    if not ep:
+        return INFERRED_ALL
+    for m, n in READ_MODE_GETS.items():
+        if len(ep) == n:
+            return m
+    return f"未知（{len(ep)} 支 GET）"
+
+
+def mode_runs(wr):
+    """依時間順序把連續相同模式合併：[(模式, 第一筆時間, 最後一筆時間, 筆數)]。"""
+    runs = []
+    for x in wr:
+        m = cycle_mode(x)
+        t = x.get("obs_t") or x.get("wall_start")
+        if runs and runs[-1][0] == m:
+            runs[-1][2], runs[-1][3] = t, runs[-1][3] + 1
+        else:
+            runs.append([m, t, t, 1])
+    return runs
+
+
+def base_mode(m):
+    return "read_cert" if m == "read_cert" else ("read_all" if m.startswith("read_all") else m)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder")
@@ -94,8 +128,17 @@ def main():
     print(f"Actual Interval（monotonic）: {stats(iv, 's')}")
     print(f"Cycle Duration           : {stats(cyc)}")
     print(f"HMI Duration（含等鎖）   : {stats([x['hmi_ms'] for x in wr])}")
-    print(f"  └ read_all             : {stats([(x.get('reader') or {}).get('read_ms') for x in wr])}")
+    runs = mode_runs(wr)
+    modes = sorted({r[0] for r in runs})
+    for m in modes:
+        print(f"  └ HMI 讀取 {m:<9}: {stats([(x.get('reader') or {}).get('read_ms') for x in wr if cycle_mode(x) == m])}")
     print(f"  └ 等 _CLIENT_LOCK      : {stats([(x.get('reader') or {}).get('lock_wait_ms') for x in wr])}")
+    eps = {}
+    for x in wr:
+        for name, ms in (x.get("reader") or {}).get("ep_ms") or []:
+            eps.setdefault(name, []).append(ms)
+    for name, v in eps.items():
+        print(f"     · 端點 {name:<12}: {stats(v)}")
     print(f"6161 Duration            : {stats([x['heat_ms'] for x in wr])}")
     print(f"Runtime Lock Wait        : {stats([x['rt_lock_wait_ms'] for x in wr])}")
     print(f"Observation Write        : {stats([x['obs_write_ms'] for x in wr])}")
@@ -145,6 +188,38 @@ def main():
         for f_ in x.get("hmi_fail") or []:
             fails[re.sub(r"^.*/", "", f_)] += 1
     e401 = sum(c for k, c in fails.items() if "_error401" in k)
+    # r2c O-1：讀取模式與 401 統計範圍（只讀 cert_state.json 既有 metadata＋cert_timing；不改任何判定）
+    st = {}
+    try:
+        st = json.load(open(os.path.join(a.folder, "cert_state.json"), encoding="utf-8"))
+    except Exception:                                   # noqa: BLE001
+        pass
+    print("\nHMI 讀取模式（依 cert_timing 逐端點耗時判定）：")
+    for m, t0_, t1_, n_ in runs:
+        print(f"  {m}：{t0_} ～ {t1_}（{n_} 筆）")
+    if len(runs) > 1:
+        print(f"  ⚠ 同一份認證包含 {len(runs)} 段讀取模式（切換 {len(runs) - 1} 次）→ 端點失敗與 401 次數請分段比較")
+    rec_mode = st.get("hmi_reader")
+    chg = st.get("hmi_reader_changes") or []
+    print(f"  cert_state.hmi_reader：{rec_mode or '（未記錄：r2c O-1 之前的 Session）'}"
+          + "".join(f"；{c.get('at')} {c.get('from')} → {c.get('to')}"
+                    + ("" if c.get("from_recorded", True) else "（切換前模式未記錄，依程式版本推定）") for c in chg))
+    if rec_mode and runs and base_mode(runs[-1][0]) != rec_mode:
+        print(f"  ⚠ cert_state 記錄的模式（{rec_mode}）與最後一段計時（{runs[-1][0]}）不一致")
+    per = {}
+    for x in wr:
+        m = base_mode(cycle_mode(x))
+        d = per.setdefault(m, {"cycles": 0, "ep401": 0, "cyc401": 0})
+        d["cycles"] += 1
+        k401 = sum(1 for f_ in x.get("hmi_fail") or [] if "_error401" in f_)
+        d["ep401"] += k401
+        d["cyc401"] += k401 > 0
+    print("HMI 401 統計範圍：只計認證本身讀取的授權端點（read_all：RunMode／Schedule／DODI 3 支；read_cert：DODI 1 支）。")
+    for m, d in per.items():
+        print(f"  {m}：401 端點次數 {d['ep401']}；含 401 的 Cycle {d['cyc401']}／{d['cycles']}"
+              f"（{d['cyc401'] / max(d['cycles'], 1):.2%}）；授權端點 {AUTH_EPS_BY_MODE.get(m, '?')}")
+    print("  ※ read_cert 不讀 RunMode／Schedule → 401 端點次數自然減少，這是端點數減少，不代表登入態改善；"
+          "跨模式請比較「含 401 的 Cycle」比例，登入態以服務 log 的判定登入態失效／嘗試登入次數為準（--log）。")
     timeouts = sum(c for k, c in fails.items() if "Timeout" in k) + sum(1 for x in wr if "Timeout" in str(x.get("heat_err")))
     print(f"\nObservation {n_obs} 筆；Timing Cycle {len(tim)} 筆（寫入 {len(wr)}，未寫入 {len(tim) - len(wr)}；"
           f"其中 Menu 22 最後取樣 {n_final}）")
@@ -157,7 +232,7 @@ def main():
     rule("PCS Missing", f"{pcs_miss} ({pcs_miss / n_obs:.1%})", pcs_miss / n_obs <= 0.05, "≤ 5%")
     rule("6161 Missing", f"{heat_miss} ({heat_miss / max(len(wr), 1):.1%})", heat_miss / max(len(wr), 1) <= 0.01, "≤ 1%")
     rule("Timeout（HMI＋6161）", timeouts, timeouts <= 1, "≤ 1 次")
-    rule("HMI 401（Cycle 內授權端點 _error401）", e401, True, "記錄（與 log 對照）")
+    rule("HMI 401（Cycle 內授權端點 _error401；統計範圍依讀取模式，見上方）", e401, True, "記錄（與 log 對照）")
 
     lw = [(x.get("reader") or {}).get("lock_wait_ms") for x in wr]
     lw = [v for v in lw if v is not None]
