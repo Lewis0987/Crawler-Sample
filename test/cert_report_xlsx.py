@@ -43,8 +43,8 @@ from cert_screenshot import caption as shot_caption, png_size, select_final_shot
 from cert_heat_link import failure_line, failure_text
 import cert_supplement as SUP
 from cert_controls import DIRECTION_TEXT, describe as describe_action
-from cert_stage_engine import (R_NO_HMI, command_stage, fmt_t, field_value, has_hmi_values, minute_value,
-                               overall_minutes, stage_minutes, stage_names)
+from cert_stage_engine import (R_NO_HMI, command_stage, decisions_keywords, fmt_t, field_value, has_hmi_values,
+                               minute_value, overall_minutes, stage_minutes, stage_names, strip_count_time)
 
 NA = CFG.NA
 LOG_HEADERS = ["時間", "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓",
@@ -96,14 +96,24 @@ def _v(x):
     return NA if x is None else x
 
 
+def _counted(st):
+    return getattr(st, "counted", True)
+
+
 def _stage_title(names, st):
+    """不計次階段（H2 stage_count）：名稱本身已含「中止…（不計次）」→ 不再附加標記。"""
     n = names[st.no]
-    return f"{n}（{st.label}）" if st.label else n
+    return f"{n}（{st.label}）" if st.label and _counted(st) else n
 
 
 def _sheet_name(i, names, st):
-    s = f"{i}.{names[st.no]}" + (f"({st.label})" if st.label else "")
-    return re.sub(r"[\[\]\*\?/\\:]", "_", s)[:31]
+    """頁籤：序號 i 唯一；Excel 上限 31 字。不計次階段不附標記；超過 31 字先去掉開始時間再截斷。"""
+    def clean(s):
+        return re.sub(r"[\[\]\*\?/\\:]", "_", s)
+    s = clean(f"{i}.{names[st.no]}" + (f"({st.label})" if st.label and _counted(st) else ""))
+    if len(s) > 31 and not _counted(st):
+        s = clean(f"{i}.{strip_count_time(names[st.no])}")
+    return s[:31]
 
 
 # =============================================================================
@@ -1195,6 +1205,31 @@ def raw_seconds_note(rs):
                   "若未造成時間重疊則無法偵測）。階段頁、整體頁、圖表與判定只使用實際觀測，不使用本頁沿用值。")
 
 
+def stage_count_notes(res):
+    """
+    H2 stage_count 說明（活頁簿屬性「描述」）：不計次原因、無效／恢復說明、完整歷史、對不到階段的決策。
+    沒有任何 stage_count 決策 → []（報告描述與現行完全相同）。
+    """
+    out = []
+    stages = [st for st in res.stages if getattr(st, "count_history", None)]
+    if stages:
+        nm = stage_names(res.stages)
+    for st in stages:
+        title = _stage_title(nm, st)
+        head = f"階段計次：{title}（開始 {fmt_t(st.start.t, True)}）→ "
+        if not _counted(st):
+            out.append(head + f"不計次；原因：{st.count_reason}")
+        else:
+            out.append(head + "計次" + (f"；{st.count_note}" if st.count_note else ""))
+        n = len(st.count_history)
+        for k, h in enumerate(st.count_history, 1):
+            out.append(f"　決策 {k}/{n}：{h.get('at') or '（無時間）'}｜counted={h.get('counted')!r}｜"
+                       f"原因：{h.get('reason') or '（空白）'}｜by={h.get('by') or ''}｜request_id={h.get('request_id') or ''}")
+    for o in getattr(res, "count_orphans", None) or []:
+        out.append(f"階段計次：stage_start={o.get('stage_start')!r} {o.get('note')}（{o.get('n')} 筆）→ 未套用")
+    return out
+
+
 def save_report(res, meta, path):
     meta = dict(meta)
     meta.setdefault("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -1206,9 +1241,13 @@ def save_report(res, meta, path):
     if raw_note:                                   # M-S2 r2：Raw Data 每秒列摘要放在格點品質之後（避免描述長度上限截掉）
         at = next((i + 1 for i, n in enumerate(notes) if str(n).startswith("格點品質：")), len(notes))
         notes.insert(at, raw_note)
+    notes += stage_count_notes(res)                # H2：只有 stage_count 歷史／孤兒時才有內容（否則描述不變）
     if notes:
         wb.properties.description = "\n".join(str(n) for n in notes)[:3000]
         wb.properties.title = "充／放電認證測試報告"
+    dec_sha = getattr(res, "dec_sha256", "")
+    if dec_sha:                                    # H2 dec_v1：分析所用決策快照的指紋
+        wb.properties.keywords = decisions_keywords(res.dec_n, dec_sha)
     wb.save(path)
     _force_plot_vis_off(path)
     _add_summary_arrows(path, getattr(wb, "_cert_summary_arrows", []))

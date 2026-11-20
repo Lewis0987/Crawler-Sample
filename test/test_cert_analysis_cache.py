@@ -37,6 +37,7 @@ from openpyxl import load_workbook
 import cert_requests as REQ
 import cert_runtime as CR
 from cert_runtime import CertRuntime, _read_jsonl
+from cert_stage_engine import decisions_digest
 from cert_screenshot import ShotError, shot_params
 
 _results = []
@@ -137,10 +138,13 @@ def _no_rid(x):
 
 
 def diff_fields(a, b, ignore_rid=False):
-    """逐欄比較兩個 Result（dataclass 深層展開）；回傳不同的欄位名。ignore_rid：兩份獨立模擬比對時忽略請求 ID。"""
+    """逐欄比較兩個 Result（dataclass 深層展開）；回傳不同的欄位名。ignore_rid：兩份獨立模擬比對時忽略請求 ID。
+    ignore_rid 時也不直接比 dec_sha256（dec_v1 雜湊包含 request_id）→ 呼叫端須另外逐份驗證。"""
     da, db = dataclasses.asdict(a), dataclasses.asdict(b)
     if ignore_rid:
         da, db = _no_rid(da), _no_rid(db)
+        da.pop("dec_sha256", None)
+        db.pop("dec_sha256", None)
     return [k for k in da if da[k] != db[k]]
 
 
@@ -215,6 +219,14 @@ try:
     d = diff_fields(res_on, res_off, ignore_rid=True)
     check(f"analysis 結果逐欄相同（obs／stages／pauses／events／gaps／params／decisions／commands／warnings；"
           f"僅忽略每次隨機產生的請求 ID）{'；不同：' + str(d) if d else ''}", not d)
+    for tag, r in (("Cache ON", res_on), ("Cache OFF", res_off)):
+        n, h = decisions_digest(r.decisions)
+        check(f"{tag}：dec_n／dec_sha256 等於 decisions_digest(自己的 decisions)（dec_n={r.dec_n}）",
+              r.dec_n == n == len(r.decisions) and r.dec_sha256 == h
+              and re.fullmatch(r"[0-9a-f]{64}", r.dec_sha256 or "") is not None)
+    check(f"兩份模擬 dec_n 相同（{res_on.dec_n}／{res_off.dec_n}）", res_on.dec_n == res_off.dec_n)
+    check("dec_sha256 的差異只來自 request_id：去掉 request_id 後兩份 decisions 的雜湊相同",
+          decisions_digest(_no_rid(res_on.decisions)) == decisions_digest(_no_rid(res_off.decisions)))
     check(f"逐輪 status.json 完全相同（{len(on['statuses'])} 輪；含 stages／uncertain／last_direction）",
           on["statuses"] == off["statuses"])
     check("Menu 22 結束與報告：兩份都成功，最後取樣都有寫入",

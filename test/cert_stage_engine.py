@@ -18,6 +18,8 @@
 """
 
 import bisect
+import hashlib
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -130,6 +132,11 @@ class Stage:
     stop_kind: str = ""             # 指令停止／自行停止／方向切換／未知
     seq0: int = 0
     seq1: int = 0
+    # ---- stage_count（H2）：是否納入「第N次」計次；只影響顯示名稱，不影響切分／起訖／停頓／數值 ----
+    counted: bool = True            # False = 不計次（只有標記「中止」且已結束、原因非空白的有效決策才會是 False）
+    count_reason: str = ""          # 不計次原因（有效的 counted=false 決策）
+    count_note: str = ""            # 系統說明（最後一筆無效 → 視為計次；已恢復計次…）
+    count_history: list = field(default_factory=list)   # 此階段全部 stage_count 決策（檔案行序；摘要複本）
 
     @property
     def dir_name(self):
@@ -147,6 +154,38 @@ class Result:
     decisions: list
     commands: object = None         # None = 來源沒有選單指令紀錄
     warnings: list = field(default_factory=list)   # [(Tc, 類型, 說明)]
+    # ---- H2：dec_v1 決策快照指紋（與分析使用同一份 decisions）；stage_count 對不到階段的決策 ----
+    dec_n: int = 0
+    dec_sha256: str = ""
+    count_orphans: list = field(default_factory=list)  # [{"stage_start", "n", "records"}]
+
+
+# =============================================================================
+# dec_v1：決策快照指紋（H2／G6／r7 共用，唯一實作）
+# =============================================================================
+DEC_V = 1
+
+
+def decisions_digest(decisions):
+    """
+    dec_v1（凍結規格）：依傳入順序（＝decisions.jsonl 解析成功的行序），每筆
+    json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) 後接 "\\n"，
+    以 UTF-8（無 BOM、不做 Unicode 正規化）串接後取 SHA-256。
+    回傳 (dec_n, dec_sha256)：dec_n＝傳入的全部紀錄數（不分類型）；dec_sha256＝64 個小寫十六進位字元。
+    只讀不改：不修改傳入的清單或其中任何紀錄。
+    """
+    h = hashlib.sha256()
+    n = 0
+    for rec in decisions:
+        h.update((json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                 .encode("utf-8"))
+        n += 1
+    return n, h.hexdigest()
+
+
+def decisions_keywords(dec_n, dec_sha256):
+    """報告 keywords 字串：dec_v=1;dec_n=<N>;dec_sha256=<64hex>。"""
+    return f"dec_v={DEC_V};dec_n={dec_n};dec_sha256={dec_sha256}"
 
 
 # =============================================================================
@@ -224,6 +263,7 @@ def analyze(obs_list, p, decisions=None, commands=None):
         o.direction = classify(o.values, p) if o.ok else None
         o.state, o.stage_no = "", None
     decisions = list(decisions or [])
+    dec_n, dec_sha256 = decisions_digest(decisions)     # H2：與下方分析使用同一份快照
     events = []
 
     V = [o for o in obs if o.ok and o.direction is not None]
@@ -243,6 +283,7 @@ def analyze(obs_list, p, decisions=None, commands=None):
         key = st.start.t.strftime("%Y-%m-%dT%H:%M:%S")
         if key in labels:
             st.label = labels[key].get("label", "")
+    count_orphans = _apply_stage_counts(stages, decisions)
 
     _label_obs(obs, V, blocks, stages, gaps, events)
     cmds = None if commands is None else sorted(commands, key=lambda c: c["t"])
@@ -250,7 +291,79 @@ def analyze(obs_list, p, decisions=None, commands=None):
     warnings = _stop_warnings(obs, cmds, p)
     return Result(obs=obs, stages=stages, pauses=pauses, events=events,
                   gaps=gaps, params=dict(p), decisions=decisions,
-                  commands=cmds, warnings=warnings)
+                  commands=cmds, warnings=warnings,
+                  dec_n=dec_n, dec_sha256=dec_sha256, count_orphans=count_orphans)
+
+
+# =============================================================================
+# stage_count（H2）：不計次決策
+# =============================================================================
+STAGE_COUNT_LABEL = "中止"
+_COUNT_FIELDS = ("counted", "reason", "note", "at", "by", "request_id")
+
+
+def _count_summary(rec):
+    """歷史用摘要（新 dict；不修改原始紀錄）。"""
+    return {k: rec.get(k) for k in _COUNT_FIELDS}
+
+
+def _count_invalid(st, rec):
+    """最後一筆 stage_count 決策無效的原因；有效 → ""。counted=true（恢復計次）只要求布林值。"""
+    c = rec.get("counted")
+    if not isinstance(c, bool):
+        return "counted 不是布林值"
+    if c:
+        return ""
+    if st.end_by == "data_end":
+        return "階段尚未結束"
+    if st.label != STAGE_COUNT_LABEL:
+        return f"階段標記為「{st.label or '未標記'}」，不是「{STAGE_COUNT_LABEL}」"
+    r = rec.get("reason")
+    if not isinstance(r, str) or not r.strip():
+        return "原因空白"
+    return ""
+
+
+def _apply_stage_counts(stages, decisions):
+    """
+    type="stage_count" 決策 → Stage.counted／count_reason／count_note／count_history。
+      · 以 stage_start（YYYY-MM-DDTHH:MM:SS）對應階段；同一開始時間取檔案行序最後一筆。
+      · 最後一筆無效 → 視為計次（不回退前一筆），count_note 說明原因。
+      · counted=false 有效條件：階段已結束、標記「中止」、原因非空白；標記之後改成其他值 → 自動恢復計次。
+      · 對不到任何階段 → 回傳於 orphans（不套用）。
+    不改 Stage.no、切分、起訖、停頓或任何觀測。回傳 orphans list。
+    """
+    by_key = {}
+    orphans = []
+    for d in decisions:
+        if d.get("type") != "stage_count":
+            continue
+        key = d.get("stage_start")
+        if not isinstance(key, str):
+            orphans.append({"stage_start": key, "n": 1, "records": [_count_summary(d)],
+                            "note": "stage_start 格式無效"})
+            continue
+        by_key.setdefault(key, []).append(d)
+    keys = {st.start.t.strftime("%Y-%m-%dT%H:%M:%S"): st for st in stages if st.start is not None}
+    for key, recs in by_key.items():
+        st = keys.get(key)
+        if st is None:
+            orphans.append({"stage_start": key, "n": len(recs), "records": [_count_summary(r) for r in recs],
+                            "note": "對不到任何階段"})
+            continue
+        st.count_history = [_count_summary(r) for r in recs]
+        last = recs[-1]
+        why = _count_invalid(st, last)
+        if why:
+            st.counted = True
+            st.count_note = f"最後一筆不計次決策無效（{why}）→ 視為計次（不回退前一筆）"
+        elif last["counted"]:
+            st.counted = True
+            st.count_note = "已恢復計次" if len(recs) > 1 else ""
+        else:
+            st.counted = False
+            st.count_reason = last["reason"].strip()
+    return orphans
 
 
 def _attach_commands(stages, cmds):
@@ -568,13 +681,37 @@ def _label_obs(obs, V, blocks, stages, gaps, events):
 # 階段命名
 # =============================================================================
 def stage_names(stages):
-    """「第N次充電／放電」依方向各自計數；有操作人員標記時附註。"""
+    """「第N次充電／放電」依方向各自計數；有操作人員標記時附註。
+    H2 stage_count：counted=False 的階段不計次 →「中止充電（不計次）」；同方向有多個不計次階段時附開始時間
+    「中止充電（不計次，HH:MM:SS）」，時分秒仍重複 → 完整日期時間。原始 Stage.no 不變。"""
+    stages = list(stages)
+    unc = {}
+    for st in stages:
+        if not getattr(st, "counted", True):
+            unc.setdefault(st.dir, []).append(st)
+    tag = {}
+    for sts in unc.values():
+        if len(sts) < 2:
+            continue
+        hms = [s.start.t.strftime("%H:%M:%S") for s in sts]
+        fmt = "%Y-%m-%d %H:%M:%S" if len(set(hms)) < len(hms) else "%H:%M:%S"
+        for s in sts:
+            tag[s.no] = "，" + s.start.t.strftime(fmt)
     cnt = {"C": 0, "D": 0}
     out = {}
     for st in stages:
-        cnt[st.dir] += 1
-        out[st.no] = f"第{cnt[st.dir]}次{st.dir_name}"
+        if getattr(st, "counted", True):
+            cnt[st.dir] += 1
+            out[st.no] = f"第{cnt[st.dir]}次{st.dir_name}"
+        else:
+            out[st.no] = f"{STAGE_COUNT_LABEL}{st.dir_name}（不計次{tag.get(st.no, '')}）"
     return out
+
+
+def strip_count_time(name):
+    """「中止充電（不計次，…）」→「中止充電（不計次）」（頁籤超過 31 字時使用）；其他名稱原樣。"""
+    i = name.find("（不計次，")
+    return name[:i] + "（不計次）" if i >= 0 and name.endswith("）") else name
 
 
 # =============================================================================
