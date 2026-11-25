@@ -214,7 +214,10 @@ class UI:
             rows.append({"no": st.no, "dir": st.dir, "name": names[st.no], "start": _iso(st.start.t),
                          "t0": st.start.t, "t1": st.A.t, "label": st.label, "active": active,
                          "soc0": soc(_num(st.start.values.get("soc"))), "soc1": soc(_num(st.A.values.get("soc"))),
-                         "soc_post": None if active else soc(stage_post_stop_soc(st))})
+                         "soc_post": None if active else soc(stage_post_stop_soc(st)),
+                         # G6 stage_count：目前有效計次狀態（H2 分析結果）與服務端比對用的階段識別
+                         "counted": st.counted, "count_reason": st.count_reason, "count_note": st.count_note,
+                         "end_by": st.end_by, "end_iso": _iso(st.A.t), "_st": st})
         return rows
 
     def mark(self):
@@ -224,9 +227,14 @@ class UI:
             return None
         if not cid:
             return None
-        kind = self.ask("1. 階段標記（滿充／滿放／未滿／中止）　2. 不確定項目確認：", "1")
+        kind = self.ask("1. 階段標記（滿充／滿放／未滿／中止）　2. 不確定項目確認　3. 階段計次／不計次　0. 返回：", "1")
         if kind == "1":
             return self.mark_stage(cid)
+        if kind == "3":
+            return self.mark_count(cid)
+        if kind == "0":
+            self.out("已返回「認證測試」選單，未進行任何標記。")
+            return None
         st = REQ.read_status(self.root) or {}
         if st.get("cert_id") != cid:
             self.out("（此認證已結束；階段清單以最新報告摘要為準，確認後請「25 重新產生認證報告」）")
@@ -286,6 +294,109 @@ class UI:
         self.out("（標記只影響報告標題與頁籤名稱；已產生的報告不會自動更新，請用「25 重新產生認證報告」）")
         return res
 
+    # ---- 23-3 階段計次／不計次（G6 stage_count）----------------------------------
+    def count_preview(self, cid, row, counted, reason):
+        """
+        預覽：在記憶體中把這筆決策附加到目前 decisions 後重新分析（與報告同一套 H2 規則：analyze／stage_names），
+        回傳 (名稱有變化的階段 [(no, 原名稱, 新名稱)], 目標階段套用後的有效計次)。不寫任何認證資料。
+        """
+        from cert_runtime import CertRuntime, _iso
+        from cert_stage_engine import stage_names
+        rt = CertRuntime(self.root, reader=None, enable_shots=False, log=lambda *a: None)._offline(
+            os.path.join(self.root, cid))
+        before = stage_names(rt.analysis().stages)
+        rt.decisions = list(rt.decisions) + [{"type": "stage_count", "stage_start": row["start"], "counted": counted,
+                                              "reason": reason, "note": "", "at": "（預覽）", "by": "menu_preview",
+                                              "request_id": "PREVIEW"}]
+        res2 = rt.analysis()
+        after = stage_names(res2.stages)
+        st2 = next((s for s in res2.stages if _iso(s.start.t) == row["start"]), None)
+        changed = [(no, before.get(no), after[no]) for no in sorted(after) if before.get(no) != after[no]]
+        return changed, (None if st2 is None else st2.counted)
+
+    def mark_count(self, cid):
+        """列出階段與目前有效計次 → 選階段 → 設為不計次（必填原因）或恢復計次 → 預覽 → 輸入 YES 才送出。
+        取消、無效輸入、目前狀態已相同 → 不送出請求。服務端會重新驗證（不只依賴選單）。"""
+        from cert_stage_engine import _count_invalid
+        try:
+            rows = self.stage_rows(cid)
+        except Exception as e:                          # noqa: BLE001（含原始參數缺少／不合法）
+            self.out(f"無法分析 {cid} 的階段（{type(e).__name__}: {e}），未送出請求。")
+            return None
+        if not rows:
+            self.out(f"{cid} 目前沒有已判定的充／放電階段，未送出請求。")
+            return None
+        self.out("【階段計次／不計次】只影響報告階段名稱與計次；原始資料、階段切分與數值不變。")
+        for r in rows:
+            end = r["t1"].strftime("%H:%M:%S" if r["t1"].date() == r["t0"].date() else "%Y-%m-%d %H:%M:%S")
+            cnt = "計次" if r["counted"] else f"不計次（原因：{r['count_reason']}）"
+            if r["active"]:
+                allow = "進行中，不可設定"
+            elif r["counted"]:
+                why = _count_invalid(r["_st"], {"counted": False, "reason": "（檢查用）"})
+                allow = "可設為不計次" if not why else f"不可設為不計次：{why}"
+            else:
+                allow = "可恢復計次"
+            self.out(f"  {r['no']}. {r['name']}｜{r['t0']:%Y-%m-%d %H:%M:%S} ～ {end}｜SOC {r['soc0']} → {r['soc1']}")
+            self.out(f"     標記：{r['label'] or '未標記'}｜目前：{cnt}" + (f"｜說明：{r['count_note']}" if r["count_note"] else "")
+                     + f"｜{allow}")
+        self.out("  0. 返回")
+        v = self.ask("階段編號（0＝返回）：", "0")
+        if v == "0":
+            self.out("已返回，未送出請求。")
+            return None
+        row = next((r for r in rows if str(r["no"]) == v), None)
+        if row is None:
+            self.out(f"沒有階段編號「{v}」，未送出請求。")
+            return None
+        if row["active"]:
+            self.out("此階段仍在進行中 → 不能設定計次，未送出請求。")
+            return None
+        self.out("  1. 設為不計次　2. 恢復計次　0. 返回")
+        a = self.ask(f"{row['name']} 計次設定（0＝返回）：", "0")
+        if a not in ("1", "2"):
+            self.out("已返回，未送出請求。" if a == "0" else f"沒有選項「{a}」，未送出請求。")
+            return None
+        counted = a == "2"
+        if counted == row["counted"]:
+            self.out(f"此階段目前已是「{'計次' if counted else '不計次'}」→ 無需設定，未送出請求。")
+            return None
+        if not counted:
+            why = _count_invalid(row["_st"], {"counted": False, "reason": "（檢查用）"})
+            if why:
+                self.out(f"不能設為不計次：{why}（未送出請求）")
+                return None
+            reason = self.ask("不計次原因（必填）：")
+            if not reason.strip():
+                self.out("原因不可空白，未送出請求。")
+                return None
+        else:
+            reason = self.ask("恢復計次說明（選填）：")
+        try:
+            changed, eff = self.count_preview(cid, row, counted, reason)
+        except Exception as e:                          # noqa: BLE001
+            self.out(f"無法預覽（{type(e).__name__}: {e}），未送出請求。")
+            return None
+        if eff is not counted:
+            self.out("預覽結果與設定不一致（找不到目標階段或決策無效）→ 未送出請求。")
+            return None
+        self.out("【預覽】")
+        self.out(f"  認證：{cid}｜階段開始：{row['start'].replace('T', ' ')}｜設定：{'恢復計次' if counted else '不計次'}"
+                 + (f"｜原因：{reason}" if reason else ""))
+        for no, b_, a_ in changed:
+            self.out(f"  {no}. {b_} → {a_}")
+        if not changed:
+            self.out("  （階段名稱不變）")
+        self.out("  原始資料、階段切分與量測數值不變；已產生的報告不會自動更新。")
+        if self.ask("輸入 YES 送出：") != "YES":
+            self.out("已取消，未送出請求。")
+            return None
+        res = self.submit("stage_count", {"stage_start": row["start"], "counted": counted, "reason": reason, "note": "",
+                                          "expect": {"no": row["no"], "dir": row["dir"], "end": row["end_iso"]}},
+                          cert_id=cid)
+        self.out("（已產生的報告不會自動更新，請用「25 重新產生認證報告」）")
+        return res
+
     # ---- 24 補拍 --------------------------------------------------------------
     def shot(self):
         cid = REQ.active_on_disk(self.root)
@@ -327,7 +438,11 @@ class UI:
         if st.get("status") != "ended":
             self.out(f"認證 {cid} 尚未結束 → 不能事後補拍。")
             return None
-        rows = self.supplement_rows(cid)
+        try:
+            rows = self.supplement_rows(cid)
+        except Exception as e:                          # noqa: BLE001（G6：原始參數缺少／不合法 → 不分析、不送出）
+            self.out(f"無法分析 {cid} 的階段（{type(e).__name__}: {e}），未送出事後補拍。")
+            return None
         if not rows:
             self.out(f"認證 {cid} 沒有原始即時熱度截圖失敗或缺少的階段 → 不需事後補拍。")
             return None
@@ -360,7 +475,33 @@ class UI:
         if cid == BACK:                                 # 0＝返回：不建立請求、不產生報告
             self.out("已返回「認證測試」選單，未重新產生報告。")
             return None
-        return self.submit("regenerate", cert_id=cid) if cid else None
+        if not cid:
+            return None
+        # G6：已結束的認證 → 重產使用該認證開始時記錄的參數（cert_state.params）；與服務端同一套驗證
+        from cert_runtime import params_diff, session_params_check
+        st = REQ.read_json(os.path.join(self.root, cid, "cert_state.json"))
+        if isinstance(st, dict) and st.get("status") == "ended":
+            sp, errs, notes = session_params_check(st)
+            if errs:
+                self.out(f"認證 {cid} 的原始參數缺少或不合法 → 不能重新產生報告（未送出請求）：")
+                for e in errs:
+                    self.out(f"  - {e}")
+                return None
+            self.out("參數來源：本認證開始時記錄的參數（cert_state.params）")
+            for n in notes:
+                self.out(f"  （提示）{n}")
+            diff = params_diff(sp, CFG.params())
+            if diff:
+                self.out("⚠ 本認證原始參數與目前設定不同：")
+                for k, a, b in diff:
+                    self.out(f"  {k}：本認證 {a!r}｜目前設定 {b!r}")
+                self.out("重新產生報告將使用本認證的原始參數（不使用目前設定）。")
+                if self.ask("輸入 YES 送出重新產生：") != "YES":
+                    self.out("已取消，未送出請求。")
+                    return None
+        else:
+            self.out("參數來源：背景服務目前載入的參數（記錄中的認證維持既有行為）")
+        return self.submit("regenerate", cert_id=cid)
 
     # ---- 26 狀態 --------------------------------------------------------------
     def status(self):

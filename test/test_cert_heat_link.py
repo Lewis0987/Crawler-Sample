@@ -28,6 +28,7 @@ from openpyxl import load_workbook
 
 import cert_heat_link as HL
 import cert_requests as REQ
+import cert_report_config as CFG                                   # noqa: E402  G6：合成 cert_state 補 params
 from cert_menu import UI, heat_link_text, status_line
 from cert_runtime import CertRuntime, _read_jsonl
 
@@ -231,7 +232,8 @@ try:
         f.write(json.dumps({"t": "2026-11-04T17:00:00", "type": "start", "detail": "開始認證"}, ensure_ascii=False) + "\n")
     REQ.atomic_write_json(os.path.join(fd, "cert_state.json"),
                           {"cert_id": cid2, "status": "ended", "started_at": "2026-11-04T17:00:00",
-                           "ended_at": "2026-11-04T19:23:18", "test_info": {"cabinet_spec": "250KW"}, "reports": []})
+                           "ended_at": "2026-11-04T19:23:18", "test_info": {"cabinet_spec": "250KW"}, "reports": [],
+                           "params": CFG.params()})
     ro = CertRuntime(old, reader=None, enable_shots=False, log=lambda *a: None)
     st_key = ro._offline(fd).analysis().stages[0].start.t.strftime("%Y-%m-%dT%H:%M:%S")
     fail3 = [{"n": i, "started": "x", "ended": "x", "status": "failed", "reason": "開頁失敗：net::ERR_CONNECTION_TIMED_OUT"}

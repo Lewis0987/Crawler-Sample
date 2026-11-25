@@ -35,6 +35,7 @@ except Exception:
 from openpyxl import load_workbook
 
 import cert_requests as REQ
+import cert_report_config as CFG                                   # noqa: E402  G6：合成 cert_state 補 params
 import cert_supplement as SUP
 from cert_menu import UI
 from cert_runtime import CertRuntime, _read_jsonl
@@ -130,7 +131,7 @@ def build_cert(root):
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
     REQ.atomic_write_json(os.path.join(fd, "cert_state.json"), {
         "cert_id": CID, "status": "ended", "started_at": "2026-11-04T09:55:00", "ended_at": "2026-11-04T11:20:00",
-        "test_info": {"cabinet_spec": "250KW", "cycles": 1}, "interruptions": [],
+        "test_info": {"cabinet_spec": "250KW", "cycles": 1}, "interruptions": [], "params": CFG.params(),
         "reports": [{"file": f"reports\\認證測試報告_{CID}_01.xlsx", "at": "2026-11-04 11:21:00"},
                     {"file": f"reports\\認證測試報告_{CID}_02.xlsx", "at": "2026-11-04 11:25:00"}]})
     open(os.path.join(fd, "reports", f"認證測試報告_{CID}_01.xlsx"), "wb").write(b"original _01 placeholder")

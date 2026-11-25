@@ -436,6 +436,257 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+# =============================================================================
+# G6：stage_count request／runtime handler（SC-09 status、SC-11、SC-13、服務端防護、HOLD、原始參數）
+#     全部在 tempfile 暫存目錄的合成 Session；不連設備、不讀寫正式資料。
+# =============================================================================
+import hashlib                                          # noqa: E402
+import json                                             # noqa: E402
+
+import cert_requests as REQ                             # noqa: E402
+import cert_runtime as CR                               # noqa: E402
+
+g6 = tempfile.mkdtemp(prefix="cert_g6sc_")
+T6 = datetime(2026, 1, 7, 9, 0, 0)
+CUR6 = {"C": 135.0, "D": -140.0, "I": 0.0}
+PLAN6 = [("D", 0, 300), ("I", 310, 430), ("C", 440, 500), ("I", 510, 630), ("C", 640, 940), ("I", 950, 1070)]
+K_D, K_C1, K_C2 = "2026-01-07T09:00:00", "2026-01-07T09:07:20", "2026-01-07T09:10:40"
+
+
+class KilledG6(BaseException):
+    """模擬行程在「決策已寫入、結果未寫入」之間被終止（不被 except Exception 攔下）。"""
+
+
+def rec6(t, k):
+    vals = {"soc": 50.0, "current_a": CUR6[k], "power_kw": None, "rack_max_c": 40.0, "rack_min_c": 30.0,
+            "cell_vmax_v": 3.4, "cell_vmin_v": 3.3, "voltage_v": 900.0, "sensor_c": None, "pcs_module_c": "60"}
+    return {"t": t.strftime("%Y-%m-%dT%H:%M:%S"), "ok": True, "hmi_ok": True, "values": vals, "missing": [],
+            "fail_reason": "", "notes": [], "flags": {}}
+
+
+def mk6(root, cid, plan=PLAN6, status="ended", params="cfg", labels=((K_C1, "中止"),)):
+    folder = os.path.join(root, cid)
+    os.makedirs(folder)
+    with open(os.path.join(folder, "observations.jsonl"), "w", encoding="utf-8") as f:
+        for k, s0, s1 in plan:
+            for s in range(s0, s1 + 1, 10):
+                f.write(json.dumps(rec6(T6 + timedelta(seconds=s), k), ensure_ascii=False) + "\n")
+    st = {"cert_id": cid, "status": status, "test_info": {"cabinet_spec": "250KW"}}
+    if params is not None:
+        st["params"] = CFG.params() if params == "cfg" else params
+    REQ.atomic_write_json(os.path.join(folder, "cert_state.json"), st)
+    for i, (ss, lb) in enumerate(labels):
+        with open(os.path.join(folder, "decisions.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "stage_label", "stage_start": ss, "label": lb, "note": "",
+                                "at": f"2026-01-07 10:0{i}:00", "by": "test", "request_id": f"LBL-{cid}-{i}"},
+                               ensure_ascii=False) + "\n")
+    return folder
+
+
+def sha6(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest() if os.path.exists(p) else None
+
+
+def decs6(folder, kind="stage_count"):
+    return [d for d in CR._read_jsonl(os.path.join(folder, "decisions.jsonl")) if d.get("type") == kind]
+
+
+def put6(root, cid, payload, rid=None, created=None, fname=None):
+    """直接寫入 pending 請求（可指定 request_id／建立時間／檔名；模擬重送與同 id 雙檔）。"""
+    created = created or datetime.now()
+    rid = rid or f"REQ_{created:%Y%m%d_%H%M%S}_{os.urandom(4).hex()}"
+    req = {"request_id": rid, "type": "stage_count", "cert_id": cid, "payload": payload,
+           "created_at": created.strftime("%Y-%m-%d %H:%M:%S"), "source": "test"}
+    REQ.atomic_write_json(os.path.join(root, "requests", "pending", fname or f"{rid}.json"), req)
+    return rid
+
+
+def res6(root, rid):
+    return REQ.read_result(root, rid) or {}
+
+
+def unc(reason="誤操作充電，約 60 秒後停止"):
+    return {"stage_start": K_C1, "counted": False, "reason": reason, "note": ""}
+
+
+try:
+    root6 = os.path.join(g6, "root")
+    svc = CR.CertRuntime(root6, reader=None, enable_shots=False, log=lambda *a: None)
+    names6 = lambda fd: [n for _no, n in sorted(stage_names(svc._offline(fd).analysis().stages).items())]   # noqa: E731
+
+    print("\n== G6 stage_count：服務端處理（已結束認證）==")
+    A = "CERT_20260107_090000"
+    fa = mk6(root6, A)
+    obs0, st0 = sha6(os.path.join(fa, "observations.jsonl")), sha6(os.path.join(fa, "cert_state.json"))
+    check("G6-SC 前提：三個階段依序為 第1次放電／第1次充電／第2次充電", names6(fa) == ["第1次放電", "第1次充電", "第2次充電"])
+    rid = put6(root6, A, unc())
+    svc.process_requests()
+    r, d = res6(root6, rid), decs6(fa)
+    check("G6-SC-1 標記「中止」且已結束的階段設為不計次 → done，decisions 只新增 1 筆（含 at／by／request_id）",
+          r.get("status") == "done" and len(d) == 1 and d[0]["request_id"] == rid and d[0]["counted"] is False
+          and d[0].get("at") and d[0].get("by") == "test")
+    check("G6-SC-2 不計次後名稱：第1次放電／中止充電（不計次）／第1次充電（不占用後續編號）",
+          names6(fa) == ["第1次放電", "中止充電（不計次）", "第1次充電"])
+    check("G6-SC-3 原始 observations、cert_state 不變（只寫 decisions）",
+          sha6(os.path.join(fa, "observations.jsonl")) == obs0 and sha6(os.path.join(fa, "cert_state.json")) == st0)
+    rid2 = put6(root6, A, unc())
+    svc.process_requests()
+    check("G6-SC-4 目前已是不計次 → 拒絕「無需設定」，不新增決策",
+          res6(root6, rid2).get("status") == "rejected" and "無需設定" in res6(root6, rid2).get("message", "")
+          and len(decs6(fa)) == 1)
+    rid3 = put6(root6, A, {"stage_start": K_C2, "counted": False, "reason": "x", "note": ""})
+    svc.process_requests()
+    check("G6-SC-5 標記不是「中止」的階段 → 拒絕（H2 規則），不寫入",
+          res6(root6, rid3).get("status") == "rejected" and "不是「中止」" in res6(root6, rid3).get("message", "")
+          and len(decs6(fa)) == 1)
+    rid4 = put6(root6, A, {"stage_start": K_C1, "counted": "false", "reason": "x", "note": ""})
+    rid5 = put6(root6, A, {"stage_start": "2026-01-07T09:99:99", "counted": False, "reason": "x", "note": ""})
+    svc.process_requests()
+    check("G6-SC-6 直接送請求：counted 不是布林值 → 拒絕；stage_start 對不到 → 拒絕；都不寫入",
+          res6(root6, rid4).get("status") == "rejected" and "布林值" in res6(root6, rid4).get("message", "")
+          and res6(root6, rid5).get("status") == "rejected" and "找不到階段" in res6(root6, rid5).get("message", "")
+          and len(decs6(fa)) == 1)
+    rid6 = put6(root6, A, {"stage_start": K_C1, "counted": True, "reason": "", "note": "",
+                           "expect": {"no": 99, "dir": "C", "end": "2026-01-07T09:08:20"}})
+    svc.process_requests()
+    check("G6-SC-7 選單階段識別（編號／方向／結束時間）與服務端不一致 → 拒絕，不寫入",
+          res6(root6, rid6).get("status") == "rejected" and "不一致" in res6(root6, rid6).get("message", "")
+          and len(decs6(fa)) == 1)
+    rid7 = put6(root6, A, {"stage_start": K_C1, "counted": True, "reason": "", "note": "",
+                           "expect": {"no": 2, "dir": "C", "end": "2026-01-07T09:08:20"}})
+    svc.process_requests()
+    res_a = svc._offline(fa).analysis()
+    st_c1 = next(s for s in res_a.stages if CR._iso(s.start.t) == K_C1)
+    check("G6-SC-8 恢復計次（識別一致）→ done；名稱恢復；歷史 2 筆完整保留",
+          res6(root6, rid7).get("status") == "done" and names6(fa) == ["第1次放電", "第1次充電", "第2次充電"]
+          and len(decs6(fa)) == 2 and len(st_c1.count_history) == 2 and st_c1.counted is True)
+
+    B = "CERT_20260108_090000"
+    fb = mk6(root6, B)
+    rb_ = put6(root6, B, unc(reason="   "))
+    svc.process_requests()
+    check("G6-SC-9 原因空白 → 拒絕（H2：原因空白），不寫入",
+          res6(root6, rb_).get("status") == "rejected" and "原因空白" in res6(root6, rb_).get("message", "")
+          and not decs6(fb))
+
+    print("\n== G6 SC-13：request_id 去重 ==")
+    rid_r = put6(root6, B, unc())
+    svc.process_requests()
+    put6(root6, B, unc(), rid=rid_r)                    # ① 同一請求重送（結果已存在）
+    svc.process_requests()
+    check("G6-SC13-1 同一 request_id 重送 → 不再執行，決策仍只有 1 筆、結果仍為 done",
+          len([x for x in decs6(fb) if x["request_id"] == rid_r]) == 1 and res6(root6, rid_r).get("status") == "done")
+
+    C = "CERT_20260109_090000"
+    fc = mk6(root6, C)
+    rid_c = put6(root6, C, unc())
+    orig_wr = REQ.write_result
+
+    def boom(*a, **k):
+        raise KilledG6("模擬中斷")
+    REQ.write_result = boom
+    try:
+        svc.process_requests()
+        crashed = False
+    except KilledG6:
+        crashed = True
+    finally:
+        REQ.write_result = orig_wr
+    pend = os.path.exists(os.path.join(root6, "requests", "pending", f"{rid_c}.json"))
+    check("G6-SC13-2a 中斷模擬：決策已寫入、處理結果未寫入、請求仍在 pending",
+          crashed and len(decs6(fc)) == 1 and not REQ.read_result(root6, rid_c) and pend)
+    late = CR.CertRuntime(root6, reader=None, enable_shots=False, log=lambda *a: None,
+                          clock=lambda: datetime.now() + timedelta(seconds=CFG.CERT_REQUEST_EXPIRE_SEC + 100))
+    late.process_requests()                             # 重啟後（已超過逾期時間）
+    rc_ = res6(root6, rid_c)
+    check("G6-SC13-2b 重啟後（已逾期）→ 逾期判斷之前補寫 done（註明不重複寫入），決策仍只有 1 筆、請求已歸檔",
+          rc_.get("status") == "done" and "不重複寫入" in rc_.get("message", "") and len(decs6(fc)) == 1
+          and not os.path.exists(os.path.join(root6, "requests", "pending", f"{rid_c}.json")))
+
+    D = "CERT_20260110_090000"
+    fd_ = mk6(root6, D)
+    rid_d = put6(root6, D, unc())
+    REQ.write_result = boom
+    try:
+        svc.process_requests()
+    except KilledG6:
+        pass
+    finally:
+        REQ.write_result = orig_wr
+    put6(root6, D, unc(reason="內容被改成不同的原因"), rid=rid_d)       # 同 request_id、不同內容（覆蓋 pending 檔）
+    svc.process_requests()
+    rd_ = res6(root6, rid_d)
+    check("G6-SC13-3 同一 request_id、內容不同 → 拒絕；原決策不覆寫、不新增",
+          rd_.get("status") == "rejected" and "內容不同" in rd_.get("message", "")
+          and len(decs6(fd_)) == 1 and decs6(fd_)[0]["reason"] == unc()["reason"])
+
+    E6 = "CERT_20260111_090000"
+    fe = mk6(root6, E6)
+    rid_e = put6(root6, E6, unc())
+    put6(root6, E6, unc(), rid=rid_e, fname=f"copy_{rid_e}.json")        # ③ pending 有兩個同 id 的請求檔
+    svc.process_requests()
+    svc.process_requests()
+    check("G6-SC13-4 pending 有兩個同 id 的請求檔 → 決策只有 1 筆、結果 done",
+          len(decs6(fe)) == 1 and res6(root6, rid_e).get("status") == "done")
+    req_e = {"request_id": rid_e, "type": "stage_count", "cert_id": E6, "payload": unc(), "source": "test",
+             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    svc._h_stage_count(req_e)                            # handler 本身也去重（不依賴前置判定）
+    check("G6-SC13-5 handler 直接收到已寫入的 request_id → done（重複），不新增決策",
+          len(decs6(fe)) == 1 and (res6(root6, rid_e).get("data") or {}).get("duplicate") is True)
+
+    print("\n== G6 HOLD／原始參數／進行中 ==")
+    H1, H2 = "CERT_20260112_090000", "CERT_20260113_090000"
+    fh1, fh2 = mk6(root6, H1), mk6(root6, H2)
+    svc._halt = {"cert_id": H1, "reason": "測試 HOLD"}
+    halt0 = json.dumps(svc._halt, sort_keys=True)
+    rh1, rh2 = put6(root6, H1, unc()), put6(root6, H2, unc())
+    svc.process_requests()
+    check("G6-HOLD-1 目標認證 HOLD → 拒絕，不寫入；HOLD 狀態不變",
+          res6(root6, rh1).get("status") == "rejected" and "HOLD" in res6(root6, rh1).get("message", "")
+          and not decs6(fh1) and json.dumps(svc._halt, sort_keys=True) == halt0)
+    check("G6-HOLD-2 其他已結束認證（獨立 Session）→ 照常處理，不影響 HOLD",
+          res6(root6, rh2).get("status") == "done" and len(decs6(fh2)) == 1 and json.dumps(svc._halt, sort_keys=True) == halt0)
+    svc._halt = None
+
+    bad = dict(CFG.params())
+    del bad["W_PAUSE_SEC"]
+    PB = "CERT_20260114_090000"
+    fpb = mk6(root6, PB, params=bad)
+    rpb = put6(root6, PB, unc())
+    svc.process_requests()
+    check("G6-PRM-1 已結束認證缺少必要參數 W_PAUSE_SEC → 拒絕（列出參數名稱），不寫入",
+          res6(root6, rpb).get("status") == "rejected" and "W_PAUSE_SEC：缺少" in res6(root6, rpb).get("message", "")
+          and not decs6(fpb))
+
+    RC = "CERT_20260115_090000"
+    frc = mk6(root6, RC, plan=PLAN6[:3], status="recording", labels=((K_C1, "中止"),))
+    rrc = put6(root6, RC, unc())
+    svc.process_requests()
+    check("G6-REC-1 記錄中認證、最後階段仍在進行（資料結束時仍運行）→ 拒絕「階段尚未結束」，不寫入",
+          res6(root6, rrc).get("status") == "rejected" and "階段尚未結束" in res6(root6, rrc).get("message", "")
+          and not decs6(frc))
+    check("G6-REC-2 記錄中認證的歷史分析維持既有行為（使用 runtime 參數 self.p，不改用 Session 參數）",
+          svc._offline(frc).p is svc.p)
+
+    print("\n== G6 SC-11 快取重算／SC-09 status 名稱（目前認證）==")
+    CC = "CERT_20260116_090000"
+    fcc = mk6(root6, CC, status="recording")
+    cur = svc._offline(fcc)                              # 視為服務目前載入的認證（folder＝self.folder）
+    ra, rb2 = cur.analysis(), cur.analysis()
+    check("G6-SC11-1 決策未變 → 分析快取命中（同一結果物件）", ra is rb2)
+    rcc = put6(cur.root, CC, unc())
+    cur.process_requests()
+    rc2 = cur.analysis()
+    check("G6-SC11-2 新增 stage_count 決策（記憶體 decisions 同步）→ 一定重算，名稱立即更新",
+          res6(root6, rcc).get("status") == "done" and rc2 is not ra and len([x for x in cur.decisions if x.get("type") == "stage_count"]) == 1
+          and [n for _no, n in sorted(stage_names(rc2.stages).items())] == ["第1次放電", "中止充電（不計次）", "第1次充電"])
+    cur.write_status()
+    stn = [x["name"] for x in (REQ.read_status(root6) or {}).get("stages") or []]
+    check("G6-SC09-1 status.json 階段名稱與分析結果一致（第1次放電／中止充電（不計次）／第1次充電）",
+          stn == ["第1次放電", "中止充電（不計次）", "第1次充電"])
+finally:
+    shutil.rmtree(g6, ignore_errors=True)
+
 ok = all(_results)
 print(f"\n== H2 stage_count／dec_v1 {'PASS' if ok else 'FAIL'}（{sum(_results)}/{len(_results)} 檢查通過）==")
 sys.exit(0 if ok else 1)

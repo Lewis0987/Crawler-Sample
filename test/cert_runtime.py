@@ -46,13 +46,91 @@ import cert_requests as REQ
 import report_quality as RQ
 import sample_scheduler as SS
 from cert_controls import describe as describe_action
-from cert_stage_engine import Obs, analyze, classify, stage_names
+from cert_stage_engine import Obs, _count_invalid, analyze, classify, hmi_valid, stage_names
 
 ISO = "%Y-%m-%dT%H:%M:%S"
 LABELS = ("滿充", "滿放", "未滿", "中止")
 LABEL_WRONG_DIR = {"C": "滿放", "D": "滿充"}   # 充電階段不可標滿放、放電階段不可標滿充
 LABELS_IN_PROGRESS = ("中止",)                  # 進行中的階段只允許標記中止
 CHOICES = ("merge", "split")
+
+# ---- G6：歷史 Session 原始參數（已結束認證的歷史分析／重產一律使用；Menu 與 runtime 共用同一套驗證）----
+# 必要參數：分析或報告說明實際使用；缺少／不合法 → 拒絕歷史分析與重產（不以 CFG.params() 或預設值補齊）。
+REQUIRED_PARAMS = ("W_PAUSE_SEC", "TCONF_SEC", "GAP_G_SEC", "IDLE_CURRENT_A", "IDLE_POWER_KW",
+                   "CMD_STAGE_MATCH_SEC", "STOP_WARN_SEC", "SENSOR_VALID_RANGE", "SAMPLE_INTERVAL_SEC")
+_PARAM_RULE = {"W_PAUSE_SEC": "gt0", "TCONF_SEC": "gt0", "GAP_G_SEC": "gt0", "IDLE_CURRENT_A": "ge0",
+               "IDLE_POWER_KW": "ge0", "CMD_STAGE_MATCH_SEC": "ge0", "STOP_WARN_SEC": "gt0", "SAMPLE_INTERVAL_SEC": "gt0"}
+COMPAT_PARAMS = {"MINUTE_TOL_SEC": "ge0"}       # 相容參數：分析不讀取；缺少只提示，存在時仍須合法
+_RULE_TEXT = {"gt0": "大於 0", "ge0": "大於等於 0"}
+
+
+class SessionParamsError(ValueError):
+    """已結束認證的原始參數缺少或不合法 → 不做歷史分析（訊息列出參數名稱與原因）。"""
+
+
+_INF = float("inf")
+
+
+def _finite_num(v):
+    """有限數值（int／float；排除 bool、NaN、±Infinity）。不另外 import math（維持 cert_runtime 既有 import 清單）。"""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and -_INF < v < _INF
+
+
+def _param_ok(v, rule):
+    return _finite_num(v) and (v > 0 if rule == "gt0" else v >= 0)
+
+
+def session_params_check(state):
+    """
+    G6：驗證 cert_state.params（認證開始時記錄的參數）。回傳 (params, errors, notes)：
+      params＝合法時的參數複本（含未知額外鍵，原樣保留）；不合法 → None。
+      errors＝不合法原因（參數名稱＋原因）；notes＝相容參數缺少等提示。
+    不修改 state；不以目前設定或預設值補齊。
+    """
+    p = state.get("params") if isinstance(state, dict) else None
+    if not isinstance(p, dict):
+        return None, ["cert_state.json 沒有 params（認證開始時記錄的參數）或格式不是物件"], []
+    errs, notes = [], []
+    for k in REQUIRED_PARAMS:
+        if k not in p:
+            errs.append(f"{k}：缺少")
+            continue
+        v = p[k]
+        if k == "SENSOR_VALID_RANGE":
+            if v is not None and not (isinstance(v, (list, tuple)) and len(v) == 2 and all(_finite_num(x) for x in v)
+                                      and v[0] < v[1]):
+                errs.append(f"{k}：不合法（須為 null，或［下限, 上限］兩個有限數值且下限小於上限）：{v!r}")
+            continue
+        if not _param_ok(v, _PARAM_RULE[k]):
+            errs.append(f"{k}：不合法（須為有限數值且{_RULE_TEXT[_PARAM_RULE[k]]}）：{v!r}")
+    for k, rule in COMPAT_PARAMS.items():
+        if k not in p:
+            notes.append(f"{k}：缺少（相容參數，分析不使用）")
+        elif not _param_ok(p[k], rule):
+            errs.append(f"{k}：不合法（須為有限數值且{_RULE_TEXT[rule]}）：{p[k]!r}")
+    return (None if errs else dict(p)), errs, notes
+
+
+def params_diff(session_p, current_p):
+    """Session 原始參數與目前設定的差異：[(名稱, Session 值, 目前值)]（鍵為兩者聯集，依名稱排序）。"""
+    s, c = session_p or {}, current_p or {}
+    miss = object()
+    out = []
+    for k in sorted(set(s) | set(c)):
+        a, b = s.get(k, miss), c.get(k, miss)
+        if a != b:
+            out.append((k, "（無）" if a is miss else a, "（無）" if b is miss else b))
+    return out
+
+# ---- BUG-2（W-G1c 最小修正，2026-11-16）：結束認證中途失敗 → HOLD（停止取樣，等人工選單 22 重新結束）----
+END_EVIDENCE_READ_TRIES = 3          # 結束證據檔讀不到時的嘗試次數（含第一次）
+END_EVIDENCE_RETRY_SEC = 0.2         # 每次重試間隔（秒）
+END_REQUEST_EVENT_TYPES = ("end_begin", "end_failed")   # events.jsonl 中代表「這個結束請求已開始執行」的事件
+
+# ---- G-1／G-2／G-3 補正（2026-11-17）----
+STRICT_TAIL_RETRIES = 3              # G-3：最後一行沒有換行（可能正在寫入）→ 等待後重讀的次數
+STRICT_TAIL_RETRY_SEC = 0.2          # 每次重讀間隔（秒）
+END_RESEND_WARN = "⚠ 結束已完成，但"   # G-2：補寫流程有任何一項異常時，結果訊息的開頭
 
 
 def _iso(t):
@@ -61,6 +139,11 @@ def _iso(t):
 
 def _parse(s):
     return datetime.strptime(s, ISO) if s else None
+
+
+def _json_copy(obj):
+    """BUG-1／BUG-2：狀態快照（與 cert_state.json 落盤內容相同的 JSON 往返複本；不新增 import）。"""
+    return json.loads(json.dumps(obj, ensure_ascii=False, default=str))
 
 
 def _append_jsonl(path, rec):
@@ -125,6 +208,56 @@ def _read_jsonl(path):
                 except ValueError:
                     pass                # 行程中斷時最後一行可能寫一半 → 略過該行，不影響其他紀錄
     return out
+
+
+def _read_jsonl_strict(path, tries=STRICT_TAIL_RETRIES, wait=STRICT_TAIL_RETRY_SEC):
+    """
+    G-3 方案 S：結束證據專用的嚴格讀法。只讀（rb），不修改、不截斷、不修復檔案。回傳 (紀錄 list, 問題 list)。
+      - 檔案不存在 → ([], [])；開檔／讀取失敗 → 重試後仍失敗 → ([], [原因])。
+      - 中間的行（後面已有換行）無法解析、不是 UTF-8 或不是 JSON 物件 → 問題
+        （所有寫入方都是「開檔 → 一次寫入一整行加換行 → 關檔」，中間的行不會是寫到一半）。
+      - 最後一行沒有換行 → 可能正在寫入：等 wait 秒重讀，最多 tries 次；仍不完整 → 問題。
+      - 不從損壞的文字推測事件類型；問題非空 → 呼叫端一律視為無法確認（保守處理）。
+    """
+    name = os.path.basename(path)
+    for k in range(tries + 1):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            return [], []
+        except OSError as e:
+            if k < tries:
+                time.sleep(wait)
+                continue
+            return [], [f"{name} 讀不到（{type(e).__name__}）"]
+        lines = data.split(b"\n")
+        tail = lines.pop()
+        if tail.strip() and k < tries:
+            time.sleep(wait)
+            continue
+        recs, probs = [], []
+        for i, ln in enumerate(lines, 1):
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s.decode("utf-8"))
+            except ValueError:                  # 含 UnicodeDecodeError
+                obj = None
+            if isinstance(obj, dict):
+                recs.append(obj)
+            else:
+                probs.append(f"{name} 第 {i} 行無法解析")
+        if tail.strip():
+            probs.append(f"{name} 最後一行不完整（重讀 {tries} 次仍未完成）")
+        return recs, probs
+    return [], [f"{name} 讀不到"]
+
+
+def _is_end_of(e, rid):
+    """events.jsonl 的 end 事件是否屬於請求 rid（正常結束的 detail 帶「（請求 rid）」；補登的另帶 request_id）。"""
+    return e.get("type") == "end" and (e.get("request_id") == rid or f"（請求 {rid}）" in str(e.get("detail")))
 
 
 def cmd_kind(action):
@@ -348,6 +481,7 @@ class CertRuntime:
         self.reader = reader
         self.env_reader = env_reader
         self._env_thread = None
+        self._env_folder = None             # G-2：_env_thread 寫入的認證資料夾（補寫流程讀 events 前等它寫完）
         self.heat_reader = heat_reader
         self.single_state = single_state or (lambda: None)
         self.cmd_file = cmd_file
@@ -381,6 +515,9 @@ class CertRuntime:
         self._tpl_lock = threading.Lock()
         self._tpl_src = None
         self._tpl = []
+        # BUG-2：HOLD 旗標（結束已開始但 ended 尚未落盤，或重啟時發現結束證據）。只在 ended 成功落盤後清除；
+        #        _reset() 不碰它（不會被意外清掉）。重啟後由 startup() 依磁碟證據重新判定（不另寫 HOLD 標記檔）。
+        self._halt = None
         self._reset()
         os.makedirs(root, exist_ok=True)
 
@@ -398,6 +535,8 @@ class CertRuntime:
         self._delayed = set()       # (job_id, target)
         self._last_cmd_sig = None
         self._report_busy = False
+        self._end_steps = set()     # BUG-2：本程序內這份認證的結束步驟已完成哪些（state／event／active／report）
+        self._end_flags = {}        # G-2：正常結束時的異常標記（例：active_json＝unknown）→ 寫入處理結果
         self._hl = None             # 6161 連線狀態（由 records 重播；重啟／新認證後於下一筆取樣時重建）
         self._hl_keys = set()       # 已記錄的 6161 連線事件 key（避免重複提醒）
         self._cur_slot = None       # 取樣迴圈設定的本格（tick 模擬時為 None → 不寫格點）
@@ -444,6 +583,15 @@ class CertRuntime:
             return None
         with self._lock:
             self._load(cid)
+            # BUG-2：先看結束證據，再決定是否續接。有證據或無法確認 → HOLD（不續接、不寫 resume／interruptions、不取樣）。
+            #        cert_state 讀不到（非 dict）→ 維持原行為（下面照舊拋出例外，由 cert_service 記錄；不續接）。
+            if isinstance(self.cert, dict):
+                try:
+                    decision, ev = self._end_evidence(cid)
+                except Exception as e:                  # noqa: BLE001
+                    decision, ev = "hold", {"reason": f"結束證據判讀例外：{type(e).__name__}: {e}"}
+                if decision != "resume":
+                    return self._startup_hold(cid, ev)
             now = self.clock()
             last = _parse(self.cert.get("last_sample_time")) if self.cert.get("last_sample_time") else None
             gap = (now - last).total_seconds() if last else None
@@ -463,6 +611,295 @@ class CertRuntime:
             self._seg_reason_next = "restart"           # M-S2：續接 → 新的格點段落（停機期間不產生格點）
             self.log(f"[CERT] 接續認證 {cid}（{detail}）")
             return cid
+
+    # ---- BUG-2：結束證據、HOLD、結束事件 -------------------------------------------
+    @staticmethod
+    def _read_json_tries(path):
+        """證據檔讀取：任何錯誤（含不存在、共用衝突、內容損壞）重試，最終回傳 (物件, 是否讀到)。"""
+        for k in range(END_EVIDENCE_READ_TRIES):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f), True
+            except (OSError, ValueError):
+                if k + 1 < END_EVIDENCE_READ_TRIES:
+                    time.sleep(END_EVIDENCE_RETRY_SEC)
+        return None, False
+
+    def _end_evidence(self, cid):
+        """
+        BUG-2（唯讀）：cert_state 仍為 recording 時，判定這份認證是否有「結束已要求或已開始」的證據。
+          歸屬：type＝end_cert、cert_id 完全相同、created_at 不早於 started_at（檔名時間早於 started_at → 直接略過）。
+          範圍：requests/pending、requests/done、results、本認證 events.jsonl（全部只讀）。
+        回傳 (decision, ev)：resume＝沒有任何證據（照原規則續接）；hold＝有證據、矛盾或無法確認（Fail Closed）。
+          rejected（未通過檢查，結束沒有開始）→ 忽略；但帶 data.hold（重啟時標記的結束請求）→ 仍是證據。
+        """
+        sa = self.cert.get("started_at")
+        started = _parse(sa) if sa else None            # 缺少 → 不做時間過濾（範圍更大）；格式錯誤 → 例外 → 呼叫端 hold
+        items, unreadable, held_marks = {}, [], []
+        for sub, key in ((("requests", "pending"), "pending"), (("requests", "done"), "done"), (("results",), "result")):
+            d = os.path.join(self.root, *sub)
+            if not os.path.isdir(d):
+                continue
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".json"):
+                    continue
+                rel = "/".join(sub + (fn,))
+                ft = None
+                if fn.startswith("REQ_"):
+                    try:
+                        ft = datetime.strptime(fn[4:19], "%Y%m%d_%H%M%S")
+                    except ValueError:
+                        ft = None
+                if ft is not None and started is not None and ft < started:
+                    continue                            # 這份認證開始前建立的請求
+                obj, ok = self._read_json_tries(os.path.join(d, fn))
+                if not ok or not isinstance(obj, dict):
+                    unreadable.append(rel)
+                    continue
+                if obj.get("type") != "end_cert":
+                    continue
+                if obj.get("cert_id") in (None, ""):
+                    unreadable.append(rel + "（end_cert 沒有 cert_id）")
+                    continue
+                if obj.get("cert_id") != cid:
+                    continue
+                try:
+                    created = datetime.strptime(str(obj.get("created_at")), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    unreadable.append(rel + "（created_at 無法判讀）")
+                    continue
+                if started is not None and created < started:
+                    continue
+                items.setdefault(obj.get("request_id") or fn[:-5], {})[key] = obj
+        ev_begin, ev_failed, n_failed_ev = {}, {}, 0
+        evp = self._f("events.jsonl")
+        if os.path.exists(evp):
+            evs, probs = _read_jsonl_strict(evp)        # G-3 方案 S：損壞行／未完成的尾行 → 無法確認 → HOLD
+            unreadable.extend(f"{p}（無法確認）" for p in probs)
+            for e in evs:
+                if e.get("type") == "end_begin":
+                    ev_begin.setdefault(e.get("request_id") or "（未記錄請求）", e.get("t"))
+                elif e.get("type") == "end_failed":
+                    n_failed_ev += 1
+                    ev_failed.setdefault(e.get("request_id") or "（未記錄請求）", e.get("t"))
+        held, contra, firsts = [], [], []
+        for rid in sorted(items):
+            x = items[rid]
+            res = x.get("result")
+            st = res.get("status") if res else None
+            data = res.get("data") if isinstance(res, dict) and isinstance(res.get("data"), dict) else {}
+            mark = data.get("hold") if isinstance(data.get("hold"), dict) else None
+            if mark:
+                held_marks.append({"request_id": rid, "class": mark.get("class"), "status": st})
+            if st == "rejected" and not mark:
+                if rid in ev_begin:
+                    contra.append(f"{rid}：結果為 rejected，但 events.jsonl 有 end_begin")
+                continue                                # 未通過檢查 → 結束沒有開始
+            src = x.get("pending") or x.get("done") or res
+            # G-3：M7b 標記的結果 → 只用標記中實際讀到的 end_begin 時間（處理時間不是嘗試時間，不推估）
+            fa_res = ((mark.get("first_attempt_at") if mark else res.get("processed_at")) if st == "failed" else None)
+            firsts.append({"request_id": rid, "requested_at": src.get("created_at"),
+                           "first_attempt_at": ev_begin.get(rid) or fa_res})
+            if st in ("failed", "rejected"):
+                held.append(f"{rid}：{st}" + ("（重啟時 HOLD 標記）" if mark else "（結束已開始執行但未完成）"))
+            elif st == "expired":
+                held.append(f"{rid}：expired（要求結束但未執行）")
+            elif st == "done":
+                contra.append(f"{rid}：結果為 done，但 cert_state 仍為 recording")
+            elif st is not None:
+                contra.append(f"{rid}：結果狀態無法判讀（{st!r}）")
+            elif "pending" in x:
+                held.append(f"{rid}：待處理、尚無結果")
+            else:
+                contra.append(f"{rid}：請求已歸檔但沒有處理結果")
+        ev = {"held": held, "contradictions": contra, "unreadable": unreadable,
+              "events_end_begin": sorted(ev_begin), "events_end_failed": sorted(ev_failed),
+              "end_failed_count": n_failed_ev, "held_requests": held_marks}
+        if not (held or contra or unreadable or ev_begin or ev_failed):
+            return "resume", ev
+        reasons = held + contra + [f"讀不到：{u}" for u in unreadable]
+        if ev_begin or ev_failed:
+            reasons.append("events.jsonl 有結束紀錄（" + "、".join(sorted(set(ev_begin) | set(ev_failed))) + "）")
+        first = min(firsts, key=lambda i: str(i.get("requested_at"))) if firsts else {}
+        fa = first.get("first_attempt_at") or (min(str(t) for t in ev_begin.values()) if ev_begin else None)
+        ev.update(reason="；".join(reasons)[:600], request_id=first.get("request_id"),
+                  requested_at=first.get("requested_at"), first_attempt_at=fa)
+        return "hold", ev
+
+    def _startup_hold(self, cid, ev):
+        """BUG-2：重啟時有結束證據 → HOLD：不續接、不寫 resume／interruptions、不取樣、不自動完成結束。回傳 None。"""
+        now = self.clock()
+        self._halt = {"cert_id": cid, "origin": "startup", "since": _iso(now), "reason": ev.get("reason"),
+                      "first_request_id": ev.get("request_id"), "first_requested_at": ev.get("requested_at"),
+                      "first_attempt_at": ev.get("first_attempt_at"), "sampling_stopped_at": None,
+                      "final_sample": "unknown", "attempts": int(ev.get("end_failed_count") or 0),
+                      "held_requests": list(ev.get("held_requests") or [])}
+        if self.worker:
+            try:
+                n = self.worker.mark_unfinished("服務中斷，截圖未完成（服務重啟前已登記的截圖工作）")
+                if n:
+                    self._event("screenshot_interrupted", f"{n} 個截圖目標因服務中斷未完成，已如實記錄為失敗", now)
+            except Exception as e:                      # noqa: BLE001
+                self.log(f"[CERT] 截圖工作補記失敗：{type(e).__name__}: {e}")
+        detail = (f"服務啟動：認證 {cid} 有結束證據 → 不續接、停止自動取樣（HOLD），資料保留；"
+                  "請用選單 22 重新結束")
+        try:
+            if not any(e.get("type") == "end_recovery_hold" for e in _read_jsonl(self._f("events.jsonl"))):
+                self._end_event("end_recovery_hold", detail, now, reason=ev.get("reason"))   # 反覆重啟只記一次
+        except Exception as e:                          # noqa: BLE001
+            self.log(f"[CERT] HOLD 事件寫入失敗（HOLD 照常）：{type(e).__name__}: {e}")
+        self.log(f"[CERT] {detail}（{ev.get('reason')}）")
+        return None
+
+    def _end_event(self, kind, detail, t=None, request_id=None, folder=None, **extra):
+        """結束相關事件：寫入前確保檔尾換行（半行不黏住新紀錄；原有 bytes 不改）；一次寫入一整行。失敗 → 例外往外拋。"""
+        rec = {"t": _iso(t or self.clock()), "type": kind, "detail": detail}
+        if request_id is not None:
+            rec["request_id"] = request_id
+        rec.update(extra)
+        path = self._f("events.jsonl", folder)
+        try:
+            RQ.ensure_newline_terminated(path)
+        except OSError:
+            pass
+        _append_jsonl(path, rec)
+
+    def _end_event_logged(self, rid):
+        """events.jsonl 是否已有這個請求的 end 事件（跨程序去重；同程序另以 _end_steps 判斷）。讀不到 → False。"""
+        try:
+            return any(_is_end_of(e, rid) for e in _read_jsonl(self._f("events.jsonl")))
+        except OSError:
+            return False
+
+    def _halt_after_failure(self, req, t0, final, e):
+        """
+        BUG-2：結束已開始執行後失敗（呼叫端仍持 _sample_lock）。ended 尚未落盤 → 設定 HOLD：停止取樣、不得開始新認證、
+        不產報；只允許同一認證的 end_cert 重試。ended 已落盤（之後的步驟失敗）→ 不需要 HOLD（重啟也不會續接）。
+        """
+        with self._lock:
+            if "state" in self._end_steps:
+                return
+            now = self.clock()
+            if self._halt is None:
+                self._halt = {"cert_id": (self.cert or {}).get("cert_id") or req.get("cert_id"), "origin": "in_process",
+                              "since": _iso(now), "reason": None, "first_request_id": req["request_id"],
+                              "first_requested_at": req.get("created_at"), "first_attempt_at": _iso(t0),
+                              "sampling_stopped_at": _iso(now), "final_sample": final, "attempts": 0,
+                              "held_requests": []}
+            self._halt["attempts"] = int(self._halt.get("attempts") or 0) + 1
+            self._halt["last_error"] = f"{type(e).__name__}: {e}"[:300]
+            self._halt["reason"] = self._halt.get("reason") or self._halt["last_error"]
+            self._halt["last_attempt_at"] = _iso(now)
+            try:
+                self._end_event("end_failed", f"結束認證未完成（請求 {req['request_id']}）：{type(e).__name__}: {e}"
+                                              f" → 已停止自動取樣（HOLD），資料保留；請用選單 22 重新結束", now,
+                                request_id=req["request_id"])
+            except Exception:                           # noqa: BLE001
+                pass
+        self.log(f"[CERT] 結束認證未完成 → HOLD，停止自動取樣（{type(e).__name__}: {e}）")
+
+    def _is_pre_restart_end(self, req):
+        """M7b：HOLD（重啟判定）中、屬於同一認證、建立時間不晚於 HOLD 開始 → 重啟前的結束請求（不自動執行）。"""
+        with self._lock:
+            h = self._halt
+            if not h or h.get("origin") != "startup" or req.get("cert_id") != h.get("cert_id"):
+                return False
+            since = h.get("since")
+        try:
+            created = datetime.strptime(str(req.get("created_at")), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return True                                 # 無法判定 → 視為重啟前（Fail Closed：不自動執行）
+        return created <= _parse(since)
+
+    def _classify_held_request(self, req):
+        """
+        M7b：重啟前的結束請求是否已開始執行。任何證據或無法確認 → started_no_result（不得誤判為從未執行）。
+        G-3 方案 S：events／cert_timing 用嚴格讀法（HOLD 中沒有本程序的其他寫入方）；損壞行、未完成的尾行、
+          沒有 request_id 的結束事件 → 記入 uncertain（寫明無法確認），不從損壞內容推測、不推估開始時間。
+        回傳 (類別, 實際證據, 無法確認原因, 實際讀到的最早 end_begin 時間或 None)。
+        """
+        rid = req["request_id"]
+        evidence, uncertain, begins = [], [], []
+        try:
+            created = datetime.strptime(str(req.get("created_at")), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            created = None
+            uncertain.append("created_at 無法判讀，無法確認是否已開始")
+        evs, probs = _read_jsonl_strict(self._f("events.jsonl"))
+        uncertain.extend(f"{p}，無法確認是否已開始" for p in probs)
+        for e in evs:
+            if e.get("type") not in END_REQUEST_EVENT_TYPES:
+                continue
+            erid = e.get("request_id")
+            if erid == rid:
+                evidence.append(f"events.jsonl {e.get('type')} {e.get('t')}")
+                if e.get("type") == "end_begin" and e.get("t"):
+                    begins.append(str(e.get("t")))
+            elif not isinstance(erid, str) or not erid:
+                uncertain.append(f"events.jsonl 有 {e.get('type')}（{e.get('t')}）但沒有 request_id，無法確認歸屬")
+        tims, probs = _read_jsonl_strict(self._f(TIMING_FILE))
+        uncertain.extend(f"{p}，無法確認是否已開始" for p in probs)
+        for t in tims:
+            if t.get("trigger") != "cert_end":
+                continue
+            try:
+                ws = datetime.fromisoformat(str(t.get("wall_start")))
+            except ValueError:
+                uncertain.append("cert_timing.jsonl cert_end 時間無法判讀，無法確認是否已開始")
+                continue
+            if created is None or ws >= created:
+                evidence.append(f"cert_timing.jsonl cert_end {t.get('wall_start')}")
+        cls = "started_no_result" if (evidence or uncertain) else "not_started"
+        return cls, evidence, uncertain, (min(begins) if begins else None)
+
+    def _hold_pre_restart_request(self, req):
+        """M7b：寫入結果（保留原始請求檔與證據；不執行）。not_started → rejected＋hold；其他 → failed＋hold。"""
+        cls, evidence, uncertain, first_at = self._classify_held_request(req)
+        hold = {"class": cls, "original_created_at": req.get("created_at"), "evidence": evidence,
+                "uncertain": uncertain, "first_attempt_at": first_at, "held_at": _iso(self.clock())}
+        if cls == "not_started":
+            status, msg = "rejected", ("服務重啟前建立的結束請求：認證處於 HOLD（已停止取樣），不自動執行；"
+                                       "請重新用選單 22 結束")
+        elif evidence:
+            status, msg = "failed", ("服務重啟前建立的結束請求已開始執行（" + "；".join(evidence)[:200] + "）"
+                                     + ("，另有無法確認的紀錄" if uncertain else "")
+                                     + "，但沒有處理結果；認證處於 HOLD，不自動重新執行；請重新用選單 22 結束")
+        else:                                           # G-3：只有無法確認 → 不寫成「已開始執行」
+            status, msg = "failed", ("服務重啟前建立的結束請求：無法確認是否已開始執行（" + "；".join(uncertain)[:200]
+                                     + "）；認證處於 HOLD，不自動執行；請重新用選單 22 結束")
+        REQ.write_result(self.root, req, status, msg, data={"hold": hold})
+        try:
+            self._end_event("end_request_held", f"重啟前的結束請求 {req['request_id']}：{cls} → {status}（不自動執行）",
+                            request_id=req["request_id"], hold_class=cls)
+        except Exception as e:                          # noqa: BLE001
+            self.log(f"[CERT] end_request_held 事件寫入失敗：{type(e).__name__}: {e}")
+        with self._lock:
+            if self._halt is not None:
+                self._halt.setdefault("held_requests", []).append(
+                    {"request_id": req["request_id"], "class": cls, "status": status})
+
+    def _data_cutoff(self):
+        """M9：資料截止時間只取自 observations.jsonl 可解析的完整行（不推估、不補造）。"""
+        out = {"last_recorded_sample_at": None, "last_valid_sample_at": None,
+               "cert_state_last_sample_time": (self.cert or {}).get("last_sample_time"),
+               "observations_unreadable": False, "notes": []}
+        try:
+            recs = _read_jsonl(self._f("observations.jsonl"))
+        except OSError as e:
+            out["observations_unreadable"] = True
+            out["notes"].append(f"observations.jsonl 讀不到（{type(e).__name__}）→ 資料截止時間不明")
+            return out
+        if recs:
+            out["last_recorded_sample_at"] = recs[-1].get("t")
+            for r in reversed(recs):
+                if hmi_valid(r.get("values") or {}):
+                    out["last_valid_sample_at"] = r.get("t")
+                    break
+        if out["cert_state_last_sample_time"] != out["last_recorded_sample_at"]:
+            out["notes"].append(f"cert_state.last_sample_time（{out['cert_state_last_sample_time']}）與 observations 最後一筆"
+                                f"完整紀錄（{out['last_recorded_sample_at']}）不一致 → 以 observations 為準")
+        out["notes"].append("時間取自 observations.jsonl 可解析的完整行；寫入未 fsync，斷電時不保證最後數筆已落盤")
+        return out
 
     def _note_hmi_reader(self, now):
         """
@@ -666,7 +1103,8 @@ class CertRuntime:
 
     def is_active(self):
         with self._lock:
-            return self.cert is not None and self.cert.get("status") == "recording"
+            # BUG-2：HOLD（結束已開始但未完成／重啟時有結束證據）→ 視為未進行：取樣、分析、指令快照一起停止
+            return self.cert is not None and self.cert.get("status") == "recording" and self._halt is None
 
     def active_id(self):
         with self._lock:
@@ -1101,6 +1539,43 @@ class CertRuntime:
             if REQ.read_result(self.root, req["request_id"]):
                 REQ.archive_request(self.root, req)         # 重複請求：已有結果 → 不再執行
                 continue
+            if req.get("type") == "end_cert" and self._is_pre_restart_end(req):
+                # M7b：HOLD 中、重啟前建立的結束請求 → 先分類再寫結果（不自動執行；不被寫成 expired 而誤認為從未執行）
+                try:
+                    self._hold_pre_restart_request(req)
+                except Exception as e:                      # noqa: BLE001
+                    self.log(f"[CERT] 重啟前結束請求的 HOLD 標記失敗（請求保留在 pending）：{type(e).__name__}: {e}")
+                    continue
+                REQ.archive_request(self.root, req)
+                done.append(req["request_id"])
+                continue
+            if req.get("type") == "end_cert":
+                # G-1：逾期判斷之前，先確認同一請求是否已完成結束（已完成 → 補寫；狀態無法確認且未載入 → 不執行）
+                try:
+                    pc = self._end_precheck(req)
+                    if pc is not None:
+                        self._apply_end_precheck(req, pc)
+                except Exception as e:                      # noqa: BLE001
+                    self.log(f"[CERT] 結束請求前置判定／補寫失敗（請求保留在 pending，下一輪重試）：{type(e).__name__}: {e}")
+                    continue
+                if pc is not None:
+                    REQ.archive_request(self.root, req)
+                    done.append(req["request_id"])
+                    continue
+            if req.get("type") == "stage_count" and req.get("cert_id"):
+                # G6 SC-13：決策已寫入、處理結果未寫（中斷後重啟）→ 逾期判斷之前先依 request_id 補寫結果，不重複寫入
+                try:
+                    sc_folder = os.path.join(self.root, req["cert_id"])
+                    dup = self._stage_count_dup(sc_folder, req) if os.path.isdir(sc_folder) else None
+                    if dup is not None:
+                        self._stage_count_resolve_dup(req, dup)
+                except Exception as e:                      # noqa: BLE001
+                    self.log(f"[CERT] 計次請求前置判定失敗（請求保留在 pending，下一輪重試）：{type(e).__name__}: {e}")
+                    continue
+                if dup is not None:
+                    REQ.archive_request(self.root, req)
+                    done.append(req["request_id"])
+                    continue
             if REQ.is_expired(req, CFG.CERT_REQUEST_EXPIRE_SEC, self.clock()):
                 REQ.write_result(self.root, req, "expired",
                                  f"請求建立後超過 {CFG.CERT_REQUEST_EXPIRE_SEC} 秒才被處理（服務未執行或延遲）→ 不執行")
@@ -1112,18 +1587,30 @@ class CertRuntime:
                     else:
                         h(req)
                 except Exception as e:                      # noqa: BLE001
-                    REQ.write_result(self.root, req, "failed", f"處理例外：{type(e).__name__}: {e}")
                     self.log(traceback.format_exc())
+                    pc = self._end_precheck(req) if req.get("type") == "end_cert" else None
+                    if pc is not None and pc[0] == "resend" and pc[2] == "memory":
+                        # G-2b：本請求已完成結束（ended 已落盤）之後才失敗 → 補寫流程（done＋狀態標記），不寫成 failed
+                        try:
+                            self._resend_end(req, pc[1], "memory", post_end_error=f"{type(e).__name__}: {e}"[:300])
+                        except Exception as e2:             # noqa: BLE001
+                            self.log(f"[CERT] 結束後補寫失敗（請求保留在 pending，下一輪重試）：{type(e2).__name__}: {e2}")
+                            continue
+                    else:
+                        REQ.write_result(self.root, req, "failed", f"處理例外：{type(e).__name__}: {e}")
             REQ.archive_request(self.root, req)
             done.append(req["request_id"])
         return done
 
-    def _check_cert(self, req, need_active=True):
-        """請求所屬認證 ID 檢查。回傳 (folder, 錯誤訊息)。"""
+    def _check_cert(self, req, need_active=True, allow_halted=False):
+        """請求所屬認證 ID 檢查。回傳 (folder, 錯誤訊息)。
+        allow_halted（只有 end_cert）：HOLD 時允許同一認證重新結束（BUG-2）。"""
         cid = req.get("cert_id")
         with self._lock:
             if need_active:
-                if not self.is_active():
+                halted_ok = (allow_halted and self._halt is not None and self.cert is not None
+                             and cid == self.cert.get("cert_id") == self._halt.get("cert_id"))
+                if not self.is_active() and not halted_ok:
                     return None, "目前沒有進行中的認證"
                 if cid != self.cert["cert_id"]:
                     return None, f"請求所屬認證 {cid} 不是目前進行中的認證 {self.cert['cert_id']}"
@@ -1136,6 +1623,11 @@ class CertRuntime:
     def _h_start_cert(self, req):
         pl = req.get("payload") or {}
         with self._lock:
+            if self._halt is not None:                  # BUG-2：結束未完成（HOLD）→ 不得開始新認證（原認證會成為孤兒）
+                REQ.write_result(self.root, req, "rejected",
+                                 f"認證 {self._halt.get('cert_id')} 結束未完成（HOLD，已停止取樣，資料保留）→ 不能開始新認證；"
+                                 f"請先用選單 22 重新結束", cert_id=self._halt.get("cert_id"))
+                return
             if self.is_active():
                 REQ.write_result(self.root, req, "rejected",
                                  f"已有進行中的認證 {self.cert['cert_id']}（重複開始已擋下，未建立第二份）",
@@ -1193,6 +1685,7 @@ class CertRuntime:
             REQ.write_result(self.root, req, "done", f"已開始認證 {cid}（背景服務持續記錄）", cert_id=cid)
             self.log(f"[CERT] 開始認證 {cid}")
             if self.env_reader is not None:                 # 起始環控快照：背景讀一次，不阻擋開始、不持 runtime 鎖
+                self._env_folder = self.folder
                 self._env_thread = threading.Thread(target=self._capture_env_start, args=(self.folder, cid),
                                                     name="cert-env-start", daemon=True)
                 self._env_thread.start()
@@ -1220,47 +1713,88 @@ class CertRuntime:
             self._event("env_start_error", f"起始環控快照寫入失敗（不影響認證）：{type(e).__name__}: {e}", now, folder=folder)
 
     def _h_end_cert(self, req):
-        folder, err = self._check_cert(req)
+        rid = req["request_id"]
+        cid = req.get("cert_id")
+        # M6b／G-1：同一請求已完整結束 → 補寫流程；狀態無法確認且未載入 → 不執行
+        #（process_requests 已在逾期判斷前判定；直接呼叫時同樣處理）
+        pc = self._end_precheck(req)
+        if pc is not None:
+            self._apply_end_precheck(req, pc)
+            return
+        folder, err = self._check_cert(req, allow_halted=True)
         if err:
             REQ.write_result(self.root, req, "rejected", err)
             return
+        t0 = self.clock()
+        with self._lock:
+            halt = dict(self._halt) if self._halt is not None else None
+        final = "unknown" if halt is not None else "not_taken"
         # C：結束前再跑一次正常取樣 Cycle（同一個 _sample_cycle：同 reader／_CLIENT_LOCK／寫入流程，schema 不變）。
         #    持 _sample_lock：不與背景取樣同時執行；收尾也在鎖內完成 → 結束後背景取樣不會再寫入。
         #    取樣失敗照一般失敗規則寫入（ok=False）；任何例外只記事件，不阻擋結束。
+        #    BUG-2：先寫 end_begin（失敗 → HOLD，不取樣）；HOLD 重試不再取樣、不讀 HMI；收尾失敗 → HOLD 後拋出。
         with self._sample_lock:
             try:
-                seg = self._slot_seg                    # M-S2：最後一筆也有格點身分（目前時間所在格；中間未讀取的格記 MISSED）
-                final_slot = seg.claim_extra_slot() if seg is not None else None
-            except Exception:                           # noqa: BLE001
-                final_slot = None
-            try:
-                self._sample_cycle("cert_end", slot=final_slot)
-            except Exception as e:                      # noqa: BLE001
-                self._event("final_poll_error", f"結束前最後取樣例外（不影響結束）：{type(e).__name__}: {e}")
+                self._end_event("end_begin", f"開始結束認證（請求 {rid}）", t0, request_id=rid)
+            except Exception as e:
+                self._halt_after_failure(req, t0, "not_taken" if halt is None else final, e)
+                raise
+            if halt is None:
+                n0 = len(self.records)
+                try:
+                    seg = self._slot_seg                # M-S2：最後一筆也有格點身分（目前時間所在格；中間未讀取的格記 MISSED）
+                    final_slot = seg.claim_extra_slot() if seg is not None else None
+                except Exception:                       # noqa: BLE001
+                    final_slot = None
+                try:
+                    self._sample_cycle("cert_end", slot=final_slot)
+                except Exception as e:                  # noqa: BLE001
+                    self._event("final_poll_error", f"結束前最後取樣例外（不影響結束）：{type(e).__name__}: {e}")
+                final = "taken" if len(self.records) > n0 else "not_taken"
             self._slot_seg_end("finalize")              # 冪等：段落已結束 → _slot_seg 為 None
-            worker, cid = self._end_locked(req)
-        # B：「認證結束（最後狀態）」截圖：在最後一筆取樣之後擷取；等待有上限、不持 runtime 鎖；失敗／逾時照實呈現，不阻擋結束
-        if worker:
             try:
-                worker.submit("cert_final", None, None, "認證結束（最後狀態）", "結束認證（Menu 22）時的最後狀態",
-                              trigger_time=self.clock())
-            except Exception as e:                      # noqa: BLE001
-                self._event("final_shot_error", f"結束截圖排程失敗（不影響結束）：{type(e).__name__}: {e}",
-                            folder=os.path.join(self.root, cid))
+                worker, cid = self._end_locked(
+                    req, recovery=None if halt is None else ("startup" if halt.get("origin") == "startup" else "retry"))
+            except Exception as e:
+                self._halt_after_failure(req, t0, final, e)
+                raise
+        # B：「認證結束（最後狀態）」截圖：在最後一筆取樣之後擷取；等待有上限、不持 runtime 鎖；失敗／逾時照實呈現，不阻擋結束
+        #    BUG-2：重新結束（HOLD 後）不截圖（截圖也是讀取 HMI；當下狀態不是結束要求當時的狀態）
+        if worker:
+            if halt is None:
+                try:
+                    worker.submit("cert_final", None, None, "認證結束（最後狀態）", "結束認證（Menu 22）時的最後狀態",
+                                  trigger_time=self.clock())
+                except Exception as e:                  # noqa: BLE001
+                    self._event("final_shot_error", f"結束截圖排程失敗（不影響結束）：{type(e).__name__}: {e}",
+                                folder=os.path.join(self.root, cid))
             worker.close(CFG.CERT_FINAL_SHOT_WAIT_SEC)  # 已排入的截圖（含結束截圖）完成或逾時後才產報
         ok, msg, path = self.generate_report(cid)
-        running = (REQ.read_json(os.path.join(self.root, cid, "cert_state.json")) or {}).get("incomplete")
+        with self._lock:                                # BUG-1：取自已落盤成功的記憶體狀態（不依賴磁碟讀取）
+            self._end_steps.add("report")
+            running = (self.cert or {}).get("incomplete")
+            er = (self.cert or {}).get("end_recovery")
+            flags = dict(self._end_flags)
         warn = f"⚠ {running}。" if running else ""
+        data = {"incomplete": running, "report": path, "report_ok": ok}
+        if er:
+            data["end_recovery"] = er
+        if flags.get("active_json"):                    # G-2：active.json 讀不到 → 未清除（正常情況不加欄位、訊息不變）
+            data["active_json"] = flags["active_json"]
+            warn += "⚠ active.json 讀不到或內容無效，未清除。"
         REQ.write_result(self.root, req, "done",
                          f"已結束認證 {cid} 的記錄。{warn}" + (f"報告：{path}" if ok else f"報告產生失敗：{msg}（資料已保留，可重產）"),
-                         cert_id=cid, data={"incomplete": running, "report": path, "report_ok": ok})
+                         cert_id=cid, data=data)
         with self._lock:
             self._reset()
 
-    def _end_locked(self, req):
-        """結束認證的狀態收尾（持 runtime 鎖）。回傳 (截圖 worker 或 None, cert_id)。"""
+    def _end_locked(self, req, recovery=None):
+        """結束認證的狀態收尾（持 runtime 鎖）。回傳 (截圖 worker 或 None, cert_id)。
+        recovery（BUG-2）：None＝正常結束；retry＝同程序 HOLD 後重新結束；startup＝重啟 HOLD 後由人工重新結束。
+        ended 寫入磁碟是確認點：先寫新狀態、成功後才換掉記憶體狀態；各步驟（state／event／active）只做一次。"""
         with self._lock:
             now = self.clock()
+            rid = req["request_id"]
             res = self.analysis()
             last = self.records[-1] if self.records else None
             running = None
@@ -1273,6 +1807,11 @@ class CertRuntime:
                         running = f"結束認證時設備仍在{'充' if d == 'C' else '放'}電（未送出停止指令，請自行確認設備）"
                     elif d is None:
                         running = "最後一筆沒有有效方向資料，結束時設備狀態未知"
+            h = self._halt or {}
+            if recovery is not None and running is None and h.get("final_sample") != "taken":
+                running = ("延遲收尾：結束當下的最後取樣"
+                           + ("未完成" if h.get("final_sample") == "not_taken" else "無法確認（服務重啟後由人工結束）")
+                           + "，結束時設備狀態未經確認")
             # 最後一個階段若已在待機且有候選截圖 → 以結束認證時的待機確認採用
             if res.stages and self.worker:
                 st = res.stages[-1]
@@ -1282,12 +1821,263 @@ class CertRuntime:
                     if jid:
                         self.worker.resolve(jid, "stage_end", "結束認證時設備已待機 → 採用首筆觀測待機的候選截圖")
                         self._resolved.add(key)
-            self.cert.update(status="ended", ended_at=_iso(now), end_request=req["request_id"],
-                             incomplete=running)
-            self._save_state()
-            self._event("end", f"結束認證（請求 {req['request_id']}）" + (f"；⚠ {running}；報告標記未完成" if running else ""), now)
-            self._set_active(None)
+            if "state" not in self._end_steps:
+                upd = dict(status="ended", ended_at=_iso(now), end_request=rid, incomplete=running)
+                if recovery is not None:
+                    # M9：延遲收尾歷程（選填欄位；正常結束沒有）。時間只填實際紀錄的值，沒有就是 None，不推估、不補資料。
+                    cut = self._data_cutoff()
+                    upd["end_recovery"] = {
+                        "mode": "after_restart" if recovery == "startup" else "in_process_retry",
+                        "reason": h.get("reason") or h.get("last_error"),
+                        "first_end_request_id": h.get("first_request_id") or rid,
+                        "first_end_requested_at": h.get("first_requested_at") or req.get("created_at"),
+                        "first_end_attempt_at": h.get("first_attempt_at"),
+                        "last_recorded_sample_at": cut["last_recorded_sample_at"],
+                        "last_valid_sample_at": cut["last_valid_sample_at"],
+                        "cert_state_last_sample_time": cut["cert_state_last_sample_time"],
+                        "observations_unreadable": cut["observations_unreadable"],
+                        "sampling_stopped_at": h.get("sampling_stopped_at"),
+                        "final_sample": h.get("final_sample", "unknown"),
+                        "held_requests": list(h.get("held_requests") or []),
+                        "manual_end_request_id": rid, "manual_end_requested_at": req.get("created_at"),
+                        "completed_at": _iso(now), "failed_attempts": int(h.get("attempts") or 0),
+                        "notes": cut["notes"]}
+                new = dict(self.cert)
+                new.update(upd)
+                REQ.atomic_write_json(self._f("cert_state.json"), new)     # 失敗 → 例外（記憶體仍是 recording）
+                self.cert = new
+                self._end_steps.add("state")
+                self._halt = None                           # ended 已落盤 → 解除 HOLD（之後的步驟失敗也不會續接）
+            if "event" not in self._end_steps:
+                if not self._end_event_logged(rid):         # end 事件只寫一次（跨程序以 events.jsonl 判斷）
+                    self._end_event("end", f"結束認證（請求 {rid}）" + (f"；⚠ {running}；報告標記未完成" if running else "")
+                                    + (f"；延遲收尾（{'服務重啟後由人工重新結束' if recovery == 'startup' else '同一程序內重新結束'}）"
+                                       if recovery else ""), now)
+                self._end_steps.add("event")
+            if "active" not in self._end_steps:
+                ap = os.path.join(self.root, "active.json")
+                a, a_ok = self._read_json_tries(ap) if os.path.exists(ap) else ({}, True)
+                cur = a.get("cert_id") if isinstance(a, dict) else None
+                if not a_ok or not isinstance(a, dict):     # G-2：讀不到／內容無效 → 不覆寫無法確認的內容
+                    self._end_flags["active_json"] = "unknown"
+                    self._event("active_unreadable", "active.json 讀不到或內容無效 → 未清除（不覆寫無法確認的內容）", now)
+                elif cur in (None, self.cert["cert_id"]):   # 只清除指向本認證（或沒有指向）的 active.json
+                    self._set_active(None)
+                else:
+                    self._event("active_mismatch", f"active.json 指向其他認證 {cur}（不是 {self.cert['cert_id']}）→ 未清除", now)
+                self._end_steps.add("active")
             return self.worker, self.cert["cert_id"]
+
+    # ---- G-1／G-2：同一請求已完成結束 → 補寫流程 -------------------------------------------
+    def _end_precheck(self, req):
+        """
+        G-1：end_cert 先確認「同一請求是否已完成結束」。回傳 None（照原本流程）或：
+          ("resend", 狀態快照, "memory"／"disk")：已由本請求結束 → 補寫流程
+          ("unconfirmed", 原因, None)：cert_state 無法確認、且本程序沒有載入該認證 → 不執行，只寫結果
+        記憶體確認：本程序載入的就是這份認證（cert_id 與資料夾都相同）→ 以記憶體為準（磁碟狀態由它寫出）：
+          ended 且 end_request＝本請求 → resend；其他（recording、HOLD、由其他請求結束）→ 原本流程。不只看 ended。
+        磁碟：讀得到且 cert_id 相同、ended、end_request＝本請求 → resend；讀得到但任一項不同 → 原本流程；
+          讀不到、內容損壞、不是 JSON 物件或 cert_state.json 不存在 → unconfirmed。認證資料夾不存在 → 原本流程（拒絕）。
+        無法確認只影響這個請求的結果，不改變任何認證的 HOLD 狀態。
+        """
+        rid, cid = req["request_id"], req.get("cert_id")
+        if not cid or not isinstance(cid, str):
+            return None
+        folder = os.path.join(self.root, cid)
+        with self._lock:
+            if (self.cert is not None and self.cert.get("cert_id") == cid and self.folder is not None
+                    and os.path.normcase(os.path.abspath(self.folder)) == os.path.normcase(os.path.abspath(folder))):
+                if self.cert.get("status") == "ended" and self.cert.get("end_request") == rid:
+                    return ("resend", _json_copy(self.cert), "memory")
+                return None
+        if not os.path.isdir(folder):
+            return None
+        st, ok = self._read_json_tries(os.path.join(folder, "cert_state.json"))
+        if ok and isinstance(st, dict):
+            if st.get("cert_id") == cid and st.get("status") == "ended" and st.get("end_request") == rid:
+                return ("resend", st, "disk")
+            return None
+        return ("unconfirmed", "cert_state.json " + ("讀不到或不存在" if not ok else "內容無效（不是 JSON 物件）"), None)
+
+    def _apply_end_precheck(self, req, pc):
+        kind, x, src = pc
+        if kind == "resend":
+            self._resend_end(req, x, src)
+            return
+        cid = req.get("cert_id")
+        REQ.write_result(self.root, req, "failed",
+                         f"無法確認認證 {cid} 是否已由此請求結束（{x}）→ 未執行（未取樣、未寫入結束紀錄、未產報），請人工確認",
+                         cert_id=cid, data={"end_state": "unconfirmed", "reason": x})
+        self.log(f"[CERT] 結束請求 {req['request_id']}：無法確認認證 {cid} 的狀態（{x}）→ 未執行")
+
+    def _resend_end(self, req, st, source, post_end_error=None):
+        """
+        G-1／G-2／G-2b 補寫流程：本請求已完成結束（ended 已落盤）→ 只檢查並補齊結束一致性、寫處理結果。
+          不重新取樣、不讀 HMI、不寫 end_begin、不重產報告、不改 cert_state.json。
+          end 事件：嚴格讀法確認不存在才補登一次（t＝原 ended_at，backfilled＝true）；events 無法確認 → 不補登（unknown）。
+          active.json：只在指向本認證時清除；讀不到 → 不寫（unknown）。報告：_end_report_state。
+          任何一項異常 → 結果訊息以「⚠ 結束已完成，但…」開頭。
+        """
+        rid, cid = req["request_id"], req.get("cert_id")
+        folder = os.path.join(self.root, cid)
+        th = self._env_thread
+        if th is not None and th.is_alive() and self._env_folder == folder:
+            th.join(CFG.CERT_ENV_START_WAIT_SEC)        # 剛開始就結束：起始環控快照也寫 events.jsonl → 等它寫完（有上限）
+        warns = []
+        if post_end_error:
+            warns.append(f"結束收尾後段發生例外（{post_end_error}）")
+        rep = self._end_report_state(folder, st)
+        evs, probs = _read_jsonl_strict(os.path.join(folder, "events.jsonl"))
+        if probs:
+            end_event = "unknown"
+            warns.append("events.jsonl 無法確認（" + "；".join(probs)[:200] + "），未補登 end 事件")
+        elif any(_is_end_of(e, rid) for e in evs):
+            end_event = "present"
+        else:
+            try:
+                t_end = _parse(st.get("ended_at"))
+            except (TypeError, ValueError):
+                t_end = None
+            if t_end is None:
+                end_event = "unknown"
+                warns.append("ended_at 無法判讀，未補登 end 事件")
+            else:
+                try:
+                    self._end_event("end", f"結束認證（請求 {rid}）（補登：原 end 事件缺少）", t_end, request_id=rid,
+                                    folder=folder, backfilled=True, backfilled_at=_iso(self.clock()))
+                    end_event = "backfilled"
+                    warns.append("end 事件原本缺少，已補登")
+                except Exception as e:                  # noqa: BLE001
+                    end_event = "backfill_failed"
+                    warns.append(f"end 事件缺少且補登失敗（{type(e).__name__}: {e}）")
+        ap = os.path.join(self.root, "active.json")
+        if not os.path.exists(ap):
+            active_json = "none"
+        else:
+            a, a_ok = self._read_json_tries(ap)
+            if not a_ok or not isinstance(a, dict):
+                active_json = "unknown"
+                warns.append("active.json 讀不到或內容無效，未清除")
+            elif a.get("cert_id") == cid:
+                try:
+                    self._set_active(None)
+                    active_json = "cleared"
+                except Exception as e:                  # noqa: BLE001
+                    active_json = "clear_failed"
+                    warns.append(f"active.json 清除失敗（{type(e).__name__}: {e}）")
+            elif a.get("cert_id") in (None, ""):
+                active_json = "none"
+            else:
+                active_json = "other"
+        rs = rep["report_state"]
+        if rs == "none":
+            warns.append("沒有結束報告紀錄（資料已保留，可用選單 25 重產）")
+        elif rs == "failed":
+            warns.append(f"結束報告產生失敗（{rep['note']}；資料已保留，可用選單 25 重產）")
+        elif rs == "unconfirmed":
+            warns.append(f"報告狀態無法確認（{rep['note']}）")
+        running = st.get("incomplete")
+        msg = ((END_RESEND_WARN + "；".join(warns) + "。") if warns else "") \
+            + f"已結束認證 {cid} 的記錄（補寫處理結果；未重新取樣、未重新產生報告）。" \
+            + (f"⚠ {running}。" if running else "") + (f"報告：{rep['report']}" if rs == "ok" else "")
+        data = {"incomplete": running, "report": rep["report"], "report_ok": rs == "ok", "resent": True,
+                "ended_confirmed": True, "ended_source": source, "report_state": rs, "report_note": rep["note"],
+                "end_event": end_event, "active_json": active_json}
+        if rep.get("later_report_error"):
+            data["later_report_error"] = rep["later_report_error"]
+            msg += f"（之後另有產報失敗紀錄：{rep['later_report_error'].get('error')}）"
+        if rep["partial_files"]:
+            data["partial_files"] = rep["partial_files"]
+        if isinstance(st.get("end_recovery"), dict):
+            data["end_recovery"] = st["end_recovery"]
+        if post_end_error:
+            data["post_end_error"] = post_end_error
+        REQ.write_result(self.root, req, "done", msg, cert_id=cid, data=data)
+        with self._lock:
+            if self.cert is not None and self.cert.get("cert_id") == cid and self.cert.get("status") == "ended":
+                self._reset()
+
+    def _end_report_state(self, folder, st):
+        """
+        G-2：結束報告狀態（只讀；不開啟活頁簿檢查內容）。「成功的結束報告」必須同時符合：
+          cert_state.reports 的 file 與 at 都存在；at 與 ended_at 都能解析且 at 不早於 ended_at；
+          檔名 .xlsx、不是 .partial.xlsx、不帶 _中途；實際檔案存在、是一般檔案、大小 > 0。
+        last_report_error：產報成功時清為 null、失敗時寫入 → 非 null 代表比所有成功紀錄都晚。
+        report_state：ok（有成功的結束報告；之後另有錯誤 → later_report_error）／failed（沒有成功、ended_at 之後有錯誤
+          或留有暫存檔）／none（結束後沒有紀錄、沒有錯誤、沒有暫存檔）／unconfirmed（任何無法確認）。無法確認一律不是 ok。
+        """
+        out = {"report_state": "unconfirmed", "report": None, "note": "", "partial_files": []}
+        try:
+            ended = _parse(st.get("ended_at"))
+        except (TypeError, ValueError):
+            ended = None
+        if ended is None:
+            out["note"] = "ended_at 無法判讀"
+            return out
+        reps, err = st.get("reports"), st.get("last_report_error")
+        reps = [] if reps is None else reps
+        if not isinstance(reps, list) or (err is not None and not isinstance(err, dict)):
+            out["note"] = "reports／last_report_error 格式錯誤"
+            return out
+        rdir = os.path.join(folder, "reports")
+        try:
+            for fn in (sorted(os.listdir(rdir)) if os.path.isdir(rdir) else []):
+                p = os.path.join(rdir, fn)
+                if fn.endswith(".partial.xlsx") and datetime.fromtimestamp(os.path.getmtime(p)) >= ended:
+                    out["partial_files"].append(os.path.relpath(p, folder))
+        except OSError as e:
+            out["note"] = f"reports 資料夾讀不到（{type(e).__name__}）"
+            return out
+        ok_path, problems = None, []
+        for r in reps:
+            if not isinstance(r, dict) or not r.get("file") or not r.get("at"):
+                problems.append("報告紀錄格式錯誤")
+                continue
+            try:
+                at = datetime.strptime(str(r["at"]), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                problems.append(f"報告紀錄時間無法判讀（{r['at']}）")
+                continue
+            fn = os.path.basename(str(r["file"]))
+            if at < ended or "_中途" in fn:
+                continue                                # 結束前（中途）的報告不是結束報告
+            p = os.path.join(folder, str(r["file"]))
+            if not fn.endswith(".xlsx") or fn.endswith(".partial.xlsx"):
+                problems.append(f"報告紀錄檔名異常（{fn}）")
+                continue
+            try:
+                good = os.path.isfile(p) and os.path.getsize(p) > 0
+            except OSError:
+                good = False
+            if not good:
+                problems.append(f"報告紀錄的檔案不存在或大小為 0（{fn}）")
+                continue
+            ok_path = p
+        if problems:
+            out["note"] = "；".join(problems)[:300]
+            return out
+        if ok_path:
+            out.update(report_state="ok", report=ok_path, note="")
+            if err:
+                out["later_report_error"] = err
+            return out
+        err_after = False
+        if err:
+            try:
+                err_after = datetime.strptime(str(err.get("at")), "%Y-%m-%d %H:%M:%S") >= ended
+            except ValueError:
+                out["note"] = "last_report_error 時間無法判讀"
+                return out
+        if err_after or out["partial_files"]:
+            out.update(report_state="failed",
+                       note="；".join(([f"產報失敗：{err.get('error')}"] if err_after else [])
+                                     + ([f"留有暫存檔 {'、'.join(out['partial_files'])}"] if out["partial_files"] else [])))
+            return out
+        if SUP.has_supplements(folder):
+            out["note"] = "有事後補拍：之後的報告紀錄記在 supplements，不在 cert_state → 無法確認"
+            return out
+        out.update(report_state="none", note="結束後沒有報告紀錄")
+        return out
 
     def _stage_keys(self, folder):
         rt = self if folder == self.folder else self._offline(folder)
@@ -1295,9 +2085,19 @@ class CertRuntime:
         return res, {_iso(st.start.t): st for st in res.stages}
 
     def _offline(self, folder):
-        rt = CertRuntime(self.root, reader=None, params=self.p, enable_shots=False, clock=self.clock, log=self.log)
+        # G6：已結束的認證 → 歷史分析一律使用該 Session 原始參數（cert_state.params）；缺少／不合法 → SessionParamsError
+        #     （不以目前設定或預設值補齊）。記錄中的認證 → 維持既有行為（self.p，與 live runtime 一致）。
+        st = REQ.read_json(os.path.join(folder, "cert_state.json"))
+        params = self.p
+        if isinstance(st, dict) and st.get("status") == "ended":
+            sp, errs, _notes = session_params_check(st)
+            if errs:
+                raise SessionParamsError(f"認證 {st.get('cert_id') or os.path.basename(folder)} 的原始參數缺少或不合法："
+                                         + "；".join(errs))
+            params = sp
+        rt = CertRuntime(self.root, reader=None, params=params, enable_shots=False, clock=self.clock, log=self.log)
         rt.folder = folder
-        rt.cert = REQ.read_json(os.path.join(folder, "cert_state.json"))
+        rt.cert = st
         rt.records = _read_jsonl(os.path.join(folder, "observations.jsonl"))
         rt.decisions = _read_jsonl(os.path.join(folder, "decisions.jsonl"))
         rt.commands = _read_jsonl(os.path.join(folder, "commands.jsonl"))
@@ -1319,7 +2119,11 @@ class CertRuntime:
         if pl.get("label") not in LABELS:
             REQ.write_result(self.root, req, "rejected", f"標記必須是 {'／'.join(LABELS)}")
             return
-        res, keys = self._stage_keys(folder)
+        try:
+            res, keys = self._stage_keys(folder)
+        except SessionParamsError as e:                 # G6：歷史參數不合法 → 明確拒絕，不寫 decisions
+            REQ.write_result(self.root, req, "rejected", f"{e} → 不能分析階段，未寫入")
+            return
         if pl.get("stage_start") not in keys:
             REQ.write_result(self.root, req, "rejected", f"找不到階段（開始時間 {pl.get('stage_start')}）")
             return
@@ -1340,6 +2144,85 @@ class CertRuntime:
         REQ.write_result(self.root, req, "done", f"已標記階段 {pl['stage_start']} 為「{pl['label']}」"
                          "（只影響報告標題與頁籤名稱，不改原始資料與系統判定）")
 
+    # ---- G6 stage_count：階段計次／不計次（H2 規則與命名；只寫 decisions，不改原始資料與 Stage.no）---------------
+    @staticmethod
+    def _stage_count_content(rec):
+        return {"stage_start": rec.get("stage_start"), "counted": rec.get("counted"),
+                "reason": rec.get("reason", ""), "note": rec.get("note", "")}
+
+    def _stage_count_dup(self, folder, req):
+        """decisions.jsonl 中與本請求同一 request_id 的決策（檔案行序第一筆）；沒有 → None。"""
+        rid = req.get("request_id")
+        for d in _read_jsonl(os.path.join(folder, "decisions.jsonl")):
+            if isinstance(d, dict) and d.get("request_id") == rid:
+                return d
+        return None
+
+    def _stage_count_resolve_dup(self, req, dup):
+        """同一 request_id 已有決策：內容相同 → 只補寫處理結果（done，不重複寫入）；內容不同 → 拒絕（不寫入、不覆寫）。"""
+        rid = req.get("request_id")
+        if dup.get("type") == "stage_count" and \
+                self._stage_count_content(dup) == self._stage_count_content(req.get("payload") or {}):
+            REQ.write_result(self.root, req, "done",
+                             f"同一請求 {rid} 的計次決策已於 {dup.get('at')} 寫入 → 不重複寫入（只補寫處理結果）",
+                             data={"duplicate": True})
+        else:
+            REQ.write_result(self.root, req, "rejected",
+                             f"request_id {rid} 已有內容不同的決策 → 拒絕，未寫入、未覆寫原決策")
+
+    def _h_stage_count(self, req):
+        folder, err = self._check_cert(req, need_active=False)
+        if err:
+            REQ.write_result(self.root, req, "rejected", err)
+            return
+        cid = req["cert_id"]
+        with self._lock:                                # 只拒絕 HOLD 中的目標認證（不改 HOLD 狀態、不觸發恢復）
+            held = self._halt is not None and self._halt.get("cert_id") == cid
+        if held:
+            REQ.write_result(self.root, req, "rejected",
+                             f"認證 {cid} 結束未完成（HOLD）→ 不能設定計次；請先用選單 22 重新結束")
+            return
+        pl = req.get("payload") or {}
+        key, counted = pl.get("stage_start"), pl.get("counted")
+        reason, note = pl.get("reason", ""), pl.get("note", "")
+        if not (isinstance(key, str) and isinstance(counted, bool) and isinstance(reason, str) and isinstance(note, str)):
+            REQ.write_result(self.root, req, "rejected",
+                             "請求內容不合法（stage_start 必須是字串、counted 必須是布林值、reason／note 必須是字串）")
+            return
+        dup = self._stage_count_dup(folder, req)        # 重送／重啟後重新處理：不重複寫入
+        if dup is not None:
+            self._stage_count_resolve_dup(req, dup)
+            return
+        try:
+            res, keys = self._stage_keys(folder)        # 服務端重新分析（目前認證＝self；已結束＝Session 原始參數）
+        except SessionParamsError as e:
+            REQ.write_result(self.root, req, "rejected", f"{e} → 不能分析階段，未寫入")
+            return
+        st = keys.get(key)
+        if st is None:
+            REQ.write_result(self.root, req, "rejected", f"找不到階段（開始時間 {key}）")
+            return
+        exp = pl.get("expect")                          # 選單看到的階段識別（編號／方向／結束時間）→ 與服務端必須一致
+        if exp is not None and not (isinstance(exp, dict) and exp.get("no") == st.no and exp.get("dir") == st.dir
+                                    and exp.get("end") == _iso(st.A.t)):
+            REQ.write_result(self.root, req, "rejected",
+                             "選單顯示的階段與服務端分析結果不一致（編號／方向／結束時間）→ 無法可靠確認目標階段，未寫入")
+            return
+        rec = {"type": "stage_count", "stage_start": key, "counted": counted, "reason": reason, "note": note}
+        why = _count_invalid(st, rec)                   # H2 有效條件（唯一實作）：已結束、標記「中止」、原因非空白
+        if why:
+            REQ.write_result(self.root, req, "rejected", f"不能設定{'計次' if counted else '不計次'}：{why}（未寫入）")
+            return
+        if st.counted == counted:
+            REQ.write_result(self.root, req, "rejected",
+                             f"階段目前已是「{'計次' if counted else '不計次'}」→ 無需設定（未寫入）")
+            return
+        name = stage_names(res.stages)[st.no]
+        self._decide(req, folder, rec)
+        REQ.write_result(self.root, req, "done",
+                         f"已將階段 {key}（{name}）設為「{'計次' if counted else '不計次'}」"
+                         "（只影響報告階段名稱與計次；原始資料不變；已產生的報告不會自動更新，請用「25 重新產生認證報告」）")
+
     def _h_confirm_item(self, req):
         folder, err = self._check_cert(req, need_active=False)
         if err:
@@ -1349,7 +2232,11 @@ class CertRuntime:
         if pl.get("choice") not in CHOICES:
             REQ.write_result(self.root, req, "rejected", "確認結果必須是 merge（同一階段）或 split（拆成兩個階段）")
             return
-        res, _keys = self._stage_keys(folder)
+        try:
+            res, _keys = self._stage_keys(folder)
+        except SessionParamsError as e:                 # G6：歷史參數不合法 → 明確拒絕，不寫 decisions
+            REQ.write_result(self.root, req, "rejected", f"{e} → 不能分析階段，未寫入")
+            return
         items = {pz.item_id: pz for pz in res.pauses if not pz.certain}
         if pl.get("item_id") not in items:
             REQ.write_result(self.root, req, "rejected", f"找不到不確定項目 {pl.get('item_id')}")
@@ -1405,7 +2292,11 @@ class CertRuntime:
             return
         pl = req.get("payload") or {}
         key = pl.get("stage_start")
-        res = self._offline(folder).analysis()
+        try:
+            res = self._offline(folder).analysis()      # G6：已結束認證 → Session 原始參數
+        except SessionParamsError as e:
+            REQ.write_result(self.root, req, "rejected", f"{e} → 不能分析階段，未排入事後補拍")
+            return
         names = stage_names(res.stages)
         c = next((x for x in SUP.candidates(folder, res, names, select_stage_shot, load_manifest)
                   if x["stage_start"] == key), None)
@@ -1454,10 +2345,25 @@ class CertRuntime:
         if err:
             REQ.write_result(self.root, req, "rejected", err)
             return
+        # G6：參數來源（只顯示於結果訊息）；已結束認證 → 先獨立驗證 Session 原始參數（不合法 → 拒絕，不產報）
+        with self._lock:
+            cur = self.cert is not None and folder == self.folder
+        st = None if cur else REQ.read_json(os.path.join(folder, "cert_state.json"))
+        if not cur and isinstance(st, dict) and st.get("status") == "ended":
+            _sp, errs, _notes = session_params_check(st)
+            if errs:
+                REQ.write_result(self.root, req, "rejected",
+                                 f"認證 {req['cert_id']} 的原始參數缺少或不合法：{'；'.join(errs)} → 不重新產生報告",
+                                 data={"param_errors": errs})
+                return
+            src = "Session 原始參數（cert_state.params）"
+        else:
+            src = "服務目前載入的參數（記錄中認證，維持既有行為）"
         ok, msg, path = self.generate_report(req["cert_id"])
         REQ.write_result(self.root, req, "done" if ok else "failed",
-                         f"已產生新報告：{path}" if ok else f"報告產生失敗：{msg}（資料已保留，可再重產）",
-                         data={"report": path})
+                         f"已產生新報告：{path}（分析參數來源：{src}）" if ok
+                         else f"報告產生失敗：{msg}（資料已保留，可再重產）",
+                         data={"report": path, "params_source": src})
 
     # ---- 報告 ----------------------------------------------------------------
     def generate_report(self, cid):
@@ -1465,14 +2371,30 @@ class CertRuntime:
         from cert_report_xlsx import save_report
         from cert_screenshot import load_manifest
         folder = os.path.join(self.root, cid)
-        rt = self if folder == self.folder else self._offline(folder)
+        # BUG-1：狀態來源 —— 目前認證用鎖內記憶體快照；其他認證讀磁碟且必須可確認，否則不產報、不寫入任何檔案。
+        # BUG-2：HOLD（結束未完成）→ 不產報（否則會把未完成收尾的狀態寫進磁碟）。
+        with self._lock:
+            cur = self.cert is not None and folder == self.folder
+            if cur and self._halt is not None:
+                return (False, f"認證 {cid} 結束未完成（HOLD，已停止取樣）→ 不產生報告；請先用選單 22 重新結束", None)
+            st_snap = _json_copy(self.cert) if cur else None
+        if not cur:
+            st_snap = REQ.read_json(os.path.join(folder, "cert_state.json"))
+            if not (isinstance(st_snap, dict) and st_snap.get("cert_id") == cid
+                    and st_snap.get("status") in ("recording", "ended")):
+                return (False, f"無法確認認證 {cid} 的 cert_state.json（讀不到、內容無效或 cert_id 不符）"
+                               "→ 不產生報告、不改寫狀態", None)
+        try:
+            rt = self if cur else self._offline(folder)
+        except SessionParamsError as e:                 # G6：已結束認證的原始參數缺少／不合法 → 不產報、不寫入任何檔案
+            return False, f"{e} → 不產生報告、不改寫狀態", None
         with self._lock:
             if self._report_busy:
                 return False, "另一份報告正在產生中", None
             self._report_busy = True
         part = None
         try:
-            st = REQ.read_json(os.path.join(folder, "cert_state.json")) or {}
+            st = st_snap
             rep = os.path.join(folder, "reports")
             os.makedirs(rep, exist_ok=True)
             # 編號：現有檔案＋cert_state 紀錄＋supplements 修訂紀錄中用過的最大號 + 1（已刪除的編號也不重用）
@@ -1484,8 +2406,16 @@ class CertRuntime:
             part = path[:-5] + ".partial.xlsx"
             res = rt.analysis()
             ti = st.get("test_info") or {}
-            notes = [f"認證測試 {cid}：背景服務自 {st.get('started_at')} 起持續取樣（含休息），"
-                     f"至 {st.get('ended_at') or '（記錄中）'}；共 {len(rt.records)} 筆。",
+            er = st.get("end_recovery") if isinstance(st.get("end_recovery"), dict) else None
+            notes = [(f"認證測試 {cid}：背景服務自 {st.get('started_at')} 起持續取樣（含休息），"
+                      f"至 {st.get('ended_at') or '（記錄中）'}；共 {len(rt.records)} 筆。") if er is None else
+                     # M9：延遲收尾 → 分開標示資料截止與收尾時間（不以收尾時間代替最後取樣；正常結束文字不變）
+                     (f"認證測試 {cid}：背景服務自 {st.get('started_at')} 起持續取樣（含休息），"
+                      f"資料至最後一筆紀錄 {er.get('last_recorded_sample_at') or '不明'}"
+                      f"（最後一筆有效 HMI 資料 {er.get('last_valid_sample_at') or '不明'}）；共 {len(rt.records)} 筆。"
+                      f"結束要求 {er.get('first_end_requested_at') or '不明'}；結束收尾未能即時完成"
+                      f"（{'服務重啟後由人工重新結束' if er.get('mode') == 'after_restart' else '同一程序內重新結束'}），"
+                      f"實際完成收尾 {er.get('completed_at') or '不明'}；其間沒有取樣、不補資料。"),
                      "原始讀值照存：不沿用上一筆、不補 0、不內插；讀取失敗或欄位無效 → 該分鐘 N/A、曲線斷線。",
                      params_note(st.get("params")) + "。",
                      "傳感器溫度／PCS 模組溫度取自 6161 /api/temperature（st／pt.moduleTemperature），對應關係待實機確認。",
@@ -1561,9 +2491,15 @@ class CertRuntime:
             if SUP.has_supplements(folder):
                 SUP.append_report_log(folder, {"type": "report_failed", "at": REQ.now_str(self.clock()), "error": msg})
                 return False, msg, None
-            st = REQ.read_json(os.path.join(folder, "cert_state.json")) or {}
-            st["last_report_error"] = {"at": REQ.now_str(self.clock()), "error": msg}
-            self._write_state_any(folder, st)
+            if cur:
+                st = {}                                 # 目前認證：_write_state_any 只合併 last_report_error 到記憶體狀態
+            else:
+                st = REQ.read_json(os.path.join(folder, "cert_state.json"))
+                if not (isinstance(st, dict) and st.get("cert_id") == cid):
+                    st = None                           # BUG-1：讀不到／內容不符 → 不寫入（不得以不完整內容覆寫）
+            if st is not None:
+                st["last_report_error"] = {"at": REQ.now_str(self.clock()), "error": msg}
+                self._write_state_any(folder, st)
             self._event("report_failed", f"報告產生失敗：{msg}（資料完整保留，可用「重新產生認證報告」重試）", folder=folder)
             return False, msg, None
         finally:
@@ -1595,6 +2531,8 @@ class CertRuntime:
         with self._lock:
             s = {"updated_at": REQ.now_str(self.clock()), "pid": os.getpid(), "owner_role": owner_role,
                  "active": self.is_active(), "cert_id": self.cert["cert_id"] if self.cert else None}
+            if self._halt is not None:                  # BUG-2：HOLD（顯示用；不參與任何判斷）
+                s["halted"] = _json_copy(self._halt)
             if self.cert:
                 s.update(started_at=self.cert.get("started_at"), sample_count=len(self.records),
                          last_sample_time=self.cert.get("last_sample_time"),

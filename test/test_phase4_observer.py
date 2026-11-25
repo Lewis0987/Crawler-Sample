@@ -130,6 +130,7 @@ check("C  UI 互動入口 report_start_interactive() 存在於 menu",
 # 注入環境
 # ======================================================================
 ROOT = tempfile.mkdtemp(prefix="p45_obs_")
+E_ROOT = tempfile.mkdtemp(prefix="p45_obsE_")      # section E only: keep its real Session out of ROOT (STOP5)
 _BAK = (CDR.read_all, CDR._fetch_cell_packs, CDR.ApiClient,
         RM._report_client, RM._monitor_client, RM._report_output_root,
         CFG.SAMPLE_INTERVAL_SEC)
@@ -167,7 +168,7 @@ CDR._fetch_cell_packs = lambda _c: (None, "offline")
 CDR.ApiClient = _ForbiddenClient
 RM._report_client = lambda *a, **k: _FakeClient()
 RM._monitor_client = lambda force=False: (_FakeClient(), False)
-RM._report_output_root = lambda: ROOT
+RM._report_output_root = lambda: E_ROOT             # section E writes its Session here
 CFG.SAMPLE_INTERVAL_SEC = 0.05
 
 _ok_all = False
@@ -189,6 +190,7 @@ try:
     with contextlib.redirect_stdout(io.StringIO()):
         RM.report_pause()
     RM.release_ownership()
+    RM._report_output_root = lambda: ROOT           # sections D..P: only the fixture is an active Session in ROOT
 
     # ==================================================================
     # 建立一份「Owner 正在記錄」的 Session 供 Observer 唯讀顯示
@@ -404,6 +406,7 @@ finally:
     RM._report.update(session=None, thread=None, stop=None, finalized=False,
                       pending_end_reason=None, stopping=False)
     shutil.rmtree(ROOT, ignore_errors=True)
+    shutil.rmtree(E_ROOT, ignore_errors=True)
 
 # ======================================================================
 # R / S  跨行程與不退步

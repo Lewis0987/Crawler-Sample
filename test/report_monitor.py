@@ -896,6 +896,12 @@ def _report_start_locked(mode_label="交流有功", setpoint=None):
        auto_monitor_service.py 使用，而 Windows Service（Phase 4.6）沒有 console，
        任何 input() 都會讓服務直接卡死。互動輸入一律留在 device_control_menu 的 UI 層。
     """
+    # ⚠️ Owner Gate（F-W）：必須在任何 Session 續接／建立、登入或落盤之前。
+    #    resume().start() 會改寫 session_state.json（status=recording）並追加 events.csv；
+    #    只靠 _report_bg_start() 的 Gate 時，非 Owner 已先寫入既有 Session。
+    if not is_owner():
+        print("[REPORT] 非 Monitor Owner → 不建立／不續接 Session（防止非 Owner 寫入既有 Session）")
+        return
     if _report["session"] is not None:
         print("已有進行中的充放電報告，請先選 17 停止並產生報告。")
         return

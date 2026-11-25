@@ -260,6 +260,184 @@ try:
           RM._report["session"] is None and RM.is_owner() is False)
 
     # ==================================================================
+    # F-W：非 Owner 呼叫 report_start（Menu 18 Core 入口）不得寫入任何 Session
+    #   三種情境各用獨立 output root（彼此隔離、避免 mtime 同值選錯 Session）：
+    #   paused / recording / 無 Session；另以 Owner 驗證正常續接與建立不受影響。
+    # ==================================================================
+    print("\n[F-W] 非 Owner 呼叫 RM.report_start → 既有 Session 完全不變、不新增 artifact")
+    import hashlib as _hl
+    _fw_prev_client = RM._report_client
+    _fw_cnt = {"n": 0}
+
+    def _fw_client(*_a, **_k):
+        _fw_cnt["n"] += 1
+        return _FakeClient()
+
+    def _fw_files(root):
+        out = {}
+        for _dp, _dn, _fn in os.walk(root):
+            for _f in _fn:
+                _p = os.path.join(_dp, _f)
+                with open(_p, "rb") as _fh:
+                    out[os.path.relpath(_p, root)] = _hl.sha256(_fh.read()).hexdigest()
+        return out
+
+    def _fw_sha(p):
+        with open(p, "rb") as _fh:
+            return _hl.sha256(_fh.read()).hexdigest()
+
+    def _fw_status(folder):
+        with open(os.path.join(folder, CFG.FILE_SESSION_STATE), encoding="utf-8") as _fh:
+            return json.load(_fh).get("status")
+
+    def _fw_use_root(root):
+        RM._report_output_root = lambda: root
+
+    def _fw_make_session(root, status):
+        """以 Owner 的真實流程建立 Session → pause；status=recording 時再把複本狀態改為 recording。"""
+        _fw_use_root(root)
+        _reset()
+        RM.acquire_ownership(role="fw-setup")
+        with contextlib.redirect_stdout(io.StringIO()):
+            RM.report_start(mode_label="交流有功")
+            RM.report_pause()
+        RM.release_ownership()
+        _dirs = [d for d in glob.glob(os.path.join(root, "*")) if os.path.isdir(d)]
+        if status == CFG.SESSION_RECORDING and len(_dirs) == 1:
+            _sp = os.path.join(_dirs[0], CFG.FILE_SESSION_STATE)
+            with open(_sp, encoding="utf-8") as _fh:
+                _js = json.load(_fh)
+            _js["status"] = CFG.SESSION_RECORDING
+            with open(_sp, "w", encoding="utf-8") as _fh:
+                json.dump(_js, _fh, ensure_ascii=False, indent=2)
+        return _dirs
+
+    def _fw_nonowner_call(root):
+        _fw_use_root(root)
+        _reset()
+        _fw_cnt["n"] = 0
+        _o = io.StringIO()
+        with contextlib.redirect_stdout(_o):
+            RM.report_start(mode_label="交流有功")
+        _out = _o.getvalue()
+        print(f"  （診斷）is_owner={RM.is_owner()} cert_block={RM._cert_block()!r} "
+              f"client_calls={_fw_cnt['n']} 進入續接={'recording_resume' in _out} "
+              f"進入新建={'新 Session' in _out}")
+        return _out
+
+    _FW_ROOTS = [tempfile.mkdtemp(prefix="p46_fw_%s_" % _k) for _k in ("p", "r", "n", "o1", "o2")]
+    _FWP, _FWR, _FWN, _FWO1, _FWO2 = _FW_ROOTS
+    RM._report_client = _fw_client
+    try:
+        # ---------------- 情境 P：單一 paused Session ----------------
+        _pd = _fw_make_session(_FWP, CFG.SESSION_PAUSED)
+        print(f"  （前置）P：Session 數={len(_pd)} status={_fw_status(_pd[0]) if _pd else None}")
+        _pst, _pev = (os.path.join(_pd[0], CFG.FILE_SESSION_STATE), os.path.join(_pd[0], CFG.FILE_EVENTS))
+        _p_ls0, _p_f0 = sorted(os.listdir(_FWP)), _fw_files(_FWP)
+        _p_st0, _p_ev0, _p_names0 = _fw_sha(_pst), _fw_sha(_pev), sorted(os.listdir(_pd[0]))
+        _out = _fw_nonowner_call(_FWP)
+        check("FW-01 非 Owner＋paused：有明確拒絕訊息（非 Monitor Owner）", "非 Monitor Owner" in _out)
+        check("FW-02 非 Owner＋paused：session_state.json SHA 不變", _fw_sha(_pst) == _p_st0)
+        check("FW-03 非 Owner＋paused：events.csv SHA 不變", _fw_sha(_pev) == _p_ev0)
+        check("FW-04 非 Owner＋paused：Session 資料夾檔案集合不變", sorted(os.listdir(_pd[0])) == _p_names0)
+        check("FW-05 非 Owner＋paused：根目錄未新增 Session／artifact",
+              sorted(os.listdir(_FWP)) == _p_ls0 and set(_fw_files(_FWP)) == set(_p_f0))
+        check(f"FW-06 非 Owner＋paused：狀態維持 paused（實際 {_fw_status(_pd[0])}）",
+              _fw_status(_pd[0]) == CFG.SESSION_PAUSED)
+        check("FW-07 非 Owner＋paused：_report session／thread 皆為 None",
+              RM._report["session"] is None and RM._report["thread"] is None)
+        check(f"FW-08 非 Owner＋paused：未取得／登入 client（實際 {_fw_cnt['n']} 次）", _fw_cnt["n"] == 0)
+
+        # ---------------- 情境 R：單一 recording Session ----------------
+        _rd = _fw_make_session(_FWR, CFG.SESSION_RECORDING)
+        print(f"  （前置）R：Session 數={len(_rd)} status={_fw_status(_rd[0]) if _rd else None}")
+        _rst, _rev = (os.path.join(_rd[0], CFG.FILE_SESSION_STATE), os.path.join(_rd[0], CFG.FILE_EVENTS))
+        _r_ls0, _r_f0 = sorted(os.listdir(_FWR)), _fw_files(_FWR)
+        _r_st0, _r_ev0, _r_names0 = _fw_sha(_rst), _fw_sha(_rev), sorted(os.listdir(_rd[0]))
+        _out = _fw_nonowner_call(_FWR)
+        check("FW-09 非 Owner＋recording：有明確拒絕訊息（非 Monitor Owner）", "非 Monitor Owner" in _out)
+        check("FW-10 非 Owner＋recording：session_state.json SHA 不變", _fw_sha(_rst) == _r_st0)
+        check("FW-11 非 Owner＋recording：events.csv SHA 不變", _fw_sha(_rev) == _r_ev0)
+        check("FW-12 非 Owner＋recording：Session 檔案集合及根目錄項目皆不變",
+              sorted(os.listdir(_rd[0])) == _r_names0 and sorted(os.listdir(_FWR)) == _r_ls0
+              and set(_fw_files(_FWR)) == set(_r_f0))
+        check(f"FW-13 非 Owner＋recording：狀態維持 recording（實際 {_fw_status(_rd[0])}）",
+              _fw_status(_rd[0]) == CFG.SESSION_RECORDING)
+        check("FW-14 非 Owner＋recording：_report session／thread 皆為 None",
+              RM._report["session"] is None and RM._report["thread"] is None)
+        check(f"FW-15 非 Owner＋recording：未取得／登入 client（實際 {_fw_cnt['n']} 次）", _fw_cnt["n"] == 0)
+
+        # ---------------- 情境 N：無任何 Session ----------------
+        _n_ls0 = sorted(os.listdir(_FWN))
+        _out = _fw_nonowner_call(_FWN)
+        check("FW-16 非 Owner＋無 Session：有明確拒絕訊息（非 Monitor Owner）", "非 Monitor Owner" in _out)
+        check(f"FW-17 非 Owner＋無 Session：未新增資料夾（實際 {len(os.listdir(_FWN)) - len(_n_ls0)}）",
+              sorted(os.listdir(_FWN)) == _n_ls0)
+        check("FW-18 非 Owner＋無 Session：未產生任何 Session artifact", not _fw_files(_FWN))
+        check(f"FW-19 非 Owner＋無 Session：未取得／登入 client（實際 {_fw_cnt['n']} 次）", _fw_cnt["n"] == 0)
+
+        # ---------------- Gate 位置與既有 Layer 3 ----------------
+        _src_fw = open(os.path.join(HERE, "report_monitor.py"), encoding="utf-8").read()
+        _lk = _src_fw[_src_fw.index("def _report_start_locked("):_src_fw.index("def _last_active_direction(")]
+        _lk = re.sub(r"#.*", "", re.sub(r'"""[\s\S]*?"""', "", _lk))
+        _g = _lk.find("if not is_owner():")
+        check("FW-20 _report_start_locked 的 Owner Gate 早於 find_active_session／_report_client／ReportSession",
+              _g != -1 and all(_g < _lk.find(_t) for _t in
+                                ("find_active_session(", "_report_client(", "ReportSession")))
+        _reset()
+        with contextlib.redirect_stdout(io.StringIO()):
+            _bgfw = RM._report_bg_start(object())
+        check("FW-21 既有 Layer 3：非 Owner 直接呼叫 _report_bg_start 仍回 False、未起 thread",
+              _bgfw is False and RM._report["thread"] is None and RM._report["session"] is None)
+
+        # ---------------- Owner 正常續接與建立 ----------------
+        _od = _fw_make_session(_FWO1, CFG.SESSION_PAUSED)
+        _oev = os.path.join(_od[0], CFG.FILE_EVENTS)
+        with open(_oev, encoding="utf-8-sig") as _fh:
+            _n_res0 = _fh.read().count("recording_resume")
+        _fw_use_root(_FWO1)
+        _reset()
+        _okf, _ = RM.acquire_ownership(role="fw-owner")
+        with contextlib.redirect_stdout(io.StringIO()):
+            RM.report_start(mode_label="交流有功")
+        with open(_oev, encoding="utf-8-sig") as _fh:
+            _n_res1 = _fh.read().count("recording_resume")
+        check(f"FW-22 Owner 續接 paused：轉 recording、events 新增 recording_resume、thread 已啟動"
+              f"（status={_fw_status(_od[0])} resume {_n_res0}→{_n_res1}）",
+              _okf is True and RM._report["session"] is not None
+              and RM._report["thread"] is not None and RM._report["thread"].is_alive()
+              and _fw_status(_od[0]) == CFG.SESSION_RECORDING and _n_res1 == _n_res0 + 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            RM.report_pause()
+        RM.release_ownership()
+        check("FW-23 Owner 收尾：session 已清空、Session 回到 paused、已釋放 Ownership",
+              RM._report["session"] is None and _fw_status(_od[0]) == CFG.SESSION_PAUSED
+              and RM.is_owner() is False)
+
+        _fw_use_root(_FWO2)
+        _reset()
+        _okf2, _ = RM.acquire_ownership(role="fw-owner-new")
+        with contextlib.redirect_stdout(io.StringIO()):
+            RM.report_start(mode_label="直流恆流", setpoint=12.0)
+        _o2d = [d for d in glob.glob(os.path.join(_FWO2, "*")) if os.path.isdir(d)]
+        check(f"FW-24 Owner 無 Session 時正常建立新 Session（資料夾 {len(_o2d)}）",
+              _okf2 is True and len(_o2d) == 1 and RM._report["session"] is not None
+              and RM._report["thread"] is not None and RM._report["thread"].is_alive())
+        with contextlib.redirect_stdout(io.StringIO()):
+            RM.report_pause()
+        RM.release_ownership()
+    finally:
+        RM._report_client = _fw_prev_client
+        RM._report_output_root = lambda: ROOT
+        _reset()
+        RM.release_ownership()
+        for _r in _FW_ROOTS:
+            shutil.rmtree(_r, ignore_errors=True)
+    check("FW-25 F-W 段收尾：已釋放 Ownership、output root 與 client 已還原、Session 已清空",
+          RM.is_owner() is False and RM._report_output_root() == ROOT
+          and RM._report_client is _fw_prev_client and RM._report["session"] is None)
+
+    # ==================================================================
     # Dashboard 唯讀路徑不受 Layer 1 early return 影響
     # ==================================================================
     print("\n[Phase 4.6-B] Observer 的唯讀設備狀態路徑不受影響")

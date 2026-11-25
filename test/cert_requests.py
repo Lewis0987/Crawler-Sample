@@ -37,6 +37,7 @@ TYPES = {
     "start_cert": "開始認證測試",
     "end_cert": "結束認證測試",
     "stage_label": "階段標記",
+    "stage_count": "階段計次設定",
     "confirm_item": "不確定項目確認",
     "manual_shot": "立即截圖／手動補拍",
     "post_test_supplement": "已結束認證事後補拍",

@@ -51,6 +51,12 @@ LIVE_SUITES = {
     "test_sm2_login": "實測會連線 192.168.128.110:8080（HMI SM2 登入）",
 }
 
+# --- 需要專用 CLI 參數的測試工具：不由本 Runner 直接執行（SKIP-CLI，不計入 PASS／FAIL）------
+#     與 LIVE_SUITES 不同：這些不是需要實機，而是必須用專用命令與參數執行，否則只會回傳 argparse 錯誤。
+CLI_TOOL_SUITES = {
+    "test_cert_merge_report": "需要 --phase/--work 等專用參數；由 Phase 3A～3C 專用命令獨立驗證",
+}
+
 # --- 既有失敗：如實列示，不在離線 Regression 範圍內修正 ----------------------
 KNOWN_FAILURES = {
     "test_pcs_modes": (
@@ -115,13 +121,16 @@ def main():
     if args.list:
         print("== 純離線（本 Runner 會執行）==")
         for n, _ in all_suites:
-            if n not in LIVE_SUITES:
+            if n not in LIVE_SUITES and n not in CLI_TOOL_SUITES:
                 note = ""
                 if n in KNOWN_FAILURES:
                     note = "   ← 既有失敗 %d 項（PRE-EXISTING / OUT-OF-SCOPE）" % KNOWN_FAILURES[n][0]
                 print("  %s%s" % (n, note))
         print("\n== 需要實體 HMI（預設不執行）==")
         for n, why in LIVE_SUITES.items():
+            print("  %-26s %s" % (n, why))
+        print("\n== 需專用 CLI 參數的測試工具（SKIP-CLI；本 Runner 不執行，須用專用命令另外執行）==")
+        for n, why in CLI_TOOL_SUITES.items():
             print("  %-26s %s" % (n, why))
         print("\n== 實機 scraper（本 Runner 永不執行）==")
         print("  run_all.py                 實機唯讀 scraper 套件，會覆寫 output\\ 下 15 個快照檔")
@@ -143,6 +152,11 @@ def main():
 
     rows, t0 = [], time.time()
     for name, path in all_suites:
+        if name in CLI_TOOL_SUITES:                     # 先於 LIVE_SUITES 判斷：--include-live 也不執行
+            rows.append({"suite": name, "rc": "SKIP-CLI", "pass": 0, "fail": 0,
+                         "why": CLI_TOOL_SUITES[name]})
+            print("%-44s SKIP-CLI 需專用參數（%s）" % (name, CLI_TOOL_SUITES[name]))
+            continue
         if name in LIVE_SUITES and not args.include_live:
             rows.append({"suite": name, "rc": "SKIP", "pass": 0, "fail": 0,
                          "why": LIVE_SUITES[name]})
@@ -162,7 +176,9 @@ def main():
         print("%-44s rc=%-7s PASS=%-5d FAIL=%-3d%s"
               % (name, rc, npass, nfail, "   ⚠ 有對外連線嘗試（已阻擋）" if n1 > n0 else ""))
 
-    ran = [r for r in rows if r["rc"] != "SKIP"]
+    ran = [r for r in rows if r["rc"] not in ("SKIP", "SKIP-CLI")]
+    skip_cli = [r for r in rows if r["rc"] == "SKIP-CLI"]
+    skip_live = [r for r in rows if r["rc"] == "SKIP"]
     known = [r for r in ran if r["suite"] in KNOWN_FAILURES and (r["fail"] or r["rc"] != 0)]
     bad = [r for r in ran if r["suite"] not in KNOWN_FAILURES and (r["fail"] or r["rc"] != 0)]
     tp = sum(r["pass"] for r in ran)
@@ -170,9 +186,13 @@ def main():
     kf = sum(r["fail"] for r in known)
 
     print("\n" + "=" * 78)
-    print("執行 %d 套件｜略過 %d（需實體 HMI）｜耗時 %.0fs"
-          % (len(ran), len(rows) - len(ran), time.time() - t0))
+    print("執行 %d 套件｜略過 %d（需實體 HMI）｜略過 %d（SKIP-CLI，需專用參數）｜耗時 %.0fs"
+          % (len(ran), len(skip_live), len(skip_cli), time.time() - t0))
     print("通過 %d 項｜失敗 %d 項（其中既有失敗 %d 項）" % (tp, tf, kf))
+    if skip_cli:
+        print("\n-- SKIP-CLI（未執行、不計入 PASS／FAIL；必須另外以專用命令執行）--")
+        for r in skip_cli:
+            print("  %s：%s" % (r["suite"], r["why"]))
     if known:
         print("\n-- 既有失敗（PRE-EXISTING / OUT-OF-SCOPE，如實列示、不修正）--")
         for r in known:

@@ -36,6 +36,7 @@ if HERE not in sys.path:
 
 import cert_menu                                                    # noqa: E402
 import cert_requests as REQ                                         # noqa: E402
+import cert_report_config as CFG                                   # noqa: E402  G6：合成 cert_state 補 params
 
 _results = []
 _P = []
@@ -82,7 +83,8 @@ def write_cert(root, cid, status, plan, t0):
                 soc = soc0 if s == secs[0] else (soc1 if s == secs[-1] else 50.0)
                 f.write(json.dumps(rec(t0 + timedelta(seconds=s), k, soc), ensure_ascii=False) + "\n")
     REQ.atomic_write_json(os.path.join(folder, "cert_state.json"),
-                          {"cert_id": cid, "status": status, "test_info": {"cabinet_spec": "250KW"}})
+                          {"cert_id": cid, "status": status, "test_info": {"cabinet_spec": "250KW"},
+                           "params": CFG.params()})
     return folder
 
 

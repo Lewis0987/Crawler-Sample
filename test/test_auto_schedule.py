@@ -1522,15 +1522,210 @@ print("\n[Phase 3.3] 正式流程 Regression（E2E）："
 # 真的 should_auto_end() + 真的 _report_finalize() → 真的產出 Summary / Excel。
 # 只把「設備讀值」與「Cell 抓取」換成合成資料（不連設備），並把節奏調快以縮短測試時間。
 _e2e_ok = False
-_e2e_root = os.path.join(os.path.dirname(HERE), "output", "test_output", "phase33_e2e")
+
+
+def _phase33_e2e_root(env_val, project_root, approved_base=r"D:\_tmp_dev_b0"):
+    """
+    E2E 輸出資料夾。未設定 PHASE33_E2E_ROOT（None）→ 原本的預設路徑（語意不變；清理前另由
+    _phase33_e2e_check 以預設模式規則驗證）。
+    有設定 → 必須通過安全檢查才可作為清除（rmtree）目標，否則丟 ValueError（不清除、也不退回預設路徑）：
+      非空字串、絕對路徑、不是磁碟根目錄、最後一層名稱以 phase33_e2e 開頭（測試專用目錄）、
+      不是專案根目錄或其上層、不在專案目錄內（避免覆蓋既有輸出）、不在正式版目錄、路徑中沒有 cert_reports、
+      父目錄已存在、父目錄與目標都沒有 symlink／junction 重新導向、若已存在必須是資料夾。
+    L1：另須位於核准測試根目錄 approved_base（固定 D:\\_tmp_dev_b0）之內且不得為其本身，
+        並通過 _phase33_e2e_safe_path（整條路徑 reparse 檢查、受保護目錄排除）。
+    """
+    default = os.path.join(project_root, "output", "test_output", "phase33_e2e")
+    if env_val is None:
+        return default
+    v = env_val.strip()
+    if not v:
+        raise ValueError("PHASE33_E2E_ROOT 為空字串")
+    if not os.path.isabs(v):
+        raise ValueError("PHASE33_E2E_ROOT 必須是絕對路徑：%r" % v)
+    p = os.path.normpath(v)
+
+    def _nc(x):
+        return os.path.normcase(os.path.normpath(os.path.abspath(x)))
+    if os.path.dirname(p) == p:
+        raise ValueError("PHASE33_E2E_ROOT 不得為磁碟根目錄：%r" % v)
+    if not os.path.basename(p).lower().startswith("phase33_e2e"):
+        raise ValueError("PHASE33_E2E_ROOT 最後一層名稱必須以 phase33_e2e 開頭：%r" % v)
+    pr, pc = _nc(project_root), _nc(p)
+    if pc == pr or pr.startswith(pc.rstrip("\\/") + os.sep):
+        raise ValueError("PHASE33_E2E_ROOT 不得為專案根目錄或其上層：%r" % v)
+    if pc.startswith(pr + os.sep):
+        raise ValueError("PHASE33_E2E_ROOT 不得位於專案目錄內（避免覆蓋既有輸出）：%r" % v)
+    prod = _nc(r"D:\Crawler Sample")
+    if pc == prod or pc.startswith(prod + os.sep):
+        raise ValueError("PHASE33_E2E_ROOT 不得位於正式版目錄：%r" % v)
+    if "cert_reports" in [x.lower() for x in pc.split(os.sep)]:
+        raise ValueError("PHASE33_E2E_ROOT 不得為認證 Session 目錄：%r" % v)
+    parent = os.path.dirname(p)
+    if not os.path.isdir(parent):
+        raise ValueError("PHASE33_E2E_ROOT 的父目錄不存在：%r" % parent)
+    for x in (parent, p):
+        if os.path.lexists(x) and os.path.normcase(os.path.realpath(x)) != _nc(x):
+            raise ValueError("PHASE33_E2E_ROOT 路徑含 symlink／junction 重新導向：%r" % x)
+    if os.path.lexists(p) and not os.path.isdir(p):
+        raise ValueError("PHASE33_E2E_ROOT 已存在但不是資料夾：%r" % v)
+    _phase33_e2e_safe_path(p, approved_base)
+    return p
+
+
+def _phase33_e2e_safe_path(p, approved_base=None):
+    """
+    L1 共用路徑安全檢查（環境變數路徑與預設路徑共用；唯讀，不建立／不修改任何東西）。違反 → ValueError：
+      - 目標本身及所有已存在的上層目錄：lstat 不得為 reparse point／symlink／junction，realpath 不得重新導向
+      - 實際解析路徑不得位於受保護目錄：正式版、舊 clone、histregen、凍結證據／封存（b0_／g0_／h2_／*_evidence_*）、
+        cert_reports（含 fixture）
+      - approved_base 有給（環境變數模式）：核准根目錄必須存在且本身與上層皆無重新導向；
+        目標實際解析路徑必須在其內（commonpath 判定，非字串前綴），且不得為核准根目錄本身
+    回傳目標的實際解析路徑（normcase）。
+    """
+    import stat as _st
+
+    def _nc(x):
+        return os.path.normcase(os.path.normpath(os.path.abspath(x)))
+
+    def _inside(c, par):
+        try:
+            return c != par and os.path.commonpath([c, par]) == par
+        except ValueError:                       # 不同磁碟機
+            return False
+
+    def _chain_plain(x):
+        cur = _nc(x)
+        while True:
+            if os.path.lexists(cur):
+                try:
+                    a = os.lstat(cur)
+                except OSError as e:
+                    raise ValueError("PHASE33_E2E 路徑無法判定（%s）：%r" % (e, cur))
+                if (getattr(a, "st_file_attributes", 0) & _st.FILE_ATTRIBUTE_REPARSE_POINT
+                        or os.path.islink(cur) or os.path.isjunction(cur)
+                        or os.path.normcase(os.path.realpath(cur)) != cur):
+                    raise ValueError("PHASE33_E2E 路徑含 reparse point／symlink／junction：%r" % cur)
+            nxt = os.path.dirname(cur)
+            if nxt == cur:
+                return
+            cur = nxt
+    _chain_plain(p)
+    real = os.path.normcase(os.path.realpath(_nc(p)))
+    if "cert_reports" in [x.lower() for x in real.split(os.sep)]:
+        raise ValueError("PHASE33_E2E 不得位於 cert_reports（認證 Session／fixture）：%r" % p)
+    for q in (r"D:\Crawler Sample", r"D:\Crawler_1hz_r2c"):
+        if real == _nc(q) or _inside(real, _nc(q)):
+            raise ValueError("PHASE33_E2E 不得位於受保護目錄 %s：%r" % (q, p))
+    wt = _nc(r"D:\Crawler WT")
+    if _inside(real, wt):
+        first = os.path.relpath(real, wt).split(os.sep)[0]
+        if first.startswith(("histregen", "b0_", "g0_", "h2_")) or "_evidence_" in first:
+            raise ValueError("PHASE33_E2E 不得位於 histregen／凍結證據目錄：%r" % p)
+    if approved_base is not None:
+        ab = _nc(approved_base)
+        if not os.path.isdir(ab):
+            raise ValueError("PHASE33_E2E 核准測試根目錄不存在：%r" % approved_base)
+        _chain_plain(ab)
+        if not _inside(real, ab):
+            raise ValueError("PHASE33_E2E_ROOT 必須位於核准測試根目錄 %s 之內（且不得為其本身）：%r" % (approved_base, p))
+    return real
+
+
+def _phase33_e2e_check(root, project_root, from_env, approved_base=r"D:\_tmp_dev_b0"):
+    """
+    清理前（重新）驗證實際目標。from_env=True → 重跑全部環境變數路徑規則；
+    False（預設模式）→ 只接受 <project_root>/output/test_output/phase33_e2e，且通過共用路徑安全檢查。
+    回傳正規化後的目標路徑；違反 → ValueError。
+    """
+    if from_env:
+        return _phase33_e2e_root(root, project_root, approved_base)
+    default = os.path.normpath(os.path.join(os.path.abspath(project_root), "output", "test_output", "phase33_e2e"))
+    if os.path.normcase(os.path.normpath(os.path.abspath(root))) != os.path.normcase(default):
+        raise ValueError("預設模式只允許 <專案>/output/test_output/phase33_e2e：%r" % root)
+    if not os.path.isdir(project_root):
+        raise ValueError("預設模式的專案根目錄不存在：%r" % project_root)
+    _phase33_e2e_safe_path(default)
+    return default
+
+
+def _phase33_e2e_marker_text(root):
+    """所有權標記 .phase33_e2e_owned 的固定內容（綁定該目錄的正規化路徑）。"""
+    return "ESS phase33_e2e test-owned v1\nroot=%s\n" % os.path.normcase(os.path.normpath(os.path.abspath(root)))
+
+
+def _phase33_e2e_marker_ok(root):
+    """標記檔存在、為一般檔案（非 reparse／link）且內容與 _phase33_e2e_marker_text(root) 完全相同。"""
+    import stat as _st
+    m = os.path.join(root, ".phase33_e2e_owned")
+    try:
+        a = os.lstat(m)
+        if (not _st.S_ISREG(a.st_mode) or getattr(a, "st_file_attributes", 0) & _st.FILE_ATTRIBUTE_REPARSE_POINT
+                or os.path.islink(m)):
+            return False
+        with open(m, encoding="utf-8", newline="") as f:
+            return f.read() == _phase33_e2e_marker_text(root)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _phase33_e2e_clean(root, project_root, from_env, approved_base=r"D:\_tmp_dev_b0"):
+    """
+    清除 E2E 輸出資料夾（兩種模式共用同一套規則；任何異常 → ValueError，不清除）：
+      1. 重新驗證實際目標（_phase33_e2e_check）
+      2. 不存在 → 不動作（回 "absent"）
+      3. 掃描整個目錄樹（不跟隨 symlink／junction）：任何 reparse point／link／非一般檔案／掃描錯誤 → 拒絕
+      4. 非空 → 必須有有效所有權標記 .phase33_e2e_owned；**不會**替未知來源目錄補標記
+      5. 刪除前再驗證一次目標，才 rmtree
+    ⚠️ 重新驗證只能降低 TOCTOU 風險，無法完全消除競態。
+    """
+    import shutil as _sh
+    import stat as _st
+    root = _phase33_e2e_check(root, project_root, from_env, approved_base)
+    if not os.path.lexists(root):
+        return "absent"
+
+    def _err(e):
+        raise ValueError("PHASE33_E2E 掃描失敗，拒絕清理：%r" % e)
+    entries = 0
+    for dp, dn, fn in os.walk(root, followlinks=False, onerror=_err):
+        for n in dn + fn:
+            q = os.path.join(dp, n)
+            try:
+                a = os.lstat(q)
+            except OSError as e:
+                raise ValueError("PHASE33_E2E 項目無法判定，拒絕清理：%r（%s）" % (q, e))
+            if (getattr(a, "st_file_attributes", 0) & _st.FILE_ATTRIBUTE_REPARSE_POINT
+                    or os.path.islink(q) or os.path.isjunction(q)):
+                raise ValueError("PHASE33_E2E 目錄樹內含 reparse point／symlink／junction，拒絕清理：%r" % q)
+            if not (_st.S_ISDIR(a.st_mode) or _st.S_ISREG(a.st_mode)):
+                raise ValueError("PHASE33_E2E 目錄樹內含非一般檔案，拒絕清理：%r" % q)
+            entries += 1
+    if entries and not _phase33_e2e_marker_ok(root):
+        raise ValueError("PHASE33_E2E 目錄非空且無有效所有權標記（.phase33_e2e_owned），拒絕清理：%r" % root)
+    root = _phase33_e2e_check(root, project_root, from_env, approved_base)
+    _sh.rmtree(root)
+    return "removed"
+
+
+def _phase33_e2e_create(root):
+    """合法建立 E2E 輸出資料夾並寫入所有權標記（唯一寫標記的地方；目錄已存在 → 例外）。"""
+    os.makedirs(root)
+    with open(os.path.join(root, ".phase33_e2e_owned"), "x", encoding="utf-8", newline="\n") as f:
+        f.write(_phase33_e2e_marker_text(root))
+
+
+_e2e_root = None
 _bak = (CDR.read_all, CDR._fetch_cell_packs, CFG.SAMPLE_INTERVAL_SEC,
         CFG.AUTO_HOLD_STOP_SEC, CFG.AUTO_STOP_ENABLED)
 try:
     import shutil
     import time as _t
-    if os.path.isdir(_e2e_root):
-        shutil.rmtree(_e2e_root)
-    os.makedirs(_e2e_root, exist_ok=True)
+    _e2e_env = os.environ.get("PHASE33_E2E_ROOT")
+    _e2e_root = _phase33_e2e_root(_e2e_env, os.path.dirname(HERE))   # 檢查不過 → 例外，不清除
+    # L1：兩種模式共用清理規則（重新驗證／reparse 掃描／非空須有所有權標記）；異常 → 例外，不清除
+    _phase33_e2e_clean(_e2e_root, os.path.dirname(HERE), _e2e_env is not None)
+    _phase33_e2e_create(_e2e_root)        # 合法建立並寫入所有權標記
 
     _phase = {"dir": "charge"}          # 由測試控制設備方向：先 charge，之後轉 idle
 

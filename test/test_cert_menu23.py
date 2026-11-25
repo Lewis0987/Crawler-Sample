@@ -23,6 +23,7 @@ if HERE not in sys.path:
 
 import cert_menu                                                    # noqa: E402
 import cert_requests as REQ                                         # noqa: E402
+import cert_report_config as CFG                                   # noqa: E402  G6：合成 cert_state 補 params
 from cert_runtime import CertRuntime, _read_jsonl                   # noqa: E402
 
 _results = []
@@ -59,7 +60,8 @@ def write_cert(root, cid, status, plan, t0):
                 soc = soc0 if s == secs[0] else (soc1 if s == secs[-1] else 50.0)
                 f.write(json.dumps(rec(t0 + timedelta(seconds=s), k, soc), ensure_ascii=False) + "\n")
     REQ.atomic_write_json(os.path.join(folder, "cert_state.json"),
-                          {"cert_id": cid, "status": status, "test_info": {"cabinet_spec": "250KW"}})
+                          {"cert_id": cid, "status": status, "test_info": {"cabinet_spec": "250KW"},
+                           "params": CFG.params()})
     return folder
 
 
@@ -358,6 +360,114 @@ try:
           n_requests(root) == n23b + 1)
 finally:
     shutil.rmtree(TMP, ignore_errors=True)
+
+# =============================================================================
+# G6：選單 23「3. 階段計次／不計次」（SC-12；預覽、YES、拒絕路徑、返回不送出、預覽＝實際結果）
+# =============================================================================
+from cert_stage_engine import stage_names as _stage_names      # noqa: E402
+
+TMP6 = tempfile.mkdtemp(prefix="cert_m23g6_")
+try:
+    T6 = datetime(2026, 1, 7, 9, 0, 0)
+    root6 = os.path.join(TMP6, "g6")
+    A6 = "CERT_20260107_090000"
+    K_C1 = "2026-01-07T09:07:20"
+    write_cert(root6, A6, "ended", [("D", 0, 300, 90.0, 40.0), ("I", 310, 430, 40.0, 40.0), ("C", 440, 500, 40.0, 42.0),
+                                    ("I", 510, 630, 42.0, 42.0), ("C", 640, 940, 42.0, 90.0), ("I", 950, 1070, 90.0, 90.0)], T6)
+    with open(os.path.join(root6, A6, "decisions.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "stage_label", "stage_start": K_C1, "label": "中止", "note": "",
+                            "at": "2026-01-07 10:00:00", "by": "test", "request_id": "LBL-1"}, ensure_ascii=False) + "\n")
+    svc6 = CertRuntime(root6, reader=None, enable_shots=False, log=lambda *a: None)
+    P6 = []
+
+    def ui6(answers, root_=None):
+        it = iter(answers)
+
+        def inp(prompt=""):
+            P6.append(prompt)
+            try:
+                return next(it)
+            except StopIteration:
+                raise KeyboardInterrupt
+        o = []
+        r = cert_menu.UI(root_ or root6, inp=inp, out=o.append, wait_sec=0.05).mark()
+        return o, r
+
+    def pend6(root_=None):
+        return [REQ.read_json(p) for p in glob.glob(os.path.join(root_ or root6, "requests", "pending", "*.json"))]
+
+    def counts6():
+        return [d for d in _read_jsonl(os.path.join(root6, A6, "decisions.jsonl")) if d.get("type") == "stage_count"]
+
+    def names6():
+        return [n for _no, n in sorted(_stage_names(svc6._offline(os.path.join(root6, A6)).analysis().stages).items())]
+
+    print("\n== G6 選單 23-3 階段計次／不計次 ==")
+    outs, _r = ui6(["1", "3", "0"])
+    check("G6-M23-1 選單 23 有「3. 階段計次／不計次」與「0. 返回」；清單顯示目前計次、標記與可否設定",
+          any("3. 階段計次／不計次" in p and "0. 返回" in p for p in P6)
+          and any("2. 第1次充電" in o for o in outs) and any("標記：中止｜目前：計次｜可設為不計次" in o for o in outs)
+          and any("標記：未標記｜目前：計次｜不可設為不計次" in o for o in outs) and not pend6())
+    ui6(["1", "0"])
+    ui6(["1", "3", "9"])
+    ui6(["1", "3", "2", "7"])
+    check("G6-M23-2 0＝返回（項目選擇）、不存在的階段編號、不存在的動作 → 都不建立請求", not pend6())
+    outs, _r = ui6(["1", "3", "3", "1"])
+    check("G6-M23-3 標記不是「中止」的階段 → 「不能設為不計次」，不建立請求",
+          any("不能設為不計次" in o for o in outs) and not pend6())
+    outs, _r = ui6(["1", "3", "2", "1", "   "])
+    check("G6-M23-4 原因空白 → 不建立請求", any("原因不可空白" in o for o in outs) and not pend6())
+    before = names6()
+    outs, _r = ui6(["1", "3", "2", "1", "誤操作充電，約 60 秒後停止", "no"])
+    prev = [o.strip() for o in outs if "→" in o and ". " in o]
+    check("G6-M23-5 預覽：目標改名＋後續同方向編號變化；輸入 YES 以外 → 取消、不建立請求、不寫入",
+          "2. 第1次充電 → 中止充電（不計次）" in prev and "3. 第2次充電 → 第1次充電" in prev
+          and not pend6() and not counts6() and names6() == before)
+    outs, _r = ui6(["1", "3", "2", "1", "誤操作充電，約 60 秒後停止", "YES"])
+    pr = pend6()
+    pl = pr[0]["payload"] if len(pr) == 1 else {}
+    check("G6-M23-6 YES → 只建立 1 筆 stage_count 請求（stage_start、counted=false、原因、選單看到的階段識別）",
+          len(pr) == 1 and pr[0]["type"] == "stage_count" and pl.get("stage_start") == K_C1 and pl.get("counted") is False
+          and pl.get("reason") == "誤操作充電，約 60 秒後停止"
+          and pl.get("expect") == {"no": 2, "dir": "C", "end": "2026-01-07T09:08:20"})
+    svc6.process_requests()
+    after = names6()
+    check("G6-M23-7 服務端處理 → done；實際名稱＝預覽（第1次放電／中止充電（不計次）／第1次充電）",
+          REQ.read_result(root6, pr[0]["request_id"])["status"] == "done" and len(counts6()) == 1
+          and after == ["第1次放電", "中止充電（不計次）", "第1次充電"])
+    rows6 = cert_menu.UI(root6, out=lambda *_: None).stage_rows(A6)
+    check("G6-M23-8 SC-09 選單清單名稱與服務端分析一致；不計次原因可見",
+          [r["name"] for r in rows6] == after and rows6[1]["counted"] is False
+          and rows6[1]["count_reason"] == "誤操作充電，約 60 秒後停止")
+    outs, _r = ui6(["1", "3", "2", "1"])
+    check("G6-M23-9 目前已是不計次 → 「無需設定」，不建立請求、不新增決策",
+          any("無需設定" in o for o in outs) and not pend6() and len(counts6()) == 1)
+    outs, _r = ui6(["1", "3", "2", "2", "", "YES"])
+    pr = pend6()
+    svc6.process_requests()
+    check("G6-M23-10 恢復計次 → 預覽名稱恢復 → YES 送出 → done；名稱恢復、歷史 2 筆",
+          len(pr) == 1 and pr[0]["payload"]["counted"] is True
+          and any("2. 中止充電（不計次） → 第1次充電" in o for o in outs)
+          and REQ.read_result(root6, pr[0]["request_id"])["status"] == "done"
+          and names6() == ["第1次放電", "第1次充電", "第2次充電"] and len(counts6()) == 2)
+
+    R6 = "CERT_20260108_090000"                          # 記錄中：最後階段仍在進行
+    write_cert(root6, R6, "recording", [("D", 0, 300, 90.0, 40.0), ("I", 310, 430, 40.0, 40.0),
+                                        ("C", 440, 600, 40.0, 50.0)], T6 + timedelta(days=1))
+    outs, _r = ui6(["1", "3", "2"])
+    check("G6-M23-11 記錄中認證的進行中階段 → 顯示「進行中，不可設定」，選擇也不建立請求",
+          any("進行中，不可設定" in o for o in outs) and any("仍在進行中" in o for o in outs) and not pend6())
+
+    root_b = os.path.join(TMP6, "badparams")
+    write_cert(root_b, A6, "ended", [("D", 0, 300, 90.0, 40.0), ("I", 310, 430, 40.0, 40.0)], T6)
+    stb = REQ.read_json(os.path.join(root_b, A6, "cert_state.json"))
+    stb["params"].pop("TCONF_SEC")
+    REQ.atomic_write_json(os.path.join(root_b, A6, "cert_state.json"), stb)
+    outs, _r = ui6(["1", "3"], root_=root_b)
+    check("G6-M23-12 原始參數缺少（TCONF_SEC）→ 無法分析、列出原因，不建立請求",
+          any("無法分析" in o and "TCONF_SEC：缺少" in o for o in outs) and not pend6(root_b))
+finally:
+    shutil.rmtree(TMP6, ignore_errors=True)
 
 ok = all(_results)
 print(f"\n== 認證報告 選單 23 階段標記 {'PASS' if ok else 'FAIL'}（{sum(_results)}/{len(_results)} 檢查通過）==")
