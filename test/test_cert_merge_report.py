@@ -2507,6 +2507,7 @@ def t_3s():
     print("-- LG --")
     _t3s_legacy(lab1)
     _t3s_fmt(lab1)
+    _t3s_stopped()
 
     # ------------------------------------------------------------------ MR-09 唯一識別
     print("-- MR-09 --")
@@ -2535,6 +2536,132 @@ def t_3s():
     check("MR-09b", "同一 Session 跨日同時分秒的兩個不計次階段 → 名稱用完整日期時間區分；頁籤 31 字截斷後仍唯一（序號）、可對回階段",
           nm[2] != nm[3] and "2026-12-09" in nm[2] and len(set(shn)) == 4 and all(len(x) <= 31 for x in shn)
           and [int(x.split(".")[0]) for x in shn] == [1, 2, 3, 4] and strip_count_time(nm[2]) == strip_count_time(nm[3]), str((nm, shn)))
+
+
+# =============================================================================
+# 3S FX：中止階段排除（stopped_stages_excluded=v1）新舊報告格式相容（只新增案例；既有案例不變）
+# =============================================================================
+S_EX = [("I", 30), ("D", 200), ("I", 90), ("C", 200), ("I", 90), ("C", 40), ("I", 90), ("D", 200), ("I", 90),
+        ("C", 200), ("I", 90)]                    # 放、充、充（中止）、放、充（083020 同型）
+LABELS_EX = ["滿放", "滿充", "中止", "滿放", "滿充"]
+
+
+def _set_category(path, value):
+    """直接改寫 docProps/core.xml 的 cp:category（None＝移除）；不經 openpyxl 重存，其他內容位元組不變。"""
+    import re
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        items = [(i, z.read(i.filename)) for i in z.infolist()]
+    tmp = path + ".cat_tmp"
+    with zipfile.ZipFile(tmp, "x", zipfile.ZIP_DEFLATED) as z:
+        for i, b in items:
+            if i.filename == "docProps/core.xml":
+                b = re.sub(rb"<cp:category>.*?</cp:category>|<cp:category\s*/>", b"", b, flags=re.S)
+                if value is not None:
+                    b = b.replace(b"</cp:coreProperties>", b"<cp:category>" + value.encode("utf-8") + b"</cp:category></cp:coreProperties>")
+            z.writestr(i, b)
+    os.replace(tmp, path)
+
+
+def _make_original_new(d, no=1):
+    """新格式原始報告：與服務端 generate_report 同一規則（meta 帶 exclude_stopped_stages）。"""
+    data = SRC.load_session(d, os.path.dirname(d))
+    sa = AN.analyze_session(data, 1)
+    meta, _ss = XL.detail_meta(sa, "TEMP_DISCLAIMER")
+    meta["source_notes"] = [n for n in meta["source_notes"] if n != "TEMP_DISCLAIMER"]
+    meta[XL.EXCLUDE_STOPPED_KEY] = True
+    cid = sa["cert_id"]
+    fn = f"認證測試報告_{cid}_{no:02d}.xlsx"
+    p = os.path.join(d, "reports", fn)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    save_report(sa["res"], meta, p)
+    stp = os.path.join(d, "cert_state.json")
+    st = json.load(open(stp, encoding="utf-8"))
+    st["reports"].append({"file": f"reports\\{fn}", "at": st["ended_at"].replace("T", " ")})
+    _w(stp, json.dumps(st, ensure_ascii=False, indent=2))
+    return p
+
+
+def _sx_session(name, day, labels=LABELS_EX, *, new=True):
+    """合成 Session（S_EX）：基準 stage_label 決策（報告前 30 分鐘內）→ 原始報告（new＝新格式／舊格式）＋ events。"""
+    d = make_session(name, T0 + timedelta(days=day), S_EX, report=False)
+    ss = _starts(d)
+    st = json.load(open(os.path.join(d, "cert_state.json"), encoding="utf-8"))
+    ended = datetime.strptime(st["ended_at"], "%Y-%m-%dT%H:%M:%S")
+    decs = [_lab(ss[i], lb, _ts(ended - timedelta(minutes=30 - i)), f"LX{i}") for i, lb in enumerate(labels) if lb]
+    if decs:
+        _jl(os.path.join(d, "decisions.jsonl"), decs)
+    rp = _make_original_new(d) if new else make_original(d)
+    _jl(os.path.join(d, "events.jsonl"), [{"t": st["ended_at"], "type": "end", "detail": "結束"},
+                                          {"t": st["ended_at"], "type": "report", "detail": f"產生報告 {os.path.basename(rp)}"}])
+    os.utime(rp, (ended.timestamp(), ended.timestamp()))
+    return d, ss, ended, rp
+
+
+def _t3s_stopped():
+    import glob
+    from openpyxl import load_workbook
+    from cert_report_xlsx import STOPPED_FORMAT
+    VERIFIED, UNVERIFIABLE, FAILED = "VERIFIED", "UNVERIFIABLE", "FAILED"
+    print("-- FX 中止階段排除：新舊報告格式相容 --")
+    n0 = make_session("CERT_S3_FXN", T0 + timedelta(days=900), STD)          # 對照來源（舊格式、無中止）
+
+    def merge(d, hooks=None):
+        rc, last, _t = run_tool([d, n0], now=nxt_now(), hooks=hooks)
+        md = last.get("merge_dir")
+        cid = os.path.basename(d)
+        return rc, md, (_sess(md, cid) if md else {}), (_dv(md, cid) if md else {})
+
+    d1, _s1, _e1, rp1 = _sx_session("CERT_S3_FX01", 901)
+    rc, md, s, v = merge(d1)
+    det = glob.glob(os.path.join(md, "重產明細", "重產明細_S*_CERT_S3_FX01*.xlsx"))
+    dsheets = load_workbook(det[0], read_only=True).sheetnames if det else []
+    check("FX-01", "新格式原始報告（category＝stopped_stages_excluded=v1、中止已排除）→ 依新規則重產比對 VERIFIED；重產明細只有 4 個有效階段頁",
+          s.get("data_value_verification") == VERIFIED and v.get("report_format") == STOPPED_FORMAT
+          and [x for x in dsheets if x[:1].isdigit()] == ["1.第1次放電(滿放)", "2.第1次充電(滿充)", "3.第2次放電(滿放)", "4.第2次充電(滿充)"],
+          str((s, v.get("report_format"), dsheets)))
+    d2, _s2, _e2, rp2 = _sx_session("CERT_S3_FX02", 902, new=False)
+    rc, md, s, v = merge(d2)
+    check("FX-02", "舊格式原始報告（含中止階段頁、category 空白）→ 依舊規則重產比對 VERIFIED（舊報告相容）",
+          s.get("data_value_verification") == VERIFIED and v.get("report_format") == ""
+          and "3.第2次充電(中止)" in load_workbook(rp2, read_only=True).sheetnames, str(s))
+    d3, _s3, _e3, rp3 = _sx_session("CERT_S3_FX03", 903)
+    _set_category(rp3, "stopped_stages_excluded=v9")
+    rc, md, s, v = merge(d3)
+    check("FX-03", "未知格式識別（category＝stopped_stages_excluded=v9）→ UNVERIFIABLE，不猜測重產規則",
+          s.get("data_value_verification") == UNVERIFIABLE and "格式識別不支援" in str(v.get("reason")), str((s, v.get("reason"))))
+    d4, _s4, _e4, rp4 = _sx_session("CERT_S3_FX04", 904)
+    _set_category(rp4, None)
+    rc, md, s, v = merge(d4)
+    check("FX-04", "新格式報告的格式識別被移除 → 依舊規則重產（含中止階段）與原始報告不符 → FAILED（不會通過）",
+          s.get("data_value_verification") == FAILED, str((s, v.get("reason"))))
+    d5, _s5, _e5, rp5 = _sx_session("CERT_S3_FX05", 905, new=False)
+    _set_category(rp5, STOPPED_FORMAT)
+    rc, md, s, v = merge(d5)
+    check("FX-05", "舊格式報告被加上新格式識別 → 依新規則重產（排除中止）與原始報告不符 → FAILED（不會通過）",
+          s.get("data_value_verification") == FAILED, str((s, v.get("reason"))))
+    d6, s6, e6, rp6 = _sx_session("CERT_S3_FX06", 906)
+    _append(os.path.join(d6, "decisions.jsonl"), [_lab(s6[4], "中止", _ts(e6 + timedelta(hours=1)), "LX_AFTER")])
+    rc, md, s, v = merge(d6)
+    da = _item(v, "D-A") or {}
+    check("FX-06", "新格式：報告後新增決策改變中止階段集合 → 第二階段 UNVERIFIABLE（STOPPED_STAGE_SET_CHANGED），整體不得 VERIFIED",
+          da.get("result") == UNVERIFIABLE and da.get("reason_code") == "STOPPED_STAGE_SET_CHANGED"
+          and s.get("data_value_verification") != VERIFIED, str((s, da.get("result"), da.get("reason_code"))))
+    d7, _s7, _e7, rp7 = _sx_session("CERT_S3_FX07", 907)
+
+    def _b3(wb):
+        wb.worksheets[3]["B3"] = 99.9
+    rc, md, s, v = merge(d7, hooks={"before_verify": _inject("CERT_S3_FX07", _b3)})
+    check("FX-07", "新格式：重產結果數值與原始報告不同 → FAILED（r8 嚴格比對未放寬）",
+          s.get("data_value_verification") == FAILED, str(s))
+    a8, _sa, _ea, rpa = _sx_session("CERT_S3_FX08A", 908, labels=["滿放", "滿充", "未滿", "滿放", "滿充"])
+    b8, _sb, _eb, rpb = _sx_session("CERT_S3_FX08B", 909, labels=["滿放", "滿充", "未滿", "滿放", "滿充"])
+    _set_category(rpb, None)
+    rc, last, _t = run_tool([a8, b8], now=nxt_now())
+    md = last.get("merge_dir")
+    sa8, sb8 = _sess(md, "CERT_S3_FX08A"), _sess(md, "CERT_S3_FX08B")
+    check("FX-08", "可偵測範圍限制：沒有中止階段時新舊格式內容完全相同 → 格式識別移除仍 VERIFIED（內容一致，無法也不需區分；非防竄改）",
+          sa8.get("data_value_verification") == VERIFIED and sb8.get("data_value_verification") == VERIFIED, str((sa8, sb8)))
 
 
 def _t3s_pairing():

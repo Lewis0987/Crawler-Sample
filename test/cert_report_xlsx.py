@@ -15,6 +15,7 @@
 本模組只寫入呼叫端指定的輸出路徑，不讀寫單次報告的任何檔案。
 """
 
+import dataclasses
 import os
 import re
 import zipfile
@@ -44,7 +45,8 @@ from cert_heat_link import failure_line, failure_text
 import cert_supplement as SUP
 from cert_controls import DIRECTION_TEXT, describe as describe_action
 from cert_stage_engine import (R_NO_HMI, command_stage, decisions_keywords, fmt_t, field_value, has_hmi_values,
-                               minute_value, overall_minutes, stage_minutes, stage_names, strip_count_time)
+                               minute_value, overall_minutes, stage_minutes, stage_names, strip_count_time,
+                               MinuteRow)
 
 NA = CFG.NA
 LOG_HEADERS = ["時間", "SOC", "電流", "Rack 最大溫度", "Rack 最小溫度", "Cell 最大電壓", "Cell 最小電壓",
@@ -114,6 +116,107 @@ def _sheet_name(i, names, st):
     if len(s) > 31 and not _counted(st):
         s = clean(f"{i}.{strip_count_time(names[st.no])}")
     return s[:31]
+
+
+# =============================================================================
+# 中止階段排除（stopped_stages_excluded=v1）：所有工作表共用同一份排除結果（唯一判斷處）
+# =============================================================================
+STOPPED_LABEL = "中止"
+STOPPED_FORMAT = "stopped_stages_excluded=v1"   # 活頁簿屬性 category：新格式識別（空白＝舊格式，完整階段）
+EXCLUDE_STOPPED_KEY = "exclude_stopped_stages"  # meta 旗標：只有 cert_runtime.generate_report 設定；直接呼叫 save_report 預設不排除
+EXCL_SRC_NOTE = "沿用來源屬已排除的中止階段，不顯示數值"
+
+
+def split_stopped(res, enabled):
+    """
+    有效 Flag 為「中止」（該階段 stage_label 最後一筆決策＝中止）的階段 → 排除（enabled 為真時）。
+    回傳 (kept, excluded, spans)；spans＝[(第一筆觀測時間, 最後一筆觀測時間, Stage)]（seq0～seq1，含階段內停頓／讀取失敗）。
+    不修改 res、Stage.no 或觀測；enabled 為假 → 不排除（舊格式）。
+    """
+    if not enabled:
+        return list(res.stages), [], []
+    kept, excluded, spans = [], [], []
+    for st in res.stages:
+        if st.label == STOPPED_LABEL:
+            excluded.append(st)
+            spans.append((res.obs[st.seq0].t, res.obs[st.seq1].t, st))
+        else:
+            kept.append(st)
+    return kept, excluded, spans
+
+
+def without_stopped(res, excluded):
+    """報告用檢視：觀測池去除排除階段的觀測（淺複製；原始 Result 與觀測物件不變）。"""
+    if not excluded:
+        return res
+    nos = {st.no for st in excluded}
+    return dataclasses.replace(res, obs=[o for o in res.obs if o.stage_no not in nos])
+
+
+def _in_spans(t, spans):
+    return any(t0 <= t <= t1 for t0, t1, _st in spans)
+
+
+def exclude_stopped_raw_rows(rs, excluded, spans):
+    """
+    1 秒格點 Raw Data 每秒列（raw_second_rows 結果）→ 排除中止階段（只作用於 Excel 輸出；不修改原列、觀測或檔案）：
+      · LIVE 列：來源觀測屬於排除階段 → 排除；其他 LIVE（待機、下一個有效階段）保留。
+      · 非 LIVE 列（沿用／未讀／無格點／服務停止）：格點秒在排除階段區間內（含頭尾）→ 排除；
+        區間外但沿用來源屬於排除階段 → 保留時間列、數值顯示 N/A（說明 EXCL_SRC_NOTE）。
+      · 來源無法對應（obs 為 None）：只依格點秒判斷（區間內排除，區間外維持原狀）。
+    回傳新 dict（rows 為新清單；stats 為複本；excluded＝排除統計）。沒有排除階段 → 原物件。
+    """
+    if rs is None or not excluded:
+        return rs
+    nos = {st.no for st in excluded}
+    rows, dropped, blanked = [], 0, 0
+    for r in rs["rows"]:
+        if "live" not in r:                         # 必須來自 raw_second_rows（live 由該函式標記）；缺少 → 不猜測
+            raise ValueError("Raw Data 每秒列缺少 live 欄位（必須由 raw_second_rows 產生）")
+        o = r.get("obs")
+        src_x = o is not None and o.stage_no in nos
+        if r["live"] and o is not None:
+            if src_x:
+                dropped += 1
+                continue
+            rows.append(r)
+        elif _in_spans(r["time"], spans):
+            dropped += 1
+        elif src_x:
+            rows.append(dict(r, obs=None, excluded_src=True))
+            blanked += 1
+        else:
+            rows.append(r)
+    return {"rows": rows, "stats": dict(rs["stats"]), "excluded": {"rows_dropped": dropped, "rows_blanked": blanked}}
+
+
+def pad_excluded_minutes(rows, res, spans):
+    """整體頁：保留完整原始時間軸（全部觀測的首筆～最後一筆所在分鐘）；排除後缺少的頭尾分鐘補 N/A（不補值）。"""
+    if not spans or not res.obs:
+        return rows
+    have = {mr.T: mr for mr in rows}
+    M = res.obs[0].t.replace(second=0, microsecond=0)
+    end = res.obs[-1].t.replace(second=0, microsecond=0)
+    out = []
+    while M <= end:
+        out.append(have.get(M) or MinuteRow(M, None, "", {}))
+        M += timedelta(minutes=1)
+    return out
+
+
+def stopped_notes(kept, excluded, spans, rs=None):
+    """排除說明（活頁簿描述；放在計次描述之前）。沒有排除階段 → []（描述與舊格式相同）。"""
+    if not excluded:
+        return []
+    out = [f"已排除中止階段：{st.dir_name}，開始 {fmt_t(t0, True)}，結束 {fmt_t(t1, True)}，原始觀測 {st.seq1 - st.seq0 + 1} 筆"
+           "（不列入階段頁、Summary、數據概覽、即時熱度、整體頁數值與 Raw Data；原始資料保留於 observations.jsonl）"
+           for t0, t1, st in spans]
+    ex = rs.get("excluded") if isinstance(rs, dict) else None
+    if ex:
+        out.append(f"已排除中止階段（Raw Data）：排除 {ex['rows_dropped']} 列；{ex['rows_blanked']} 列沿用中止階段讀值改為 N/A")
+    if not kept:
+        out.append("本報告沒有有效充放電階段（全部階段標記為中止）")
+    return out
 
 
 # =============================================================================
@@ -960,8 +1063,10 @@ def _write_commands(ws, res, commands, names, p):
 # =============================================================================
 def build_workbook(res, meta):
     p = res.params
-    names = stage_names(res.stages)
-    names_full = {st.no: _stage_title(names, st) for st in res.stages}
+    kept, excluded, spans = split_stopped(res, meta.get(EXCLUDE_STOPPED_KEY))   # 唯一中止判斷；各頁共用同一份結果
+    res_v = without_stopped(res, excluded)          # 選樣／極值／Raw 觀測池：去除排除階段觀測（原始資料不變）
+    names = stage_names(kept)                       # 有效階段重新計算第N次（原始 Stage.no 不變）
+    names_full = {st.no: _stage_title(names, st) for st in kept}
     wb = Workbook()
     ws_sum = wb.active
     ws_sum.title = "Summary"
@@ -969,10 +1074,10 @@ def build_workbook(res, meta):
     ws_heat = wb.create_sheet("即時熱度")
 
     sheet_of, n_rows = {}, {}
-    for i, st in enumerate(res.stages, 1):
+    for i, st in enumerate(kept, 1):
         ws = wb.create_sheet(_sheet_name(i, names, st))
         sheet_of[st.no] = ws.title
-        rows = stage_minutes(res, st, valid=lambda o: is_report_valid(o, p, names_full),   # 與 Raw Data 同一有效判定
+        rows = stage_minutes(res_v, st, valid=lambda o: is_report_valid(o, p, names_full),   # 與 Raw Data 同一有效判定
                              ext_scope="minute",             # 四個極值＝階段所涵蓋分鐘的完整日曆分鐘（排除明確反方向）
                              prefer=lambda o: has_pcs_temp(o, p))                  # 優先含 PCS 溫度的取樣（與整體頁同一條件）
         n_rows[st.no] = len(rows)
@@ -986,14 +1091,18 @@ def build_workbook(res, meta):
             _write_short_stage(ws, st, p)
 
     ws_all = wb.create_sheet("整體測試")
-    orows = overall_minutes(res, valid=lambda o: is_report_valid(o, p, names_full),          # 有效觀測優先（同一判定）
+    orows = overall_minutes(res_v, valid=lambda o: is_report_valid(o, p, names_full),          # 有效觀測優先（同一判定）
                             prefer=lambda o: has_pcs_temp(o, p),                              # 與階段頁同一選樣優先條件
                             phase=lambda o: overall_phase(o, names_full),                     # 不跨語意；沒有 → 原規則
                             ext_scope="minute")              # 四個極值＝完整日曆分鐘（一般欄位仍為最後語意範圍）
+    orows = pad_excluded_minutes(orows, res, spans)    # 中止階段排除：保留完整原始時間軸（頭尾補 N/A）
     n_rows["overall"] = len(orows)
 
     def overall_remark(mr):
         if mr.obs is None:
+            hit = [st for t0, t1, st in spans if mr.T <= t1 and mr.T + timedelta(minutes=1) > t0]
+            if hit:
+                return "N/A：已排除中止階段（" + "、".join(f"{st.dir_name}，開始 {fmt_t(st.start.t, True)}" for st in hit) + "）"
             return f"N/A：{mr.na_reason}"
         if not has_hmi_values(mr.obs):          # 該分鐘內只有僅 6161 溫度的觀測
             return f"N/A：{R_NO_HMI}，僅有 6161 溫度"
@@ -1006,20 +1115,21 @@ def build_workbook(res, meta):
 
     shots = meta.get("screenshots")
     show_final = not is_cycle_test(meta)           # 循環測試：兩個截圖頁都不顯示「認證結束（最後狀態）」
-    _write_overview(ws_ov, res.stages, names, shots, show_final)
-    _write_heat(ws_heat, res.stages, names, shots, show_final)
-    _write_summary(wb, ws_sum, res, names_full, sheet_of, n_rows, meta, p)
+    _write_overview(ws_ov, kept, names, shots, show_final)
+    _write_heat(ws_heat, kept, names, shots, show_final)
+    _write_summary(wb, ws_sum, dataclasses.replace(res_v, stages=kept), names_full, sheet_of, n_rows, meta, p)
     # 「控制紀錄」頁已自報告移除；commands.jsonl 仍由 cert_runtime 照常記錄（不影響控制流程／稽核）
     grid = (meta.get("sampling_slots") or {}).get("grid")
-    rs = raw_second_rows(res, grid, names_full) if grid else None
+    rs = exclude_stopped_raw_rows(raw_second_rows(res, grid, names_full), excluded, spans) if grid else None
     if rs is None:
-        _write_raw(wb.create_sheet("Raw Data"), res, names_full, p)
+        _write_raw(wb.create_sheet("Raw Data"), res_v, names_full, p)
         if grid:
             wb._cert_raw_note = ("Raw Data：本認證的格點不是全部 1 秒間隔（或沒有任何格點）→ 維持只列實際有效觀測的格式"
                                  "（不補秒、不沿用）。")
     else:
         write_raw_seconds(wb, rs, p, names_full)            # M-S2 r2：每秒一列（整筆沿用）；取代 Sampling Slots 工作表
         wb._cert_raw_note = raw_seconds_note(rs)
+    wb._cert_stopped_notes = stopped_notes(kept, excluded, spans, rs)
     return wb
 
 
@@ -1095,6 +1205,7 @@ def raw_second_rows(res, grid, names=None):
         return None
     for r in out["rows"]:
         r["obs"] = ref2obs.get(r["src"]) if r["src"] is not None else None
+        r["live"] = r["state"] == RD.RAW_LIVE          # 內部判斷用（中止階段排除）；不輸出到 Excel
     out["stats"]["unmatched_raw"] = miss
     check_raw_continuity(out["rows"])
     return out
@@ -1111,6 +1222,8 @@ def check_raw_continuity(rows):
 def _raw1_note(r, p):
     """說明欄（r2b）：只放來源觀測本身的設備資訊（分析狀態、電池上下電、傳感器、PCS 模組溫度說明）；
     沿用列＝來源列的說明（整筆沿用）；沒有來源（N/A）→ 空白。不顯示取樣品質／沿用等技術文字（統計在報告描述）。"""
+    if r.get("excluded_src"):                       # 中止階段排除：沿用來源屬排除階段 → 不顯示來源資訊
+        return EXCL_SRC_NOTE
     o = r.get("obs")
     parts = []
     if o is not None:
@@ -1188,8 +1301,23 @@ def raw_seconds_note(rs):
     import report_display as RD
     s, rows = rs["stats"], rs["rows"]
     c = s["counts"]
+    ex = rs.get("excluded")
+    if ex:                                          # 中止階段排除：依實際輸出列重算各狀態秒數與資料年齡
+        c = {k: 0 for k in RD.RAW_STATES}
+        ages, unk = [], 0
+        for r in rows:
+            c[RD.RAW_NA if r.get("excluded_src") else r["state"]] += 1
+            if r.get("obs") is not None or r["state"] == RD.RAW_LIVE:
+                if r.get("age") is None:
+                    unk += 1
+                else:
+                    ages.append(r["age"])
+        s = dict(s, max_age=max(ages) if ages else None, age_unknown=unk)
+    cont = ("秒數連續不重複；" if not ex else
+            f"秒數不重複；已排除中止階段 {ex['rows_dropped']} 列（排除時段不列出）、"
+            f"{ex['rows_blanked']} 列沿用中止階段讀值改為 N/A；")
     span = f"{rows[0]['time']:%Y-%m-%d %H:%M:%S}～{rows[-1]['time']:%Y-%m-%d %H:%M:%S}" if rows else "—"
-    txt = (f"Raw Data（1 秒格點認證）：每秒一列，共 {len(rows)} 列（{span}），秒數連續不重複；"
+    txt = (f"Raw Data（1 秒格點認證）：每秒一列，共 {len(rows)} 列（{span}），{cont}"
            "沒有新的有效量測時整筆沿用最近一筆有效量測（沿用值不是新量測；Excel 不另外標示，各狀態秒數如下；"
            "讀值有效但狀態無法判定者照列真實讀值、狀態顯示 N/A）；"
            + "／".join(f"{k} {c.get(k, 0)}" for k in RD.RAW_STATES)
@@ -1241,10 +1369,13 @@ def save_report(res, meta, path):
     if raw_note:                                   # M-S2 r2：Raw Data 每秒列摘要放在格點品質之後（避免描述長度上限截掉）
         at = next((i + 1 for i, n in enumerate(notes) if str(n).startswith("格點品質：")), len(notes))
         notes.insert(at, raw_note)
+    notes += getattr(wb, "_cert_stopped_notes", [])  # 中止階段排除說明（必須在計次描述之前：r8 X10 要求計次描述在最後）
     notes += stage_count_notes(res)                # H2：只有 stage_count 歷史／孤兒時才有內容（否則描述不變）
     if notes:
         wb.properties.description = "\n".join(str(n) for n in notes)[:3000]
         wb.properties.title = "充／放電認證測試報告"
+    if meta.get(EXCLUDE_STOPPED_KEY):              # 新格式識別（category 目前無其他用途；dec_v1 keywords 不變）
+        wb.properties.category = STOPPED_FORMAT
     dec_sha = getattr(res, "dec_sha256", "")
     if dec_sha:                                    # H2 dec_v1：分析所用決策快照的指紋
         wb.properties.keywords = decisions_keywords(res.dec_n, dec_sha)

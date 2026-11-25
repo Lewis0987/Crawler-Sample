@@ -2368,7 +2368,7 @@ class CertRuntime:
     # ---- 報告 ----------------------------------------------------------------
     def generate_report(self, cid):
         """產生新報告檔（不覆蓋舊檔）。回傳 (ok, 訊息, 路徑)。失敗不動資料。"""
-        from cert_report_xlsx import save_report
+        from cert_report_xlsx import EXCLUDE_STOPPED_KEY, save_report
         from cert_screenshot import load_manifest
         folder = os.path.join(self.root, cid)
         # BUG-1：狀態來源 —— 目前認證用鎖內記憶體快照；其他認證讀磁碟且必須可確認，否則不產報、不寫入任何檔案。
@@ -2445,7 +2445,8 @@ class CertRuntime:
                                    f"硬體概述：{hardware_txt}",
                                    f"測試條件：{ti.get('conditions') or '（未輸入）'}"],
                     "source_notes": notes, "cabinet_spec": ti.get("cabinet_spec"), "cycles": ti.get("cycles"),
-                    "commands": meta_cmds}
+                    "commands": meta_cmds,
+                    EXCLUDE_STOPPED_KEY: True}                   # 報告優化：有效 Flag 為「中止」的階段不列入報告（原始資料不變）
             if os.path.exists(os.path.join(folder, "screenshots.jsonl")) or os.path.isdir(os.path.join(folder, "screenshots")):
                 hl, _evs = HL.replay(rt.records, rt.p["GAP_G_SEC"], CFG.CERT_HEAT_LINK_ALERT_SEC)
                 meta["screenshots"] = {"folder": folder, "records": load_manifest(folder), "note": self.shot_note,

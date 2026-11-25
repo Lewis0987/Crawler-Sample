@@ -6,6 +6,7 @@
 名稱固定「資料值驗證」：只涵蓋儲存格值、公式文字、工作表結構、表格與指定中繼資料；圖表、圖片、注入圖形與格式不在範圍。
 原始參數可追溯性另欄記錄（第一版一律 UNVERIFIABLE），不影響資料值驗證結果。
 """
+import dataclasses
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from cert_report_xlsx import (LOG_KEYS, RAW1_HEADERS, _raw1_note, _sheet_name, _
                               pcs_display, raw_measurement_valid, stage_count_notes)
 from cert_report_xlsx import TITLE_FILL, _slot_title, _title_cols, screenshot_slots   # r8 FMT：H2 標題底色規則（唯讀使用）
 from cert_stage_engine import decisions_digest, stage_names
+from cert_report_xlsx import STOPPED_FORMAT, _stage_key, exclude_stopped_raw_rows, split_stopped   # 中止階段排除格式相容（r8 補充）
 
 RAW_VALUE_KEYS = LOG_KEYS + ["power_kw"]          # 與 write_raw_seconds 相同順序：SOC～功率 kW（RAW1 第 3～12 欄）
 
@@ -85,6 +87,15 @@ def report_list(folder, cid, state, sha256_file):
     if base:
         base["is_baseline"] = True
     return out, base
+
+
+def report_format(path):
+    """原始報告格式識別（活頁簿屬性 category）：""＝舊格式（完整階段）；STOPPED_FORMAT＝中止階段排除；其他值原樣回傳（不支援）。"""
+    wb = load_workbook(path, read_only=True)
+    try:
+        return wb.properties.category or ""
+    finally:
+        wb.close()
 
 
 # =============================================================================
@@ -286,6 +297,11 @@ def verify_session(sa, detail_path, rs, sha256_file, *, bd=None, base_target=Non
         if RAW_PREFIX not in wo.sheetnames or \
                 [c.value for c in next(wo[RAW_PREFIX].iter_rows(min_row=1, max_row=1))] != RAW1_HEADERS:
             return _final(out, UNVERIFIABLE, "來源版本過舊或格式不支援（Raw Data 不是 13 欄格式）")
+        fmt = wo.properties.category or ""
+        out["report_format"] = fmt
+        if fmt not in ("", STOPPED_FORMAT):                                          # 未知格式識別：不猜測
+            return _final(out, UNVERIFIABLE, f"原始報告格式識別不支援（category＝{fmt!r}）")
+        new_fmt = fmt == STOPPED_FORMAT
         ok_base = bd is not None and bd["snapshot"] in (SNAP_CONFIRMED, SNAP_PRESUMED)
         out["decision_verification"] = {k: bd[k] for k in ("path", "snapshot", "reason", "trace", "evidence",
                                                             "added_lines")} if bd else None
@@ -315,6 +331,9 @@ def verify_session(sa, detail_path, rs, sha256_file, *, bd=None, base_target=Non
                 continue
             kind = "V-O" if name in VALUE_SHEETS_O else "V-S"
             out["items"].append(_cmp_sheet(kind, name, wo[name], wt[name], newer if kind == "V-S" else (newer or x8)))
+        if new_fmt:                                  # 新格式：Raw Data 與 build_workbook 同一排除規則（共用函式）
+            _k, _x, _sp = split_stopped(sa_t["res"], True)
+            rs_t = exclude_stopped_raw_rows(rs_t, _x, _sp)
         out["items"].append(_cmp_raw(wo, wt, rs_t, sa_t))
         out["items"].append(_cmp_desc(wo.properties.description or "", wt.properties.description or ""))
         out["items"].append(_cmp_title(wo.properties.title, wt.properties.title))
@@ -323,7 +342,7 @@ def verify_session(sa, detail_path, rs, sha256_file, *, bd=None, base_target=Non
         step1 = [i["result"] for i in out["items"] if i["item"] != "D-S 決策快照一致性"]
         out["reproducibility"] = FAILED if FAILED in step1 else (UNVERIFIABLE if UNVERIFIABLE in step1 else VERIFIED)
         if ok_base and bd["added"]:                                                  # 第二階段：差異歸因
-            item, changes = attribute(sa_t, wt, sa, wn, bd)
+            item, changes = attribute(sa_t, wt, sa, wn, bd, new_fmt=new_fmt)
             out["items"].append(item)
             out["change_list"] = changes
     finally:
@@ -511,7 +530,7 @@ def _compare_title_sheet(name, A, B, allowed, renamed_ok):
     return problems, cells
 
 
-def attribute(sa_b, wb_b, sa_a, wb_a, bd):
+def attribute(sa_b, wb_b, sa_a, wb_a, bd, new_fmt=False):
     """
     新增決策只有 stage_label／stage_count：差異只能是由 H2 規則推導的名稱（頁籤、標題、各頁名稱字串）與
     X10 計次描述；任何數值、列數、結構、非計次描述差異 → FAILED（DECISION_DIFF_OUT_OF_SCOPE）。
@@ -525,6 +544,16 @@ def attribute(sa_b, wb_b, sa_a, wb_a, bd):
                for ln, d in zip(bd["added_lines"], added)]
     structural = any(d.get("type", "continuity") not in NAME_ONLY_TYPES for d in added)
     rb, ra = sa_b["res"], sa_a["res"]
+    rb_full, ra_full = rb, ra                       # X10（計次描述、歷史、孤兒）依完整 Result（與 save_report 相同）
+    if new_fmt:                                     # 新格式：名稱／頁籤／FMT 依排除後的有效階段推導（共用 split_stopped）
+        kb, xb, _sb = split_stopped(rb, True)
+        ka, xa, _sa = split_stopped(ra, True)
+        if [_stage_key(s) for s in xb] != [_stage_key(s) for s in xa]:
+            item.update(result=UNVERIFIABLE, reason_code="STOPPED_STAGE_SET_CHANGED",
+                        detail={"stopped_base": [_stage_key(s) for s in xb], "stopped_all": [_stage_key(s) for s in xa],
+                                "note": "新增決策改變中止階段集合 → 結構差異無法依 r8 名稱規則歸因（不放寬）"})
+            return item, changes
+        rb, ra = dataclasses.replace(rb, stages=kb), dataclasses.replace(ra, stages=ka)
     problems, x10 = [], {}
     nb, na = stage_names(rb.stages), stage_names(ra.stages)
     # 頁籤／名稱推導（H2 _sheet_name／_stage_title；名稱對照依 Stage.no，原始 Stage.no 不變）
@@ -611,7 +640,7 @@ def attribute(sa_b, wb_b, sa_a, wb_a, bd):
             problems.append("活頁簿標題不同")
         # X10：計次描述（各自依 R_base／R_all 的有效決策集合重算，逐字一致；非計次描述不得變動）
         db, da = wb_b.properties.description or "", wb_a.properties.description or ""
-        cb, ca = stage_count_notes(rb), stage_count_notes(ra)
+        cb, ca = stage_count_notes(rb_full), stage_count_notes(ra_full)
         x10 = {"expected_base": cb, "expected_all": ca, "truncated_3000": len(db) >= 3000 or len(da) >= 3000}
         if x10["truncated_3000"]:
             item.update(result=UNVERIFIABLE, reason_code="X10_TRUNCATED")
@@ -622,8 +651,8 @@ def attribute(sa_b, wb_b, sa_a, wb_a, bd):
                 problems.append("計次描述與依決策集合重算的內容不一致（X10）")
             elif restb != resta:
                 problems.append("非計次描述行改變（X10 不吸收；含實際分析參數說明）")
-            hb = {s.no: [_hist_key(h) for h in getattr(s, "count_history", None) or []] for s in rb.stages}
-            ha = {s.no: [_hist_key(h) for h in getattr(s, "count_history", None) or []] for s in ra.stages}
+            hb = {s.no: [_hist_key(h) for h in getattr(s, "count_history", None) or []] for s in rb_full.stages}
+            ha = {s.no: [_hist_key(h) for h in getattr(s, "count_history", None) or []] for s in ra_full.stages}
             for no, h in hb.items():
                 if ha.get(no, [])[:len(h)] != h:
                     problems.append(f"階段 {no} 原有計次決策歷史遺失或改變")

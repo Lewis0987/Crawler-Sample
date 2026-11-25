@@ -20,7 +20,7 @@ import cert_heat_link as HL
 import cert_report_config as CFG
 import cert_supplement as SUP
 import report_quality as RQ
-from cert_report_xlsx import save_report
+from cert_report_xlsx import EXCLUDE_STOPPED_KEY, STOPPED_FORMAT, save_report
 from cert_screenshot import load_manifest
 
 DETAIL_TITLE = "重產明細（非原始認證紀錄）"
@@ -215,6 +215,14 @@ def build_sampling_slots(folder):
 # <<< BUILD_SAMPLING_SLOTS
 
 
+def _baseline_format(folder, st):
+    """原始比較基準報告的格式識別（活頁簿 category）；沒有基準 → ""（舊規則）。未知值原樣回傳（驗證端判 UNVERIFIABLE）。"""
+    import cert_merge_source as SRC
+    import cert_merge_verify as VF
+    _reps, base = VF.report_list(folder, st.get("cert_id"), st, SRC.sha256_file)
+    return VF.report_format(base["path"]) if base else ""
+
+
 def detail_meta(sa, disclaimer):
     """對照 cert_runtime.generate_report 的 meta 組裝（rt＝離線 runtime；extra_notes＝[重產聲明]；shot_note＝""）。"""
     folder = sa["data"]["folder"]
@@ -252,6 +260,7 @@ def detail_meta(sa, disclaimer):
                            f"測試條件：{ti.get('conditions') or '（未輸入）'}"],
             "source_notes": notes, "cabinet_spec": ti.get("cabinet_spec"), "cycles": ti.get("cycles"),
             "commands": meta_cmds}
+    meta[EXCLUDE_STOPPED_KEY] = _baseline_format(folder, st) == STOPPED_FORMAT   # 依原始報告格式選擇重產規則（r8 補充）
     supp = SUP.has_supplements(folder)
     if os.path.exists(os.path.join(folder, "screenshots.jsonl")) or os.path.isdir(os.path.join(folder, "screenshots")):
         hl, _evs = HL.replay(records, p["GAP_G_SEC"], CFG.CERT_HEAT_LINK_ALERT_SEC)
