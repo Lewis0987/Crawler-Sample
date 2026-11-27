@@ -692,19 +692,26 @@ check(f"#5c pause 後 finalize → completed，session_end / finalize_ok 各 1 �
       and ev5c2.count("finalize_ok") == 1
       and ev5c2.count("recording_pause") == 1)
 
-# (d) 重複收尾：守門在**監看層**，不在 ReportSession
-#     ReportSession.finalize() 是低層原始操作，本身不守門 —— 直接連呼兩次會寫兩筆。
-#     產品路徑不會二次到達，因為 _stop_and_finalize 以 stopping / finalized 旗標守門。
+# (d) 重複收尾（2026-11-26 規格變更：Session State Atomic Persistence Bugfix M-2，使用者核准）
+#     原規格：低層 ReportSession.finalize() 連呼兩次允許寫入兩筆收尾紀錄（守門只在監看層）。
+#     新規格：成功完成的 Session 再次呼叫 finalize() 不得重複收尾、不得新增第二筆 session_end；
+#             物件層與監看層（stopping / finalized 旗標＋Session 身分）雙重守門。
 s5d, _ = mk_session()
 advance(s5d, 3)
 with contextlib.redirect_stdout(io.StringIO()):
-    s5d.finalize("auto_stop")
-    s5d.finalize("auto_stop")
+    _r5d1 = s5d.finalize("auto_stop")
+_files5d = [os.path.join(s5d.folder, n) for n in (CFG.FILE_SAMPLES, CFG.FILE_EVENTS, CFG.FILE_SESSION_STATE, CFG.FILE_XLSX)]
+_sha5d = lambda: [hashlib.sha256(open(f, "rb").read()).hexdigest() if os.path.exists(f) else None for f in _files5d]   # noqa: E731
+_h5d1 = _sha5d()
+with contextlib.redirect_stdout(io.StringIO()):
+    _r5d2 = s5d.finalize("auto_stop")
 ev5d = [r["event_type"] for r in rows(s5d.folder, CFG.FILE_EVENTS)]
-check(f"#5d 低層 ReportSession.finalize() 連呼兩次 → 寫入兩筆"
+check(f"#5d 低層 ReportSession.finalize() 連呼兩次 → 第一次正常完成、第二次被拒絕（不重複收尾）"
       f"（session_end {ev5d.count('session_end')} / "
-      f"finalize_ok {ev5d.count('finalize_ok')}）—— 守門不在此層，鎖定現況",
-      ev5d.count("session_end") == 2 and ev5d.count("finalize_ok") == 2)
+      f"finalize_ok {ev5d.count('finalize_ok')}；samples／events／狀態檔／report.xlsx 未被第二次呼叫修改）",
+      _r5d1 is not None and _r5d2 is None and state(s5d.folder).get("status") == CFG.SESSION_COMPLETED
+      and ev5d.count("session_end") == 1 and ev5d.count("finalize_ok") == 1 and _sha5d() == _h5d1
+      and _h5d1[3] is not None)
 check("#5d _stop_and_finalize docstring 明載 idempotent（守門位置）",
       "idempotent" in (RM._stop_and_finalize.__doc__ or ""))
 

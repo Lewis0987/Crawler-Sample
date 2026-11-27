@@ -253,8 +253,218 @@ def _parse_dt(s):
         return None
 
 
-def find_active_session(output_root):
-    """回傳最近一個未完成（status=recording/paused）的 session 資料夾；無則 None。"""
+# =====================================================================
+# Session State Atomic Persistence（session_state.json 專用；其他 JSON 檔維持原寫法）
+# ---------------------------------------------------------------------
+# 原子寫入：同目錄唯一暫存檔 → 完整 JSON → flush（可選 fsync）→ 關檔 → os.replace。
+#   讀取端只會讀到「舊的完整檔」或「新的完整檔」，不會讀到清空中／寫一半的內容。
+#   ⚠️ 原子替換 ≠ 斷電持久性保證（是否 fsync 由 STATE_WRITE_FSYNC 決定，依離線量測裁定）。
+# 替換失敗：只對暫時性存取錯誤重試；總嘗試 STATE_WRITE_MAX_ATTEMPTS 次（首次＋重試）；
+#   失敗保留原本完整的狀態檔、只清除本次暫存檔、回報失敗（絕不退回清空後直接寫入）。
+# =====================================================================
+STATE_WRITE_FSYNC = True                       # 依離線量測裁定（見 BUG 驗收報告）
+STATE_WRITE_MAX_ATTEMPTS = 5                   # 總嘗試次數（第 1 次＋最多 4 次重試）
+STATE_WRITE_RETRY_SLEEP_SEC = (0.05, 0.1, 0.1, 0.1)   # 第 1～4 次重試前的等待
+_STATE_TRANSIENT_WINERRORS = (5, 32, 33)       # 存取被拒／檔案使用中／部分鎖定（Windows）
+_state_replace = os.replace                    # 測試可替換（失敗注入）
+_state_fsync = os.fsync
+# M-6：收尾第①階段取得共用 client 鎖的上限（秒）。逾時 → 結束狀態標示「未取得」（不讀 HMI、不捏造、
+# 不以最後一筆取樣冒充），以已保留的有效原始資料繼續收尾。⚠️ 只限制「等鎖」；取得鎖後的 HMI 讀取
+# （read_all）仍無整體 deadline，故完整收尾**沒有**硬性時間上限。
+FINALIZE_CLIENT_LOCK_TIMEOUT_SEC = 10
+
+STATE_OK, STATE_MISSING, STATE_PARSE_ERROR, STATE_IO_ERROR, STATE_INVALID = (
+    "OK", "MISSING", "PARSE_ERROR", "IO_ERROR", "INVALID")
+
+
+class SessionStateError(Exception):
+    """Session 狀態無法確認或無法安全持久化（呼叫端既有的例外處理會中止續接／建立）。"""
+
+
+def _session_state_lock(sess):
+    """取得 Session 物件的私有鎖（離線替身物件沒有時就地建立）。"""
+    lk = getattr(sess, "_state_lock", None)
+    if lk is None:
+        lk = threading.RLock()
+        try:
+            sess._state_lock = lk
+        except AttributeError:
+            pass
+    return lk
+
+
+def _state_transient(exc):
+    return isinstance(exc, OSError) and getattr(exc, "winerror", None) in _STATE_TRANSIENT_WINERRORS
+
+
+def write_json_atomic(path, obj, fsync=None, metrics=None):
+    """
+    原子寫入 JSON（格式與 json.dump(obj, f, ensure_ascii=False, indent=2) 完全相同）。
+    回傳 (ok, err)；metrics（dict）會填入各段耗時（ms）與嘗試次數。
+    """
+    fsync = STATE_WRITE_FSYNC if fsync is None else fsync
+    m = {"serialize_ms": 0.0, "write_flush_ms": 0.0, "fsync_ms": 0.0, "replace_ms": [],
+         "retry_sleep_ms": 0.0, "attempts": 0, "fsync": bool(fsync)}
+    tmp = None
+    try:
+        t0 = time.perf_counter()
+        data = json.dumps(obj, ensure_ascii=False, indent=2)
+        m["serialize_ms"] = (time.perf_counter() - t0) * 1000
+        d, base = os.path.split(os.path.abspath(path))
+        tmp = os.path.join(d, f".{base}.{os.getpid()}.{threading.get_ident()}.{os.urandom(4).hex()}.tmp")
+        t0 = time.perf_counter()
+        with open(tmp, "x", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            m["write_flush_ms"] = (time.perf_counter() - t0) * 1000
+            if fsync:
+                t1 = time.perf_counter()
+                _state_fsync(f.fileno())
+                m["fsync_ms"] = (time.perf_counter() - t1) * 1000
+        while True:
+            m["attempts"] += 1
+            t0 = time.perf_counter()
+            try:
+                _state_replace(tmp, path)
+                m["replace_ms"].append((time.perf_counter() - t0) * 1000)
+                tmp = None                         # 已成為正式檔
+                break
+            except OSError as e:
+                m["replace_ms"].append((time.perf_counter() - t0) * 1000)
+                if m["attempts"] < STATE_WRITE_MAX_ATTEMPTS and _state_transient(e):
+                    w = STATE_WRITE_RETRY_SLEEP_SEC[min(m["attempts"] - 1, len(STATE_WRITE_RETRY_SLEEP_SEC) - 1)]
+                    time.sleep(w)
+                    m["retry_sleep_ms"] += w * 1000
+                    continue
+                raise
+        return True, None
+    except Exception as e:                         # noqa: BLE001 —— 一律回報失敗（不吞成成功）
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        if tmp is not None:                        # 只清除本次建立的暫存檔
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+        if isinstance(metrics, dict):
+            metrics.clear()
+            metrics.update(m)
+
+
+def read_session_state(path, retries=3, delay=0.1):
+    """
+    讀 session_state.json 並分類：(STATE_*, dict|None)。
+      MISSING：檔案不存在；PARSE_ERROR：JSON 解析失敗；IO_ERROR：檔案暫時無法讀取；
+      INVALID：JSON 正常但不符規格（非 dict、session_id 非空字串、status 不在 recording/paused/completed）；
+      OK：其他欄位一律可缺（舊版 Session 相容）。PARSE_ERROR／IO_ERROR 會短暫重試 retries 次。
+    """
+    kind, obj = STATE_MISSING, None
+    for i in range(max(1, retries + 1)):
+        if not os.path.exists(path):
+            return STATE_MISSING, None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+        except ValueError:
+            kind = STATE_PARSE_ERROR
+        except OSError:
+            kind = STATE_IO_ERROR
+        else:
+            if (isinstance(obj, dict) and isinstance(obj.get("session_id"), str) and obj.get("session_id")
+                    and obj.get("status") in (CFG.SESSION_RECORDING, CFG.SESSION_PAUSED, CFG.SESSION_COMPLETED)):
+                return STATE_OK, obj
+            return STATE_INVALID, obj
+        if i < retries:
+            time.sleep(delay)
+    return kind, None
+
+
+# 收尾證據（只讀 events.csv；只看最後一次 recording_resume 之後的紀錄）
+EVID_NO_END, EVID_END_ONLY, EVID_END_OK, EVID_END_PARTIAL, EVID_UNRELIABLE = (
+    "no_end", "end_only", "end_ok", "end_partial", "unreliable")
+
+
+def session_end_evidence(folder):
+    """
+    依 events.csv 判斷收尾證據：
+      no_end      最後一段沒有 session_end、也沒有 finalize_*（仍在錄製或暫停）
+      end_only    有 session_end、其後沒有 finalize_*（收尾中斷）
+      end_ok      session_end 之後有 finalize_ok（最後一筆收尾事件）
+      end_partial session_end 之後有 finalize_partial
+      unreliable  events.csv 不存在／無法讀取／最後一行不完整／事件順序異常
+    最後一行不完整（檔尾無換行）→ 一律 unreliable（不得因略過該行而判定為已完成）。
+    """
+    p = os.path.join(folder, CFG.FILE_EVENTS)
+    try:
+        with open(p, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return EVID_UNRELIABLE
+    if not raw or not raw.endswith(b"\n"):
+        return EVID_UNRELIABLE
+    try:
+        text = raw.decode("utf-8-sig")
+        rows = list(csv.DictReader(text.splitlines()))
+    except (UnicodeDecodeError, csv.Error):
+        return EVID_UNRELIABLE
+    types = [str(r.get("event_type") or "") for r in rows]
+    if any(not t for t in types):
+        return EVID_UNRELIABLE
+    last_resume = max((i for i, t in enumerate(types) if t == "recording_resume"), default=-1)
+    seg = types[last_resume + 1:]
+    ends = [i for i, t in enumerate(seg) if t == "session_end"]
+    fins = [i for i, t in enumerate(seg) if t in ("finalize_ok", "finalize_partial")]
+    if not ends:
+        return EVID_UNRELIABLE if fins else EVID_NO_END
+    if fins and min(fins) < ends[0]:
+        return EVID_UNRELIABLE                     # finalize_* 出現在 session_end 之前：順序異常
+    after = [i for i in fins if i > ends[-1]]
+    if not after:
+        return EVID_END_ONLY
+    return EVID_END_OK if seg[after[-1]] == "finalize_ok" else EVID_END_PARTIAL
+
+
+def classify_session_folder(folder):
+    """
+    回傳 (kind, detail)：
+      none        不是 Session（沒有狀態檔，也沒有 samples.csv／events.csv）
+      completed   狀態檔 OK 且 completed
+      resumable   狀態檔 OK（recording／paused）且沒有收尾證據 → 可依既有流程續接
+      finalized_ok／finalized_partial  有可靠收尾證據但狀態未標記 completed（或狀態檔損壞）→ 不續接、不阻擋新建
+      unknown     無法確認（收尾中斷、缺狀態檔但有資料、狀態檔異常且無可靠收尾證據、事件不可靠）
+    """
+    kind, st = read_session_state(os.path.join(folder, CFG.FILE_SESSION_STATE))
+    if kind == STATE_MISSING:
+        if any(os.path.exists(os.path.join(folder, n)) for n in (CFG.FILE_SAMPLES, CFG.FILE_EVENTS)):
+            return "unknown", "missing_state_with_data"
+        return "none", ""
+    if kind == STATE_OK and st.get("status") == CFG.SESSION_COMPLETED:
+        return "completed", ""
+    ev = session_end_evidence(folder)
+    if kind == STATE_OK:
+        if ev == EVID_NO_END:
+            return "resumable", st.get("status")
+        if ev == EVID_END_OK:
+            return "finalized_ok", "session_end+finalize_ok；completed 狀態未寫入"
+        if ev == EVID_END_PARTIAL:
+            return "finalized_partial", "session_end+finalize_partial；completed 狀態未寫入；報告部分產出"
+        if ev == EVID_END_ONLY:
+            return "unknown", "finalize_interrupted（有 session_end、沒有 finalize_ok／finalize_partial）"
+        return "unknown", f"events_{ev}"
+    if ev == EVID_END_OK:
+        return "finalized_ok", f"狀態檔 {kind}；events 有 session_end+finalize_ok（歷史資料，未修改）"
+    if ev == EVID_END_PARTIAL:
+        return "finalized_partial", f"狀態檔 {kind}；events 有 session_end+finalize_partial（歷史資料，未修改）"
+    return "unknown", f"state_{kind}；events_{ev}"
+
+
+def find_active_session(output_root, checked=False):
+    """回傳最近一個未完成（status=recording/paused）的 session 資料夾；無則 None。
+    checked=True（建立／續接入口專用）→ 回傳 (folder|None, unknown[(folder, 原因)], warnings[(folder, 說明)])：
+      依 classify_session_folder 判斷；無法確認的資料夾由呼叫端拒絕新建與續接（不刪除、不修復）。"""
+    if checked:
+        return _find_active_session_checked(output_root)
     if not os.path.isdir(output_root):
         return None
     cands = []
@@ -267,6 +477,27 @@ def find_active_session(output_root):
             except OSError:
                 pass
     return max(cands)[1] if cands else None
+
+
+def _find_active_session_checked(output_root):
+    cands, unknown, warns = [], [], []
+    if not isinstance(output_root, str) or not os.path.isdir(output_root):
+        return None, unknown, warns
+    for name in sorted(os.listdir(output_root)):
+        folder = os.path.join(output_root, name)
+        if not os.path.isdir(folder):
+            continue
+        kind, detail = classify_session_folder(folder)
+        if kind == "resumable":
+            try:
+                cands.append((os.path.getmtime(folder), folder))
+            except OSError:
+                unknown.append((folder, "mtime_unavailable"))
+        elif kind == "unknown":
+            unknown.append((folder, detail))
+        elif kind in ("finalized_ok", "finalized_partial"):
+            warns.append((folder, detail))
+    return (max(cands)[1] if cands else None), unknown, warns
 
 
 _GIT_COMMIT_CACHE = None
@@ -2471,6 +2702,18 @@ class ReportSession:
         self._last_rack_min = None           # Rack 最低溫 fallback
         # 設備今日累計充/放電量（API 直接值，取最新一筆有效；僅供 Summary 對照，不參與能量積分）
         self.device_daily = {"charge": None, "discharge": None}
+        # Session State Atomic Persistence：物件內私有鎖（只包「接受資料判斷＋資料提交／狀態轉移＋狀態檔寫入」；
+        # 不包網路讀取；持鎖期間不取得 _CLIENT_LOCK／_SESSION_LOCK）。
+        self._state_lock = threading.RLock()
+        self._accepting = True              # False＝已暫停／收尾：遲到取樣一律捨棄（不寫任何紀錄）
+        self._finalizing = False            # 收尾中／已收尾：同一 Session 不得同時走兩條收尾路徑
+        self.state_persist_ok = True        # 最近一次狀態檔寫入是否成功
+        self.state_persist_error = None
+        self.state_write_failures = 0
+        self.state_write_metrics = {}
+        self.late_samples_discarded = 0
+        self.last_transition_error = None
+        self.end_state_unavailable = None   # M-6：結束狀態未取得的原因（None＝已取得或尚未收尾）
 
         if state is None:
             # ---------- 新 Session ----------
@@ -2514,9 +2757,15 @@ class ReportSession:
         self.monitor = SafetyMonitor(self.target_power_kw)
 
     @classmethod
-    def resume(cls, folder, client, now_fn=None):
-        """由 session_state.json 續接既有 Session。"""
-        state = _load_json_file(os.path.join(folder, CFG.FILE_SESSION_STATE)) or {}
+    def resume(cls, folder, client, now_fn=None, allow_completed=False):
+        """由 session_state.json 續接既有 Session。
+        狀態檔無法確認（MISSING／PARSE_ERROR／IO_ERROR／INVALID）→ SessionStateError（不以空內容續接）；
+        completed 只允許補產（allow_completed=True，不 start、不寫入）使用。"""
+        kind, state = read_session_state(os.path.join(folder, CFG.FILE_SESSION_STATE))
+        if kind != STATE_OK:
+            raise SessionStateError(f"Session 狀態檔無法確認（{kind}）：{folder}")
+        if state.get("status") == CFG.SESSION_COMPLETED and not allow_completed:
+            raise SessionStateError(f"Session 已完成（completed），不得續接：{folder}")
         return cls(None, None, None, client, os.path.dirname(folder),
                    now_fn=now_fn, folder=folder, state=state)
 
@@ -2558,7 +2807,9 @@ class ReportSession:
         p0 = (r.get("actual_active_power_kw") if CFG.POWER_SOURCE == "pcs"
               else r.get("calculated_power_kw"))
         self._capture_cell_snapshot(r, d0, p0, "session_start")
-        self._persist_state()
+        if self._persist_state() is False:
+            # 初次建立狀態檔失敗：不啟動取樣（呼叫端既有例外處理會中止）；資料夾保留、不刪除
+            raise SessionStateError(f"初次建立 {CFG.FILE_SESSION_STATE} 失敗：{self.state_persist_error}")
         return r
 
     def _start_resume(self):
@@ -2575,8 +2826,20 @@ class ReportSession:
 
     def sample_once(self):
         elapsed = self._elapsed()
-        self.sample_index += 1               # 持續遞增（跨 resume 不歸零）
-        r = read_all(self.client)
+        r = read_all(self.client)            # 網路讀取：不持有私有鎖
+        with _session_state_lock(self):
+            if not getattr(self, "_accepting", True):
+                # 遲到取樣（暫停／收尾後才返回的背景讀取）：不增序號、不積分、不寫 samples／events／狀態檔，
+                # 不觸發任何後續判定；只走主控台（不修改已暫停／已完成 Session 的原始紀錄）
+                self.late_samples_discarded = getattr(self, "late_samples_discarded", 0) + 1
+                print(f"  [REPORT] 遲到取樣已捨棄（Session {getattr(self, 'session_id', '?')} "
+                      f"狀態={self.status}；未寫入任何紀錄）")
+                return r, None
+            return self._commit_sample(r, elapsed)
+
+    def _commit_sample(self, r, elapsed):
+        """sample_once 的資料提交段（呼叫端已持有私有鎖並確認仍接受資料）。"""
+        self.sample_index += 1               # 持續遞增（跨 resume 不歸零）；提交時才遞增（捨棄的讀值不佔序號）
         power = r.get("actual_active_power_kw") if CFG.POWER_SOURCE == "pcs" else r.get("calculated_power_kw")
         self.energy.add(power, elapsed)      # 以相對秒數積分（dt = elapsed - prev_elapsed）
         # 記錄設備今日累計（API 值；取最新有效，供 Summary 對照，不影響上面的能量積分）
@@ -2818,11 +3081,53 @@ class ReportSession:
         ②③不持鎖 → Excel/CSV/Chart 產出（數秒）期間不再阻塞前景 Dashboard 讀取。
         鎖範圍寫死在此處而非由呼叫端自行包覆，外部就不可能誤把②一起鎖進去。
         未傳入時（standalone run_all / selftest）等同無鎖，行為與 Phase 3.6 相同。
+
+        狀態轉移防護：同一 Session 物件只能收尾一次（收尾中／已完成 → 回傳 None 並記錄原因）；
+        recording 或 paused 皆可合法收尾。開始收尾即停止接受新資料（遲到取樣一律捨棄）。
+        私有鎖只在檢查／標記時短暫持有，不與 client_lock 巢狀持有。
         """
-        with (client_lock if client_lock is not None else _NULL_LOCK):
-            self._prepare_finalize(end_reason)
-        stats = self._write_outputs()
-        self._finalize_cleanup(stats)
+        with _session_state_lock(self):
+            if getattr(self, "_finalizing", False) or (self.status == CFG.SESSION_COMPLETED
+                                                       and getattr(self, "_completed_persisted", True)):
+                self.last_transition_error = (f"finalize 拒絕：Session 已在收尾或已完成"
+                                              f"（status={self.status}）")
+                print(f"  [REPORT] {self.last_transition_error}")
+                return None
+            self._finalizing = True
+            self._accepting = False
+        try:
+            # 合法重試（首次收尾中途失敗）：已完成的步驟不重做 —— session_end／結束狀態已記錄 → 不重讀 HMI、
+            # 不重寫 session_end；finalize_* 已記錄 → 不重產輸出、不重寫事件，只重試標記 completed。
+            if not getattr(self, "_end_logged", False):
+                if client_lock is None:
+                    self._prepare_finalize(end_reason)
+                elif not callable(getattr(client_lock, "acquire", None)):
+                    with client_lock:                      # 僅 context manager 的替身（selftest）
+                        self._prepare_finalize(end_reason)
+                elif client_lock.acquire(timeout=FINALIZE_CLIENT_LOCK_TIMEOUT_SEC):   # M-6：有限等待
+                    try:
+                        self._prepare_finalize(end_reason)
+                    finally:
+                        client_lock.release()
+                else:
+                    self._end_state_unavailable(
+                        end_reason, f"{FINALIZE_CLIENT_LOCK_TIMEOUT_SEC}s 內無法取得共用 client 鎖"
+                                    f"（背景 HMI 讀取可能仍在進行）")
+            if getattr(self, "_finalize_logged", False):
+                stats = getattr(self, "_finalize_stats", None)
+            else:
+                stats = self._write_outputs()
+                self._finalize_stats = stats
+            self._finalize_cleanup(stats)
+            if getattr(self, "_completed_persisted", True) is False:
+                with _session_state_lock(self):       # completed 未寫入狀態檔 → 允許合法重試只補寫 completed
+                    self._finalizing = False
+        except Exception:
+            # 收尾途中失敗：未標記 completed（不得誤判完成）；解除「收尾中」讓合法重試（Menu 19）可再收尾；
+            # 仍維持不接受新資料（遲到取樣不寫入）
+            with _session_state_lock(self):
+                self._finalizing = False
+            raise
         return stats
 
     def _prepare_finalize(self, end_reason):
@@ -2846,7 +3151,27 @@ class ReportSession:
         self.log_event("session_end", "info",
                        f"reason={self.end_reason}({CFG.END_REASON.get(self.end_reason,'')}) "
                        f"samples={len(self.samples)}")
+        self._end_logged = True
         return self.end_state
+
+    def _end_state_unavailable(self, end_reason, why):
+        """
+        M-6：收尾第①階段無法在時限內取得共用 client 鎖 →「結束狀態未取得」。
+        **不**做 HMI 讀取與 session_end Cell 快照；end_state 維持 None（summary 以既有格式顯示 null／N/A），
+        不以最後一筆取樣冒充即時結束狀態、不捏造；最後一筆有效取樣照常保留於 samples。
+        記錄 final_state_unavailable（原因）＋ session_end（標示 end_state=unavailable），
+        之後以已保留的有效原始資料繼續既有收尾流程；③ 一律記 finalize_partial（不回報為成功）。
+        """
+        self.end_reason = end_reason or "unknown"
+        self.end_state = None
+        self.end_state_unavailable = why
+        print(f"  [REPORT] ⚠ 結束狀態未取得：{why} → 不讀取 HMI、不捏造，以已保留的原始資料繼續收尾")
+        self.log_event("final_state_unavailable", "warning", f"結束狀態未取得：{why}")
+        self.log_event("session_end", "info",
+                       f"reason={self.end_reason}({CFG.END_REASON.get(self.end_reason,'')}) "
+                       f"samples={len(self.samples)} end_state=unavailable")
+        self._end_logged = True
+        return None
 
     def _write_outputs(self):
         """
@@ -2870,13 +3195,25 @@ class ReportSession:
         """
         bad = {k: v for k, v in (self.output_status or {}).items()
                if v in (CFG.OUTPUT_FAILED_LOCKED, CFG.OUTPUT_FAILED)}
-        if bad:
-            detail = " ".join(f"{k}={v}" for k, v in sorted(bad.items()))
-            self.log_event("finalize_partial", "warning", f"輸出未全部成功：{detail}")
-        else:
-            self.log_event("finalize_ok", "info", "所有輸出檔產生完成")
-        self.status = CFG.SESSION_COMPLETED
-        self._persist_state(stats)
+        detail = " ".join(f"{k}={v}" for k, v in sorted(bad.items()))
+        _unavail = getattr(self, "end_state_unavailable", None)
+        if not getattr(self, "_finalize_logged", False):   # 合法重試不重複記錄 finalize_*
+            if bad or _unavail:
+                parts = ([f"輸出未全部成功：{detail}"] if bad else []) +                         ([f"結束狀態未取得（end_state=unavailable）：{_unavail}"] if _unavail else [])
+                self.log_event("finalize_partial", "warning", "；".join(parts))
+            else:
+                self.log_event("finalize_ok", "info", "所有輸出檔產生完成")
+            self._finalize_logged = True
+        with _session_state_lock(self):
+            self.status = CFG.SESSION_COMPLETED
+            self._completed_persisted = False
+            _ok = self._persist_state(stats)
+            self._completed_persisted = _ok is not False
+        if _ok is False:
+            # completed 未寫入狀態檔：不得宣稱流程完整成功（events 已有 session_end＋finalize_*，
+            # 下次啟動依收尾證據判定為「已收尾、狀態未寫入」→ 不續接）
+            print(f"  [REPORT] ⚠ 報告已產生，但 {CFG.FILE_SESSION_STATE} 未能標記 completed"
+                  f"（狀態檔仍為上一份完整內容）：{getattr(self, 'state_persist_error', None)}")
         if bad:
             print(f"  [輸出] ⚠ Session 已結束（completed），但下列輸出未成功：{detail}")
             print("         原始資料完整保留；關閉占用該檔的程式後，可用 --regen 補產。")
@@ -2890,14 +3227,36 @@ class ReportSession:
         與 pause() 的差別：pause() 會呼叫 _regenerate_outputs()（重算統計、重寫
         alarms/summary/statistics 與**整份 Excel**，需數秒），不適合放在 atexit。
         兩者都讓 Session 停在 paused，下次啟動皆可由 find_active_session() 續接。
+        狀態轉移防護：只有 recording 且未在收尾時才改為 paused（已 paused／completed／收尾中 → 不改寫）；
+        私有鎖最多等 CFG.ATEXIT_JOIN_TIMEOUT_SEC 秒（atexit 不可卡住），等不到就不寫並回報。
         """
-        self.status = CFG.SESSION_PAUSED
-        self._persist_state()
+        lk = _session_state_lock(self)
+        if not lk.acquire(timeout=max(0.1, float(getattr(CFG, "ATEXIT_JOIN_TIMEOUT_SEC", 2) or 2))):
+            self.last_transition_error = "mark_paused 未取得 Session 鎖（背景提交進行中）→ 未改寫狀態檔"
+            print(f"  [REPORT] {self.last_transition_error}")
+            return self.status
+        try:
+            if self.status != CFG.SESSION_RECORDING or getattr(self, "_finalizing", False):
+                return self.status
+            self._accepting = False
+            self.status = CFG.SESSION_PAUSED
+            self._persist_state()
+        finally:
+            lk.release()
         return self.status
 
     def pause(self):
-        """暫停 Session（status=paused，可續接）並更新報告快照；不寫 session_end。"""
-        self.status = CFG.SESSION_PAUSED
+        """暫停 Session（status=paused，可續接）並更新報告快照；不寫 session_end。
+        狀態轉移防護：只允許 recording → paused（收尾中／已 paused／已 completed → 回傳 None 並記錄原因）；
+        轉為 paused 即停止接受新資料，之後才重產輸出（報告產生後不會再有遲到資料寫入）。"""
+        with _session_state_lock(self):
+            if self.status != CFG.SESSION_RECORDING or getattr(self, "_finalizing", False):
+                self.last_transition_error = (f"pause 拒絕：status={self.status} "
+                                              f"finalizing={getattr(self, '_finalizing', False)}")
+                print(f"  [REPORT] {self.last_transition_error}")
+                return None
+            self._accepting = False
+            self.status = CFG.SESSION_PAUSED
         self.log_event("recording_pause", "info", f"samples={len(self.samples)}")
         return self._regenerate_outputs()
 
@@ -3159,30 +3518,44 @@ class ReportSession:
         return out
 
     def _persist_state(self, stats=None):
-        """寫 session_state.json（供 resume 續接：狀態/起始時間/最後取樣/累積電量/start_state）。"""
-        last = self.samples[-1] if self.samples else {}
-        state = {
-            "session_id": self.session_id,
-            "status": self.status,
-            "action": self.action,
-            "control_mode": self.control_mode_label,
-            "setpoint_value": self.setpoint_value,
-            "start_time": self.start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "last_sample_time": last.get("timestamp"),
-            "last_elapsed_seconds": last.get("elapsed_seconds"),
-            "sample_count": self.sample_index,
-            "cumulative_charge_energy_kwh": round(self.energy.charged_kwh, 4),
-            "cumulative_discharge_energy_kwh": round(self.energy.discharged_kwh, 4),
-            "net_energy_kwh": round(self.energy.net_kwh, 4),
-            "start_state": self.start_state,
-            "device_ip": self.device_ip,
-            "report_version": CFG.REPORT_VERSION,
-            "schema_version": CFG.SCHEMA_VERSION,
-            # 各輸出檔產生結果（Phase 3.7）。completed 只代表 finalize 流程走完，
-            # 輸出是否齊全一律看這裡；summary.json 刻意不加此欄位（不動 Summary schema）。
-            "output_status": dict(getattr(self, "output_status", None) or {}),
-        }
-        self._dump_json(CFG.FILE_SESSION_STATE, state)
+        """寫 session_state.json（供 resume 續接：狀態/起始時間/最後取樣/累積電量/start_state）。
+        原子寫入（write_json_atomic）；組狀態內容與寫入都在私有鎖內 → 寫入順序＝狀態改變順序（舊內容不會蓋掉新內容）。
+        回傳 True／False（失敗時保留上一份完整狀態檔並記錄錯誤，不回報假成功）。"""
+        t0 = time.perf_counter()
+        with _session_state_lock(self):                 # RLock：sample_once／pause／finalize 已持有時可重入（不死結）
+            lock_wait_ms = (time.perf_counter() - t0) * 1000
+            metrics = {}
+            last = self.samples[-1] if self.samples else {}
+            state = {
+                "session_id": self.session_id,
+                "status": self.status,
+                "action": self.action,
+                "control_mode": self.control_mode_label,
+                "setpoint_value": self.setpoint_value,
+                "start_time": self.start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_sample_time": last.get("timestamp"),
+                "last_elapsed_seconds": last.get("elapsed_seconds"),
+                "sample_count": self.sample_index,
+                "cumulative_charge_energy_kwh": round(self.energy.charged_kwh, 4),
+                "cumulative_discharge_energy_kwh": round(self.energy.discharged_kwh, 4),
+                "net_energy_kwh": round(self.energy.net_kwh, 4),
+                "start_state": self.start_state,
+                "device_ip": self.device_ip,
+                "report_version": CFG.REPORT_VERSION,
+                "schema_version": CFG.SCHEMA_VERSION,
+                # 各輸出檔產生結果（Phase 3.7）。completed 只代表 finalize 流程走完，
+                # 輸出是否齊全一律看這裡；summary.json 刻意不加此欄位（不動 Summary schema）。
+                "output_status": dict(getattr(self, "output_status", None) or {}),
+            }
+            ok, err = write_json_atomic(self._path(CFG.FILE_SESSION_STATE), state, metrics=metrics)
+            metrics["lock_wait_ms"] = lock_wait_ms
+            self.state_write_metrics = metrics
+            self.state_persist_ok = ok
+            if not ok:
+                self.state_write_failures = getattr(self, "state_write_failures", 0) + 1
+                self.state_persist_error = err
+                print(f"  [警告] 寫入 {CFG.FILE_SESSION_STATE} 失敗（保留上一份完整狀態檔，未改寫）：{err}")
+            return ok
 
     def _meta(self):
         import platform
@@ -3274,10 +3647,12 @@ class ReportSession:
                 "control_success": None,       # 獨立報告不介入控制 → None
                 "verify_success": None,
                 "data_complete": stats.get("sample_count", 0) > 0
-                                 and stats.get("communication_error_count", 0) == 0,
+                                 and stats.get("communication_error_count", 0) == 0
+                                 and not getattr(self, "end_state_unavailable", None),
                 "stop_recommended": self.stop_recommended,
                 "stop_reasons": self.stop_reasons,
-                "warnings": [],
+                "warnings": ([f"end_state_unavailable：{self.end_state_unavailable}"]
+                             if getattr(self, "end_state_unavailable", None) else []),
             },
         }
         self._dump_json(CFG.FILE_SUMMARY, obj)
@@ -5532,84 +5907,192 @@ def _sync_output_status(folder, output_status):
     if not isinstance(st, dict):
         return False
     st["output_status"] = dict(output_status or {})
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        print(f"  [警告] 更新 {CFG.FILE_SESSION_STATE} 的 output_status 失敗：{e}")
+    ok, err = write_json_atomic(p, st)             # 原子寫入：失敗保留原本完整狀態檔
+    if not ok:
+        print(f"  [警告] 更新 {CFG.FILE_SESSION_STATE} 的 output_status 失敗：{err}")
         return False
     return True
 
 
-def regenerate_report(folder, backup_name=None):
+def _state_fingerprint(st):
+    """補產第二層比對用的狀態指紋（session_id／status／筆數／最後取樣時間）。"""
+    st = st or {}
+    return (st.get("session_id"), st.get("status"), st.get("sample_count"), st.get("last_sample_time"))
+
+
+REGEN_GUARDED_CLI_HINT = 'python test/report_monitor.py --regen "<Session資料夾>"'
+REGEN_LOCK_NAME = ".regen.lock"
+
+
+def _regen_folder_lock(folder):
+    """
+    M-5：同一 Session 資料夾的補產互斥（多個補產程序同時執行時只允許一個；completed 亦適用）。
+    以 OS 檔案位元組鎖（Windows msvcrt.locking；其他平台 fcntl.flock）實作：程序結束時由 OS 自動釋放，
+    不會因異常中斷而永久卡住。回傳 (handle, reason)；handle 為 None 表示未取得（reason 說明原因）。
+    """
+    path = os.path.join(folder, REGEN_LOCK_NAME)
+    try:
+        f = open(path, "a+b")
+    except OSError as e:
+        return None, f"無法建立補產鎖檔：{type(e).__name__}"
+    try:
+        try:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except ImportError:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f, "acquired"
+    except OSError:
+        f.close()
+        return None, "其他補產程序正在處理同一 Session"
+
+
+def _regen_folder_unlock(f, folder):
+    """釋放補產鎖並移除鎖檔（best-effort：其他程序仍開啟該檔時 Windows 會拒絕刪除 → 保留，不影響互斥）。"""
+    try:
+        try:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except ImportError:
+            pass
+    except OSError:
+        pass
+    finally:
+        f.close()
+    if os.name == "nt":
+        try:
+            os.remove(os.path.join(folder, REGEN_LOCK_NAME))
+        except OSError:
+            pass
+
+
+def _regen_precheck(folder, owner_check=None):
+    """
+    M-5（R2）補產前置檢查。回傳 (ok, fingerprint)。本模組**不** import 監看層（report_monitor）。
+      recording        → 一律拒絕
+      狀態無法確認     → 拒絕（不修改任何既有資料）
+      paused           → 必須由持有錄製權限的入口呼叫（owner_check 為呼叫端注入的權限查核函式，
+                         且呼叫當下回傳 True）；原 --regen 指令沒有錄製權限 → 拒絕並提示改用受保護入口
+      completed        → 允許（多程序同時補產由 _regen_folder_lock 互斥）
+    """
+    folder = os.path.abspath(folder)
+    kind, st0 = read_session_state(os.path.join(folder, CFG.FILE_SESSION_STATE))
+    if kind != STATE_OK:
+        print(f"[REGEN] 拒絕補產：Session 狀態無法確認（{kind}）：{folder}")
+        return False, None
+    if st0.get("status") == CFG.SESSION_RECORDING:
+        print(f"[REGEN] 拒絕補產：Session 錄製中（recording）：{folder}")
+        return False, None
+    if st0.get("status") == CFG.SESSION_PAUSED:
+        if owner_check is None:
+            print(f"[REGEN] 拒絕補產：paused Session 需在持有錄製權限下補產，本指令不具錄製權限：{folder}")
+            print(f"        請改用：{REGEN_GUARDED_CLI_HINT}")
+            return False, None
+        if owner_check() is not True:
+            print(f"[REGEN] 拒絕補產：paused Session 需要錄製權限，但呼叫端目前未持有：{folder}")
+            return False, None
+    return True, _state_fingerprint(st0)
+
+
+def regenerate_report(folder, backup_name=None, owner_check=None, meter_csv=None):
     """
     用『唯一的 _write_xlsx』重產指定 session 資料夾的 report.xlsx（與 finalize/selftest 同一函式）。
     - 只讀該資料夾既有 samples.csv / alarms.csv / summary.json / cell_snapshots.json；不連設備、不動原始資料。
     - **不建立新的 session 資料夾**（走 resume 分支，直接在原資料夾內更新 report.xlsx）。
     - 重產前將原 report.xlsx 備份為 backup_name；預設 report_backup_YYYYMMDD_HHMMSS.xlsx（每次一份帶時間戳）。
     - 統計數值沿用 summary.json（不重算、不改變）。
+    - M-5（R2）：前置檢查見 _regen_precheck()；owner_check 只由持有錄製權限的入口
+      （report_monitor.regenerate_report_guarded）注入；同一資料夾的補產程序彼此互斥。
+    - meter_csv：前置檢查與互斥通過後才複製進資料夾（被拒絕時不改動任何既有資料）。
     """
     global _now_str
     folder = os.path.abspath(folder)
-    if not backup_name:
-        backup_name = "report_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".xlsx"
-    summ = _load_json_file(os.path.join(folder, CFG.FILE_SUMMARY))
-    if not summ:
-        print(f"[REGEN] 找不到或無法讀取 summary.json：{folder}")
+    if not os.path.isdir(folder):
+        print(f"[REGEN] 找不到 session 資料夾：{folder}")
         return False
-    stats = summ.get("statistics") or {}
-    sess_blk = summ.get("session") or {}
-
-    sess = ReportSession.resume(folder, object())            # 僅 __init__（不 start、不寫檔）
-    sess.samples = sess._load_all_samples()
-    # 舊報告的 alarms.csv 可能存有未中文化的 i18n key（如 1838F4.soc.underAlarm）。
-    # best-effort：若設備可達，以 Accept-Language: zh-TW 取回中文化告警，依 alarm_id_raw 補譯
-    # 既有紀錄（不改變告警集合）；設備不可達則沿用 CSV 原值（不中斷 regen）。
-    zh_map = _fetch_alarm_zh_map()
-    sess.alarm_tracker.load_existing(sess._load_csv_rows(CFG.FILE_ALARMS), translate_map=zh_map)
-    has_cell_file = os.path.exists(os.path.join(folder, CFG.FILE_CELL_SNAPSHOTS))
-    sess._load_cell_snapshots()                              # 讀回歷史 Cell 快照（不重抓最新值）
-    if not has_cell_file:
-        # Cell 功能之前建立的舊報告：不回填、不產生 Cell 工作表（保持歷史真實性）
-        print(f"[REGEN] 此報告建立時尚未支援 Cell 快照功能（無 {CFG.FILE_CELL_SNAPSHOTS}）"
-              f"→ 不會產生 Cell Volt./Cell Temp.（不以現在的即時值回填歷史）。")
-    sess.start_state = summ.get("start_state") or sess.start_state
-    sess.end_state = summ.get("end_state")
-    sess.end_reason = sess_blk.get("end_reason") or "completed"
-
-    # 一併刷新 alarms.csv：level 依 UI 規則（裸數字 → 中文）、alarm_code 由 alarm_id_raw 穩定配號；
-    # 欄位完全不變、僅修正值，使 CSV 與 report.xlsx 一致（原始量測資料 samples 不動）。
-    if os.path.exists(os.path.join(folder, CFG.FILE_ALARMS)):
-        sess._write_alarms()
-        print("[REGEN] 已一併刷新 alarms.csv（level/alarm_code 依最新規則，欄位不變）")
-
-    xlsx = os.path.join(folder, CFG.FILE_XLSX)
-    bak = os.path.join(folder, backup_name)
-    if os.path.exists(xlsx) and not os.path.exists(bak):
-        import shutil
-        shutil.copy2(xlsx, bak)
-        print(f"[REGEN] 已備份原報表 → {os.path.basename(bak)}")
-
-    # 電表報告：資料夾內有 meter Log 就一併重產（須在 _write_xlsx 前，Summary 參照區塊要用其結果）
-    sess._write_meter_report()
-
-    orig_now = _now_str
-    if sess_blk.get("end_time"):
-        _now_str = lambda: sess_blk["end_time"]              # Summary「結束時間」顯示原值
+    if not _regen_precheck(folder, owner_check)[0]:     # 唯讀預檢：被拒絕時不建立任何檔案（含補產鎖檔）
+        return False
+    _lockf, _why = _regen_folder_lock(folder)
+    if _lockf is None:
+        print(f"[REGEN] 拒絕補產：{_why}：{folder}")
+        return False
     try:
-        ok = sess._write_xlsx(stats)                         # 唯一 Excel 產生函式；回傳是否成功寫入
+        _pre_ok, fingerprint = _regen_precheck(folder, owner_check)    # 取得補產鎖後再確認（以此為準）
+        if not _pre_ok:
+            return False
+        if meter_csv:
+            attach_meter_csv(folder, meter_csv)
+        if not backup_name:
+            backup_name = "report_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".xlsx"
+        summ = _load_json_file(os.path.join(folder, CFG.FILE_SUMMARY))
+        if not summ:
+            print(f"[REGEN] 找不到或無法讀取 summary.json：{folder}")
+            return False
+        stats = summ.get("statistics") or {}
+        sess_blk = summ.get("session") or {}
+
+        sess = ReportSession.resume(folder, object(), allow_completed=True)   # 僅 __init__（不 start、不寫檔）
+        sess.samples = sess._load_all_samples()
+        # 舊報告的 alarms.csv 可能存有未中文化的 i18n key（如 1838F4.soc.underAlarm）。
+        # best-effort：若設備可達，以 Accept-Language: zh-TW 取回中文化告警，依 alarm_id_raw 補譯
+        # 既有紀錄（不改變告警集合）；設備不可達則沿用 CSV 原值（不中斷 regen）。
+        zh_map = _fetch_alarm_zh_map()
+        sess.alarm_tracker.load_existing(sess._load_csv_rows(CFG.FILE_ALARMS), translate_map=zh_map)
+        has_cell_file = os.path.exists(os.path.join(folder, CFG.FILE_CELL_SNAPSHOTS))
+        sess._load_cell_snapshots()                              # 讀回歷史 Cell 快照（不重抓最新值）
+        if not has_cell_file:
+            # Cell 功能之前建立的舊報告：不回填、不產生 Cell 工作表（保持歷史真實性）
+            print(f"[REGEN] 此報告建立時尚未支援 Cell 快照功能（無 {CFG.FILE_CELL_SNAPSHOTS}）"
+                  f"→ 不會產生 Cell Volt./Cell Temp.（不以現在的即時值回填歷史）。")
+        sess.start_state = summ.get("start_state") or sess.start_state
+        sess.end_state = summ.get("end_state")
+        sess.end_reason = sess_blk.get("end_reason") or "completed"
+
+        # 一併刷新 alarms.csv：level 依 UI 規則（裸數字 → 中文）、alarm_code 由 alarm_id_raw 穩定配號；
+        # 欄位完全不變、僅修正值，使 CSV 與 report.xlsx 一致（原始量測資料 samples 不動）。
+        if os.path.exists(os.path.join(folder, CFG.FILE_ALARMS)):
+            sess._write_alarms()
+            print("[REGEN] 已一併刷新 alarms.csv（level/alarm_code 依最新規則，欄位不變）")
+
+        xlsx = os.path.join(folder, CFG.FILE_XLSX)
+        bak = os.path.join(folder, backup_name)
+        if os.path.exists(xlsx) and not os.path.exists(bak):
+            import shutil
+            shutil.copy2(xlsx, bak)
+            print(f"[REGEN] 已備份原報表 → {os.path.basename(bak)}")
+
+        # 電表報告：資料夾內有 meter Log 就一併重產（須在 _write_xlsx 前，Summary 參照區塊要用其結果）
+        sess._write_meter_report()
+
+        orig_now = _now_str
+        if sess_blk.get("end_time"):
+            _now_str = lambda: sess_blk["end_time"]              # Summary「結束時間」顯示原值
+        try:
+            ok = sess._write_xlsx(stats)                         # 唯一 Excel 產生函式；回傳是否成功寫入
+        finally:
+            _now_str = orig_now
+        # 同步 output_status（Phase 3.7）：否則先前 Retry 耗盡寫下的 failed_locked 會永久殘留，
+        # 使用者關掉 Excel 補產成功後，狀態檔仍宣稱缺檔 —— 那比沒有這個欄位更糟。
+        # 第二層比對：寫回前重新讀取狀態檔；與補產開始時不一致 → 不寫回（照實回報）。
+        _k2, _st2 = read_session_state(os.path.join(folder, CFG.FILE_SESSION_STATE))
+        if owner_check is not None and owner_check() is not True:
+            print("[REGEN] ⚠ 補產期間錄製權限已不在本程序 → 未同步 output_status（報表已產生，狀態檔未改寫）")
+        elif _k2 != STATE_OK or _state_fingerprint(_st2) != fingerprint:
+            print(f"[REGEN] ⚠ 狀態檔於補產期間已改變（{_k2}）→ 未同步 output_status（報表已產生，狀態檔未改寫）")
+        else:
+            _sync_output_status(folder, sess.output_status)
+        if not ok:
+            print(f"[REGEN] ✗ report.xlsx 寫入失敗（未更新）：{xlsx}")
+            print("        請先關閉 Excel 中開啟的 report.xlsx，再重新執行 --regen。")
+            return False
+        print(f"[REGEN] ✓ 已用最新 _write_xlsx 重新產生：{xlsx}")
+        print(f"        樣本 {len(sess.samples)} 筆；統計沿用 summary.json（未改變）")
+        return True
     finally:
-        _now_str = orig_now
-    # 同步 output_status（Phase 3.7）：否則先前 Retry 耗盡寫下的 failed_locked 會永久殘留，
-    # 使用者關掉 Excel 補產成功後，狀態檔仍宣稱缺檔 —— 那比沒有這個欄位更糟。
-    _sync_output_status(folder, sess.output_status)
-    if not ok:
-        print(f"[REGEN] ✗ report.xlsx 寫入失敗（未更新）：{xlsx}")
-        print("        請先關閉 Excel 中開啟的 report.xlsx，再重新執行 --regen。")
-        return False
-    print(f"[REGEN] ✓ 已用最新 _write_xlsx 重新產生：{xlsx}")
-    print(f"        樣本 {len(sess.samples)} 筆；統計沿用 summary.json（未改變）")
-    return True
+        _regen_folder_unlock(_lockf, folder)       # 錄製權限由呼叫端（受保護入口）持有與釋放
 
 
 def main():
@@ -5637,9 +6120,8 @@ def main():
         selftest()
         return
     if args.regen:
-        if args.meter_csv:
-            attach_meter_csv(args.regen, args.meter_csv)
-        regenerate_report(args.regen, backup_name=args.backup_name)
+        # 原指令不具錄製權限：completed 照舊補產；paused 拒絕並提示改用 report_monitor.py --regen
+        regenerate_report(args.regen, backup_name=args.backup_name, meter_csv=args.meter_csv)
         return
     run_live(args.action, args.power, args.mode, args.duration, args.interval,
              ignore_stop=args.ignore_stop)

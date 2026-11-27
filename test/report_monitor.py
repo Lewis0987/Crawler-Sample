@@ -434,7 +434,9 @@ atexit.register(_release_ownership_atexit)
 _report = {"session": None, "thread": None, "stop": None,
            "lock": threading.Lock(), "finalized": False,
            "pending_end_reason": None, "client": None,
-           "stopping": False}      # 停止流程進行中（防重複 Stop；期間一律不得 Start）
+           "stopping": False,      # 停止流程進行中（防重複 Stop；期間一律不得 Start）
+           "gen": 0,               # 背景執行緒世代（每次 _report_bg_start +1；舊執行緒以此判斷已失效）
+           "last_join_timeout": False}   # 最近一次暫停／收尾時背景執行緒是否未在時限內停止
 # ---- Process-level 鎖（Phase 2）----
 # _SESSION_LOCK：保護「Session 的建立與停止」。手動控制（Menu 4/5/6/7）與智慧排程監看層
 #   共用同一份 _report 狀態，兩邊都必須經此鎖，確保同一時間只會有一份 Report Session。
@@ -847,14 +849,30 @@ def _actual_direction(r):
     # 語言無關）；旗標缺失才退回中文 badge 比對。不在此檔另做字串判斷，避免兩份邏輯不一致。
     fault = CDR.pcs_is_fault(r)
     return d, fault
-def _report_finalize(end_reason):
+def _report_session_scan_ok(unknown, warns, what):
+    """A-4／F-1：建立／續接入口共用。已收尾但狀態未寫入 → 警告（不續接、不阻擋新建）；
+    有任何無法確認的 Session → 拒絕新建與續接，列出路徑供人工確認（不刪除、不修復、不改寫）。"""
+    for folder, detail in warns or []:
+        print(f"[REPORT] ⚠ 已收尾但狀態未標記 completed（不續接）：{folder}｜{detail}")
+    if unknown:
+        print(f"[REPORT] ✗ {what}已拒絕：下列 Session 狀態無法確認，為避免錯誤新建或續接，"
+              f"請人工確認（未刪除、未修復、未改寫）：")
+        for folder, detail in unknown:
+            print(f"         - {folder}｜{detail}")
+        return False
+    return True
+
+
+def _report_finalize(end_reason, expect=None):
     """
     idempotent finalize：整個 session 只會產生一次報告（避免背景自動結束與手動 17 併發重複產檔）。
     回傳 (sess, stats)；若已結束/無 session → (None, None)。finalize 僅讀取狀態與寫本地檔，不送任何控制。
+    expect：呼叫端持有的 Session 物件；與目前 Session 不同（例如舊執行緒在新 Session 啟動後才返回）→ (None, None)，
+    不收尾新 Session（身分確認與 finalized 標記在同一把鎖內完成）。
     """
     with _report["lock"]:
         sess = _report["session"]
-        if sess is None or _report["finalized"]:
+        if sess is None or _report["finalized"] or (expect is not None and sess is not expect):
             return None, None
         _report["finalized"] = True
     try:
@@ -865,7 +883,14 @@ def _report_finalize(end_reason):
         #   _stop_and_finalize() 先 set stop event 並 join thread 才呼叫本函式；
         #   _auto_finalize_from_loop() 本身就跑在背景取樣迴圈內。
         # 故輸出期間不會有人改動 sess.samples。
-        return sess, sess.finalize(end_reason, client_lock=_CLIENT_LOCK)
+        stats = sess.finalize(end_reason, client_lock=_CLIENT_LOCK)
+        # M-6：結束狀態未取得／completed 未寫入 → 照實提示（不回報為完整成功；事件已記 finalize_partial）
+        if getattr(sess, "end_state_unavailable", None):
+            print(f"[REPORT] ⚠ 報告已產生，但結束狀態未取得（{sess.end_state_unavailable}）"
+                  f"→ finalize_partial、summary 標示 end_state_unavailable")
+        if getattr(sess, "_completed_persisted", True) is False:
+            print("[REPORT] ⚠ 報告已產生，但狀態檔未能標記 completed（下次啟動依收尾證據判定、不續接）")
+        return sess, stats
     except Exception as e:
         # 例外安全：finalized 旗標在嘗試前就已設 True，若不還原，之後用 Menu 19 重試會被
         # idempotent 檢查擋掉 → 整份 Session 永遠無法補產報告（例如 Excel 被開啟鎖住時）。
@@ -910,7 +935,9 @@ def _report_start_locked(mode_label="交流有功", setpoint=None):
         print(f"[REPORT] 認證測試 {_cid} 進行中 → 不建立／續接單次充放電報告（兩種報告擇一）")
         return
 
-    active = CDR.find_active_session(_report_output_root())
+    active, _unknown, _warns = CDR.find_active_session(_report_output_root(), checked=True)
+    if not _report_session_scan_ok(_unknown, _warns, "開始／續接報告"):
+        return
     client = _report_client()
     if client is None:
         return
@@ -1043,13 +1070,27 @@ def _sync_transition_wait(sess, reason, sched_ctx):
                    f"origin=scheduler｜相鄰排程銜接中，暫緩收尾以維持同一份報告｜"
                    f"{prev_d} -> {next_d}｜plan={ctx.get('current_plan') or 'next'}｜"
                    f"idle 持續 {sess.idle_held_seconds():.0f}s")
-def _auto_finalize_from_loop(sess, reason):
+def _auto_finalize_from_loop(sess, reason, gen=None, stop=None):
     """
     背景取樣執行緒內的自動收尾。回傳 True=可結束迴圈；False=收尾失敗（Session 保留供重試）。
     ⚠️ 這裡**不可**呼叫 _stop_and_finalize()：那會 join 自己所在的執行緒 → 死鎖。
        一律走既有唯一入口 _report_finalize(reason)，不新增第二套 finalize 邏輯。
+    舊執行緒防護：在 _SESSION_LOCK 內一次完成「身分確認＋取得收尾權」——必須仍是目前 Session、
+    世代相符、本執行緒未被要求停止、且沒有其他停止流程進行中；否則放棄，不碰任何共用狀態
+    （不清除參照、不重設停止旗標、不改冷卻狀態、不影響錄製權限）。
+    gen／stop 未傳入時取自呼叫執行緒（_report_bg_start 綁定的 th._rm_gen／th._rm_stop）；
+    背景執行緒呼叫時兩者一定存在，故身分、世代與停止旗標確認不會因呼叫寫法而被省略。
     """
+    _th = threading.current_thread()
+    if gen is None:
+        gen = getattr(_th, "_rm_gen", None)
+    if stop is None:
+        stop = getattr(_th, "_rm_stop", None)
     with _SESSION_LOCK:
+        if (_report["session"] is not sess or (gen is not None and _report.get("gen") != gen)
+                or (stop is not None and stop.is_set()) or _report["stopping"]):
+            print(f"[REPORT] 自動收尾放棄（{reason}）：已非目前 Session 或已有其他停止流程（未做任何狀態轉移）")
+            return True
         _report["stopping"] = True                   # 收尾期間擋掉任何新 Session（條件 F）
         _auto["state"] = AUTO_STOP_PENDING
     ok = False
@@ -1073,7 +1114,7 @@ def _auto_finalize_from_loop(sess, reason):
                                f"最後方向 {d or 'unknown'}")
             except Exception as e:
                 print(f"[REPORT] 記錄自動停止事件失敗：{e}")
-        s, stats = _report_finalize(reason)
+        s, stats = _report_finalize(reason, expect=sess)
         if s is None:                                # 已由其他路徑收尾（idempotent）
             ok = True
         elif stats is None:
@@ -1088,7 +1129,7 @@ def _auto_finalize_from_loop(sess, reason):
         print(f"[REPORT] 自動收尾例外（{reason}）：{e}；Session 保留，可用 Menu 19 重試")
     finally:
         with _SESSION_LOCK:
-            if ok:                                   # 成功才清空；失敗保留供 Menu 19 重試
+            if ok and _report["session"] is sess:    # 成功才清空（且只清自己的 Session）；失敗保留供 Menu 19 重試
                 _report.update(session=None, thread=None, stop=None,
                                pending_end_reason=None)
                 _auto_clear_notes()              # 回到 IDLE → 統一清除所有去重狀態
@@ -1123,7 +1164,11 @@ def _report_bg_start(sess):
               "（防止同一 Session 被兩個行程同時寫入）")
         return False
     stop = threading.Event()
-    _report.update(session=sess, thread=None, stop=stop, finalized=False)
+    # 世代編號：每個背景執行緒綁定「啟動時的 Session 物件＋世代＋自己的 stop Event」。
+    # 新 Session 會建立新的 Event 與新世代 → 舊執行緒的 stop 永遠維持已設定、世代永遠不符，
+    # 不會因新 Session 啟動而恢復合法性。
+    gen = _report.get("gen", 0) + 1
+    _report.update(session=sess, thread=None, stop=stop, finalized=False, gen=gen)
     # 新 Session 起始（手動 / 排程 / resume 都會經過這裡）→ 清除上一份 Session 遺留的
     # 去重狀態，確保各類提示（含停止提示）在新 Session 會重新各印一次。
     _auto_clear_notes()
@@ -1136,6 +1181,14 @@ def _report_bg_start(sess):
                         sess.sample_once()
                 except Exception as e:
                     print(f"[REPORT] 背景取樣例外：{e}")
+                # 取樣返回後先確認仍是合法的目前執行緒：已非目前 Session／世代 → 設定本執行緒專屬的
+                # stop（新 Session 使用另一個 Event，不受影響）；停止要求已送出（暫停／收尾／等待逾時）或
+                # 剛被設定 → 本輪立即結束（不做任何判定、事件寫入或自動收尾），回到 while 條件即退出。
+                if _report.get("session") is not sess or _report.get("gen") != gen:
+                    print(f"[REPORT] 背景執行緒已不屬於目前 Session（世代 {gen}）→ 停止，不做任何狀態轉移")
+                    stop.set()
+                if stop.is_set():
+                    continue
 
                 # ---- 排程感知（Phase 3.5）：只在 idle 開始累積時才查，並快取 60s ----
                 #      本層只把 ctx 算出來，判定仍在 should_auto_end()。
@@ -1202,16 +1255,42 @@ def _report_bg_start(sess):
                                    key="last_stop_note")
                         stop.wait(CDR_CFG.SAMPLE_INTERVAL_SEC)
                         continue
-                    _auto_finalize_from_loop(sess, reason)
+                    _auto_finalize_from_loop(sess, reason)   # 世代／stop 由本執行緒物件攜帶（見下方 th._rm_*）
                     break                        # 成功或失敗都結束迴圈（失敗時 Session 保留）
                 stop.wait(CDR_CFG.SAMPLE_INTERVAL_SEC)
         except Exception as e:                   # 最外層防護：背景執行緒不得靜默死亡
             print(f"[REPORT] 背景執行緒異常結束：{e}")
 
     th = threading.Thread(target=_loop, daemon=True)
+    th._rm_session, th._rm_gen, th._rm_stop = sess, gen, stop     # 本執行緒的合法身分（_auto_finalize_from_loop 讀取）
     _report["thread"] = th
     th.start()
     return True
+def _note_join_timeout(sess, th, what):
+    """M-4：join 後背景執行緒仍存活 → 主控台＋事件紀錄（Session 尚未轉移狀態，事件仍屬本 Session）。
+    回傳是否逾時。不宣稱背景執行緒已停止。"""
+    alive = bool(th is not None and th.is_alive())
+    _report["last_join_timeout"] = alive
+    if alive:
+        msg = (f"背景取樣執行緒未在 {CDR_CFG.SAMPLE_INTERVAL_SEC + 10}s 內停止（{what}；仍在執行，"
+               f"可能卡在 HMI 讀取）→ 其遲到取樣將被捨棄，且不得觸發任何狀態轉移")
+        print(f"[REPORT] ⚠ {msg}")
+        try:
+            sess.log_event("bg_thread_join_timeout", "warning", msg)
+        except Exception as e:
+            print(f"[REPORT] 記錄 bg_thread_join_timeout 失敗：{e}")
+    return alive
+
+
+def _skip_final_sample(sess, why):
+    """M-6：略過最後一筆取樣（不補值、不捏造、不宣稱已取得）。"""
+    print(f"[REPORT] ⚠ 略過最後一筆取樣：{why}")
+    try:
+        sess.log_event("final_sample_skipped", "warning", f"最後一筆取樣未取得：{why}")
+    except Exception as e:
+        print(f"[REPORT] 記錄 final_sample_skipped 失敗：{e}")
+
+
 def _stop_and_finalize(reason, write_final=True):
     """
     停止背景執行緒 →（選擇性）寫最後一筆即時資料 → finalize（idempotent）。回傳 (sess, stats)。
@@ -1233,13 +1312,21 @@ def _stop_and_finalize(reason, write_final=True):
             stop_ev.set()
         if th is not None:
             th.join(timeout=CDR_CFG.SAMPLE_INTERVAL_SEC + 10)
+        _timed_out = _note_join_timeout(sess, th, "收尾")
         if write_final and sess is not None and not _report["finalized"]:
-            try:
-                with _CLIENT_LOCK:               # 只包一次取樣
+            if _timed_out:
+                # M-6：背景執行緒仍在執行（可能卡在 HMI 讀取並持有 _CLIENT_LOCK）→ 不等鎖、略過最後一筆
+                _skip_final_sample(sess, "背景取樣未在時限內停止")
+            elif _CLIENT_LOCK.acquire(timeout=CDR_CFG.SAMPLE_INTERVAL_SEC):   # 只包一次取樣；最多等一個取樣週期
+                try:
                     sess.sample_once()           # 寫入最後一筆即時資料
-            except Exception as e:
-                print(f"[REPORT] 最後取樣失敗：{e}")
-        res = _report_finalize(reason)
+                except Exception as e:
+                    print(f"[REPORT] 最後取樣失敗：{e}")
+                finally:
+                    _CLIENT_LOCK.release()
+            else:
+                _skip_final_sample(sess, f"{CDR_CFG.SAMPLE_INTERVAL_SEC}s 內無法取得共用 client 鎖")
+        res = _report_finalize(reason, expect=sess)
     finally:                                     # ③ 瞬時：清除參考與狀態
         with _SESSION_LOCK:
             _report.update(session=None, thread=None, stop=None,
@@ -1265,10 +1352,17 @@ def report_pause():
             stop_ev.set()
         if th is not None:
             th.join(timeout=CDR_CFG.SAMPLE_INTERVAL_SEC + 10)
+        _note_join_timeout(sess, th, "暫停")
         if not _report["finalized"]:             # 背景已 finalize（completed）→ 不覆蓋
             try:
-                sess.pause()
-                print(f"充放電報告已暫停（下次可續接）：{sess.session_id}")
+                _pst = sess.pause()
+                if _pst is None and getattr(sess, "last_transition_error", None):
+                    print(f"[REPORT] 暫停未執行：{sess.last_transition_error}")
+                elif getattr(sess, "state_persist_ok", True) is False:
+                    print(f"[REPORT] ⚠ 已停止記錄並重產報表，但暫停狀態未寫入 "
+                          f"{CDR_CFG.FILE_SESSION_STATE}（狀態檔仍為上一份完整內容）：{sess.session_id}")
+                else:
+                    print(f"充放電報告已暫停（下次可續接）：{sess.session_id}")
             except Exception as e:
                 print(f"[REPORT] 暫停報告失敗：{e}")
     finally:                                     # ③ 瞬時
@@ -1424,7 +1518,9 @@ def report_resume_on_launch():
     if _cid:
         print(f"[REPORT] 認證測試 {_cid} 進行中 → 不續接單次充放電報告（保留於磁碟，認證結束後才會續接）")
         return
-    active = CDR.find_active_session(_report_output_root())
+    active, _unknown, _warns = CDR.find_active_session(_report_output_root(), checked=True)
+    if not _report_session_scan_ok(_unknown, _warns, "啟動時自動續接"):
+        return
     if not active:
         return
     gap = _orphan_gap_seconds(active)            # 需在 resume 覆寫 state 前先讀
@@ -2089,3 +2185,63 @@ _SCHED_ITEM_LIST = "/schedule/list/{tid}"
 def _sched_template_enabled(t):
     """模板是否啟用（enableFlag==1）。"""
     return t.get("enableFlag") in (1, "1")
+
+
+# ======================================================================
+# M-5（R2）：受錄製權限保護的補產入口
+# ----------------------------------------------------------------------
+# charge_discharge_report.py 不得 import 本模組（分層：報告模組不依賴監看層），故 paused Session 的補產
+# 由本模組提供：取得錄製權限（同一顆 Windows 跨程序 Mutex）→ 由報告模組重新確認狀態 → 補產與
+# output_status 更新 → 釋放本次取得的權限。
+# 命令列入口只做離線補產與必要的權限檢查：不啟動背景監控／ESSAutoMonitor、不登入 HMI、不送任何控制。
+# ======================================================================
+def regenerate_report_guarded(folder, backup_name=None, meter_csv=None):
+    """
+    在持有錄製權限下補產（paused／completed 皆可；recording 與狀態無法確認一律拒絕，由報告模組判定）。
+    回傳是否補產成功。服務或其他程序持有錄製權限 → 拒絕。
+    權限的保護範圍是 Session 所在的輸出目錄：資料夾必須直接位於本程序的報告輸出目錄下，否則拒絕
+    （命令列入口會以資料夾所在目錄推導，與服務對同一目錄推導出相同的 Mutex 名稱）。
+    本程序已是 Owner（服務程序內呼叫）時：有進行中的 Session 即拒絕；整個補產期間持有 _SESSION_LOCK，
+    防止同程序在補產期間建立或續接 Session。
+    """
+    if not _REPORT_AVAILABLE:
+        print(f"[錯誤] 無法載入報告模組：{_REPORT_IMPORT_ERR}")
+        return False
+    folder = os.path.abspath(folder)
+    root = os.path.normcase(os.path.abspath(_report_output_root()))
+    if os.path.normcase(os.path.dirname(folder)) != root:
+        print(f"[REGEN] 拒絕補產：Session 資料夾不在錄製權限所保護的輸出目錄下（{_report_output_root()}）：{folder}")
+        return False
+    with _SESSION_LOCK:
+        if _report.get("session") is not None or _report.get("stopping"):
+            print("[REGEN] 拒絕補產：本程序有進行中的報告 Session（錄製權限使用中）")
+            return False
+        got, why = acquire_ownership(role="regen")
+        if not got:
+            print(f"[REGEN] 拒絕補產：無法取得錄製權限（{why}；服務或其他程序持有）：{folder}")
+            return False
+        try:
+            return bool(CDR.regenerate_report(folder, backup_name=backup_name, owner_check=is_owner,
+                                              meter_csv=meter_csv))
+        finally:
+            if why != "already_owner":           # 只釋放本次取得的權限（成功或失敗皆釋放）
+                release_ownership()
+
+
+def _regen_cli(argv=None):
+    """python test/report_monitor.py --regen "<Session資料夾>" [--backup-name N] [--meter-csv CSV]"""
+    import argparse
+    ap = argparse.ArgumentParser(prog="report_monitor.py",
+                                 description="受錄製權限保護的離線補產（不啟動監控、不登入 HMI、不控制設備）")
+    ap.add_argument("--regen", metavar="FOLDER", required=True, help="Session 資料夾")
+    ap.add_argument("--backup-name", default=None, help="原 report.xlsx 的備份檔名")
+    ap.add_argument("--meter-csv", metavar="CSV", default=None, help="先複製電表 Log 進資料夾再補產")
+    args = ap.parse_args(argv)
+    global _report_output_root
+    _root = os.path.dirname(os.path.abspath(args.regen))
+    _report_output_root = lambda: _root          # 權限範圍＝該 Session 所在輸出目錄（Mutex 名稱與服務一致）
+    return 0 if regenerate_report_guarded(args.regen, args.backup_name, args.meter_csv) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(_regen_cli())
