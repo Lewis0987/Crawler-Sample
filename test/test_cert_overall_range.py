@@ -657,15 +657,22 @@ try:
         ex_ = [st for st in res_.stages if st.no in stp]
         mine, p4 = RX.valid_cycle_pairs(res_.stages, ex_), p4_pairs(res_, stp, first_)
         check(f"OR-12 {tag_}：v2 配對與 P-4 pair_session 相同 {mine}", mine == p4, f"v2={mine} P-4={p4}")
-    # 刻意差異：P-4 會在排除不計次階段後的剩餘序列重新配對（可跨越中止階段）；甲-1 不跨越
+        if stp:
+            # v2-align（2026-11-27 裁定 Q1）：只有中止標記、沒有不計次決策 → 仍與甲-1 相同（不需要不計次）
+            res_l = analyze(obs_, P, labels(r0_.stages, stp), [])
+            ex_l = [st for st in res_l.stages if st.no in stp]
+            mine_l, p4_l = RX.valid_cycle_pairs(res_l.stages, ex_l), p4_pairs(res_l, stp, first_)
+            check(f"OR-12 {tag_}（只標中止、無不計次）：v2 配對與 P-4 pair_session 相同 {mine_l}",
+                  mine_l == p4_l and all(getattr(st, "counted", True) for st in res_l.stages), f"v2={mine_l} P-4={p4_l}")
+    # v2-align（裁定 Q2；原為「已知且刻意的差異」P-4＝(1,3)）：P-4 改為不跨越中止階段 → 與甲-1 相同
     SEG_X = [("I", 60), ("D", 600), ("I", 300), ("C", 600), ("I", 300), ("C", 600), ("I", 300), ("D", 600), ("I", 300)]
     obs_x, _sx = build(SEG_X)
     r0x = analyze(obs_x, P, [], [])
     resx = analyze(obs_x, P, labels(r0x.stages, {2}) + [cnt(r0x.stages[1], False)], [])
     mine_x = RX.valid_cycle_pairs(resx.stages, [resx.stages[1]])
     p4_x = p4_pairs(resx, {2}, "D")
-    check("OR-12b 已知且刻意的差異（放 → 充（中止）→ 充 → 放）：P-4 跨越中止階段配成 (1,3)；甲-1 不跨越 → 0 個循環",
-          p4_x == [(1, 3)] and mine_x == [], f"P-4={p4_x} v2={mine_x}")
+    check("OR-12b v2-align（放 → 充（中止）→ 充 → 放）：P-4 不再跨越中止階段配對 → 與甲-1 相同（0 個循環）",
+          p4_x == [] and mine_x == [], f"P-4={p4_x} v2={mine_x}")
 
     # ========================================================================= OR-13／OR-19 格式相容
     print("\n== OR-13 Legacy／v1／v2／未知格式相容性 ==")

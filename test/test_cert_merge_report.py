@@ -461,6 +461,9 @@ def t_unverifiable_and_failed():
     man = manifest_of(md)
     v2 = [s for s in man["sources"] if s["cert_id"] == "CERT_F_2"][0]["data_value_verification"]
     check("TA-1", "manifest 有差異明細與原因", v2["result"] == "FAILED" and v2["reason_codes"])
+    check("V2A-NP", "未發布路徑（VERIFY_FAILED）：STATUS 與 manifest 皆有 pairing_rule＝v2-align；manifest 各階段有 stopped 布林值",
+          st.get("pairing_rule") == "v2-align" and man.get("pairing_rule") == "v2-align"
+          and all(isinstance(s.get("stopped"), bool) for s in man["stages"]), str(st.get("pairing_rule")))
     check("TA-6", "數值差異 → UNEXPLAINED_VALUE_DIFF（含 X6 附註），不是 UNVERIFIABLE",
           "UNEXPLAINED_VALUE_DIFF" in v2["reason_codes"]
           and any("X6" in json.dumps(i.get("detail"), ensure_ascii=False) for i in v2["items"]))
@@ -843,7 +846,9 @@ def t_pairing_units():
     sa = fake_session([("D", "滿放", N), ("C", "未滿", N), ("D", "滿放", N), ("C", "滿充", N)])
     check("T-K7", "未滿、確認完成", [c[1] for c in _cy(sa)] == [AN.ST_NOTFULL, AN.ST_DONE])
     sa = fake_session([("D", "中止", N), ("C", "滿充", N)])
-    check("T-K8", "中止", [c[1] for c in _cy(sa)] == [AN.ST_ABORT])
+    # v2-align（2026-11-27 裁定 Q1）：有效標記中止即排除配對（原期待：1 個「中止」循環）
+    check("T-K8", "中止（v2-align）：放（中止）、充 → 0 循環；放＝中止排除、充＝開頭半循環；無中止循環",
+          not sa["cycles"] and _pairings(sa) == [AN.STOPPED_EXCLUDED, AN.UNP_HEAD], str(_pairings(sa)))
     sa = fake_session([("D", "滿放", N), ("C", "", N)])
     check("T-K9", "後半未標記 → 待確認", [c[1] for c in _cy(sa)] == [AN.ST_PENDING])
     sa = fake_session([("D", "滿放", N), ("C", "滿充", {"end_by": "data_end", "ec": False})])
@@ -904,8 +909,14 @@ def t_pairing_units():
     check("T7-11", "A1 且標記正確、邊界確定 → 待確認；配對待確認（兩欄分開）",
           sa["cycles"][0]["status"] == AN.ST_PENDING and sa["cycles"][0]["certainty"] == AN.PAIR_PENDING)
     sa = fake_session([("D", "中止", N), ("C", "滿充", {"end_by": "data_end", "ec": False})])
-    check("T7-12", "中止＋未完成 → 中止，理由同時列出", sa["cycles"][0]["status"] == AN.ST_ABORT
-          and any("[未完成]" in r for r in sa["cycles"][0]["reasons"]))
+    # v2-align：配對層不再產生含中止階段的循環；_confirm 的「中止優先、理由同時列出」相容邏輯（Q4 保留列舉）直接驗證
+    cy_ = {"id": "X#CY1", "a": sa["stages"][0], "b": sa["stages"][1], "certainty": AN.CERTAIN, "certainty_triggers": [],
+           "uncounted_notes": []}
+    AN._confirm(cy_, sa)
+    check("T7-12", "中止＋未完成：配對層 0 循環（中止排除）；_confirm 相容邏輯仍為中止優先、理由同時列出",
+          not sa["cycles"] and sa["stages"][0]["pairing"] == AN.STOPPED_EXCLUDED
+          and cy_["status"] == AN.ST_ABORT and any("[未完成]" in r for r in cy_["reasons"])
+          and any("[中止]" in r for r in cy_["reasons"]), str(cy_.get("reasons")))
     sa = fake_session([("D", "滿放", N), ("C", "滿充", N)], decisions=[
         {"type": "continuity", "item_id": f"U-{(T0 + timedelta(seconds=50)):%Y%m%d%H%M%S}-{(T0 + timedelta(seconds=60)):%Y%m%d%H%M%S}",
          "choice": "merge", "at": "2026-12-01 12:00:00"}])
@@ -924,6 +935,129 @@ def t_pairing_units():
           not s1["cycles"] and not s2["cycles"] and _pairings(s1) == [AN.UNP_TAIL] and _pairings(s2) == [AN.UNP_HEAD])
     inv, counts = AN.invariants([fake_session([("D", "滿放", N), ("C", "滿充", N), ("D", "", N)])])
     check("T8-4／T-K20", "I1～I8 正常資料全部成立", all(inv.values()), str(inv))
+    _t_v2_align_units()
+
+
+def _t_v2_align_units():
+    """v2-align（2026-11-27 使用者裁定 Q1～Q6）：中止階段＝不可跨越的分界；不需要不計次決策；統計與不變式。"""
+    print("== V2A 合併摘要中止階段排除（v2-align） ==")
+    N = {}
+    W = CFG.params()["W_PAUSE_SEC"]
+
+    def ses(spec, order="DC", cid="CERT_V2A", pend=None):
+        sa = fake_session(spec, order=order, cid=cid)
+        sa["params"] = dict(CFG.params(), W_PAUSE_SEC=W)                 # 保護②需要 W（同 _t3s_pairing.unc_session）
+        for no, n in (pend or {}).items():
+            sa["stages"][no - 1]["pending_pauses"] = n
+        AN.pair_session(sa, order)
+        return sa
+
+    def pr(sa):
+        return [(c["a"]["no"], c["b"]["no"]) for c in sa["cycles"]]
+    S, BS, H, T, NP, SM = AN.STOPPED_EXCLUDED, AN.UNP_BEFORE_STOP, AN.UNP_HEAD, AN.UNP_TAIL, AN.UNP_NOPREV, AN.UNP_SAME
+    check("V2A-00", "常數：pairing_rule＝v2-align；中止排除／其後為中止階段 標籤",
+          AN.PAIRING_RULE == "v2-align" and S == "中止（不參與配對）" and BS == "未配對：其後為中止階段（不跨越）")
+    # T03：中止但沒有不計次決策（使用者裁定範例：放、充（中止）、充、放，DC）
+    sa = ses([("D", "滿放", N), ("C", "中止", N), ("C", "滿充", N), ("D", "滿放", N)])
+    inv, cnt = AN.invariants([sa])
+    check("V2A-01", "放、充（中止，無不計次）、充、放（DC）→ 不跨越：0 循環、有效未配對 3、中止排除 1",
+          not sa["cycles"] and _pairings(sa) == [BS, S, NP, T] and cnt["unpaired"] == 3 and cnt["stopped"] == 1
+          and cnt["uncounted"] == 0 and all(inv.values()), f"{_pairings(sa)} {cnt} {inv}")
+    # T07：中止位於兩個有效循環之間；T08：中止位於有效循環之後
+    sa = ses([("D", "滿放", N), ("C", "滿充", N), ("C", "中止", N), ("D", "滿放", N), ("C", "滿充", N)])
+    check("V2A-02", "放、充、充（中止）、放、充 → (1,2)、(4,5) 兩循環；中止排除不計入有效未配對",
+          pr(sa) == [(1, 2), (4, 5)] and AN.invariants([sa])[1]["unpaired"] == 0 and sa["stages"][2]["pairing"] == S)
+    sa = ses([("D", "滿放", N), ("C", "滿充", N), ("C", "中止", N), ("D", "中止", N), ("C", "中止", N)])
+    inv, cnt = AN.invariants([sa])
+    check("V2A-03", "中止位於有效循環之後（083020 形狀）：1 循環、中止排除 3、有效未配對 0、中止循環 0、確定（保護②無疑慮）",
+          pr(sa) == [(1, 2)] and cnt["stopped"] == 3 and cnt["unpaired"] == 0 and cnt["status"][AN.ST_ABORT] == 0
+          and sa["cycles"][0]["certainty"] == AN.CERTAIN and all(inv.values()), f"{_cy(sa)} {cnt}")
+    # 第一個階段中止／最後一個階段中止／連續多個中止
+    sa = ses([("D", "中止", N), ("C", "滿充", N), ("D", "滿放", N), ("C", "滿充", N)])
+    check("V2A-04", "第一個階段中止：放（中止）、充、放、充 → 充＝開頭半循環、(3,4) 1 循環",
+          pr(sa) == [(3, 4)] and _pairings(sa)[:2] == [S, H])
+    sa = ses([("D", "滿放", N), ("C", "滿充", N), ("D", "中止", N)])
+    check("V2A-05", "最後一個階段中止 → (1,2) 1 循環、最後階段中止排除", pr(sa) == [(1, 2)] and _pairings(sa)[2] == S)
+    sa = ses([("D", "滿放", N), ("C", "中止", N), ("D", "中止", N), ("C", "滿充", N)])
+    check("V2A-06", "連續兩個中止夾在放、充之間 → 不跨越：0 循環；放＝其後為中止階段、充＝前無可配",
+          not sa["cycles"] and _pairings(sa) == [BS, S, S, NP])
+    # CD 方向
+    sa = ses([("C", "滿充", N), ("D", "中止", N), ("D", "滿放", N), ("C", "滿充", N), ("D", "滿放", N)], order="CD")
+    check("V2A-07", "CD：充、放（中止）、放、充、放 → (4,5) 1 循環；充＝其後為中止階段、放＝前無可配",
+          pr(sa) == [(4, 5)] and _pairings(sa)[:3] == [BS, S, NP])
+    # T09：全部中止 vs T10：沒有任何階段（統計區分）
+    sa = ses([("D", "中止", N), ("C", "中止", N)])
+    inv9, c9 = AN.invariants([sa])
+    inv10, c10 = AN.invariants([fake_session([])])
+    check("V2A-08", "全部中止：0 循環、有效階段 0、中止排除 2；與沒有階段（原始 0、中止排除 0）可區分",
+          not sa["cycles"] and c9["stopped"] == 2 and c9["valid_D"] + c9["valid_C"] == 0 and c9["stages_D"] + c9["stages_C"] == 2
+          and c10["stopped"] == 0 and c10["stages_D"] + c10["stages_C"] == 0 and all(inv9.values()) and all(inv10.values()))
+    # 未滿仍屬有效階段
+    sa = ses([("D", "滿放", N), ("C", "未滿", N), ("D", "未滿", N), ("C", "未滿", N)])
+    check("V2A-09", "未滿充／未滿放仍屬有效階段：2 循環、中止排除 0", pr(sa) == [(1, 2), (3, 4)] and AN.invariants([sa])[1]["stopped"] == 0)
+    # 保護②擴大：相鄰同向中止階段的交界有未決停頓 → 待確認並加註（保護強度不變）
+    sa = fake_session([("D", "滿放", N), ("C", "滿充", N), ("C", "中止", N)], cid="CERT_V2A_P2")
+    sa["params"] = dict(CFG.params(), W_PAUSE_SEC=W)
+    b_end = sa["stages"][1]["stage"].A.t
+    sa["res"].pauses = [type("P", (), {"item_id": "U-X", "certain": False, "decision": None,
+                                       "A": type("O", (), {"t": b_end})(), "R": type("O", (), {"t": b_end + timedelta(seconds=5)})()})()]
+    AN.pair_session(sa, "DC")
+    c0 = sa["cycles"][0]
+    check("V2A-10", "保護②擴大至相鄰同向中止階段（無不計次）：交界窗口有未決停頓 → 配對待確認＋A2（保護②）＋相鄰中止階段加註",
+          c0["certainty"] == AN.PAIR_PENDING and any("A2（保護②）：相鄰中止階段" in t for t in c0["certainty_triggers"])
+          and any(n.startswith("相鄰中止階段") for n in c0["uncounted_notes"]), str(c0["certainty_triggers"]))
+    # 保護①維持：充1、充（中止，無不計次）、充2 → 排除後充1、充2 相鄰 → A2 仍觸發（只用於確定性）
+    sa = ses([("D", "滿放", N), ("C", "滿充", N), ("C", "中止", N), ("C", "滿充", N)])
+    check("V2A-11", "保護①：充1、充（中止）、充2 → A2 仍觸發（確定性觀察可跨分界，配對不跨越）",
+          pr(sa) == [(1, 2)] and sa["cycles"][0]["certainty"] == AN.PAIR_PENDING
+          and any(t.startswith("A2：") for t in sa["cycles"][0]["certainty_triggers"]) and _pairings(sa)[3] == NP)
+    # P-7 確認狀態不變：未決停頓 → 待確認（不自動視為已確認）
+    sa = ses([("D", "滿放", N), ("C", "滿充", N), ("C", "中止", N)], pend={1: 4, 2: 7})
+    check("V2A-12", "P-7：中止排除後，循環內仍有未決停頓 → 待確認（配對確定性＝確定，兩欄分開）",
+          _cy(sa) == [(AN.CERTAIN, AN.ST_PENDING)], str(_cy(sa)))
+    # 不變式負向：故意破壞分類 → I2／I9／I10／I11／I12 偵測
+    sa = ses([("D", "滿放", N), ("C", "滿充", N), ("C", "中止", N)])
+    sa["stages"][2]["pairing"] = AN.UNP_NOPREV                        # M3：中止排除被錯計為有效未配對
+    inv_m3 = AN.invariants([sa])[0]
+    sb = ses([("D", "滿放", N), ("C", "中止", N), ("C", "滿充", N)])
+    sb["cycles"] = [{"id": "CERT_V2A#CY9", "cert_id": "CERT_V2A", "s_no": 1, "a": sb["stages"][0], "b": sb["stages"][1],
+                     "certainty": AN.CERTAIN, "status": AN.ST_ABORT}]     # M4：含中止階段的循環進入統計
+    for s in sb["stages"][:2]:
+        s["pairing"] = AN.PAIR_FIRST if s["no"] == 1 else AN.PAIR_SECOND
+        s["cycle_id"] = "CERT_V2A#CY9"
+    inv_m4 = AN.invariants([sb])[0]
+    sc = ses([("D", "滿放", N), ("C", "中止", N), ("C", "滿充", N)])
+    sc["stages"][1]["stage"].counted = False
+    sc["stages"][1]["pairing"] = AN.UNP_NOPREV                       # 不計次階段未歸入中止排除
+    inv_unc = AN.invariants([sc])[0]
+    check("V2A-13", "不變式負向：中止排除錯計為有效未配對 → I11 失敗；含中止階段的循環 → I9 失敗；不計次未歸入中止排除 → I10 失敗",
+          not inv_m3["I11"] and not inv_m4["I9"] and not inv_unc["I10"], f"{inv_m3} {inv_m4} {inv_unc}")
+    sd = ses([("D", "滿放", N), ("C", "中止", N), ("C", "滿充", N)])
+    sd["cycles"] = [{"id": "CERT_V2A#CY1", "cert_id": "CERT_V2A", "s_no": 1, "a": sd["stages"][0], "b": sd["stages"][2],
+                     "certainty": AN.CERTAIN, "status": AN.ST_PENDING}]   # M2：跨越中止階段配對
+    sd["stages"][0]["pairing"], sd["stages"][0]["cycle_id"] = AN.PAIR_FIRST, "CERT_V2A#CY1"
+    sd["stages"][2]["pairing"], sd["stages"][2]["cycle_id"] = AN.PAIR_SECOND, "CERT_V2A#CY1"
+    check("V2A-14", "不變式負向：跨越中止階段的循環 → I12 失敗", not AN.invariants([sd])[0]["I12"])
+    # T20：正式 083020 決策結構忠實重現（7 筆 stage_label、沒有 stage_count；第 4、5 階段先標滿放／滿充再改中止）
+    key = lambda i: (T0 + timedelta(seconds=300 * (i - 1))).strftime("%Y-%m-%dT%H:%M:%S")      # noqa: E731
+    hist = [(1, "滿放"), (2, "滿充"), (3, "中止"), (4, "滿放"), (5, "滿充"), (4, "中止"), (5, "中止")]
+    decs = [{"type": "stage_label", "stage_start": key(n), "label": lab, "at": f"2026-11-2{0 if k < 3 else 5} 1{k}:00:00",
+             "request_id": f"R{k}"} for k, (n, lab) in enumerate(hist)]
+    for tag, pend, want in (("A", {}, AN.ST_DONE), ("B", {1: 4, 2: 7}, AN.ST_PENDING)):
+        sa = fake_session([("D", "", N), ("C", "", N), ("C", "", N), ("D", "", N), ("C", "", N)], decisions=decs,
+                          cid="CERT_V2A_083020")
+        for s, lab in zip(sa["stages"], ("滿放", "滿充", "中止", "中止", "中止")):
+            s["stage"].label = lab
+            s["pending_pauses"] = pend.get(s["no"], 0)
+        sa["params"] = dict(CFG.params(), W_PAUSE_SEC=W)
+        AN.pair_session(sa, "DC")
+        inv, cnt = AN.invariants([sa])
+        check(f"V2A-T20{tag}", f"083020 決策結構重現（{'無' if not pend else '有'}未決停頓）：7 筆標記、0 筆不計次 → "
+                               f"1 循環確定＋{want}、中止排除 3、有效未配對 0、中止循環 0、不變式全部成立",
+              len([d for d in sa["data"]["decisions"] if d["type"] == "stage_label"]) == 7
+              and not any(d["type"] == "stage_count" for d in sa["data"]["decisions"])
+              and _cy(sa) == [(AN.CERTAIN, want)] and cnt["stopped"] == 3 and cnt["unpaired"] == 0
+              and cnt["status"][AN.ST_ABORT] == 0 and all(inv.values()), f"{_cy(sa)} {cnt} {inv}")
 
 
 def t_titles():
@@ -2238,9 +2372,11 @@ def t_3s():
     AN.pair_session(sa, "DC")
     st_ = {s["stage_start"]: s for s in sa["stages"]}
     check("SCR-01", "有效不計次（標記中止＋counted=false，H2 判定）→ 不參與配對，原始階段保留",
-          st_[ss[1]]["count_counted"] is False and st_[ss[1]]["pairing"] == AN.UNC_EXCLUDED and len(sa["stages"]) == 3)
+          st_[ss[1]]["count_counted"] is False and st_[ss[1]]["pairing"] == AN.STOPPED_EXCLUDED
+          and AN.is_uncounted(st_[ss[1]]) and len(sa["stages"]) == 3)
     check("SCR-02", "標記不是「中止」的 counted=false → H2 判為無效 → 視為計次並列原因（不排除配對）",
-          st_[ss[2]]["count_counted"] is True and "不是「中止」" in st_[ss[2]]["count_note"] and st_[ss[2]]["pairing"] != AN.UNC_EXCLUDED)
+          st_[ss[2]]["count_counted"] is True and "不是「中止」" in st_[ss[2]]["count_note"]
+          and st_[ss[2]]["pairing"] not in (AN.UNC_EXCLUDED, AN.STOPPED_EXCLUDED) and not AN.is_stopped(st_[ss[2]]))
     kinds = [o["kind"] for o in sa["orphans"]]
     check("SCR-03", "對不到階段的 stage_count → 「無法對應的計次決策」（依 H2 count_orphans）", "無法對應的計次決策" in kinds)
     check("SCR-04", "其他未知類型仍為「無法辨識的紀錄」；有效 stage_count 不列為孤兒",
@@ -2517,10 +2653,50 @@ def t_3s():
         _cnt(ss[1], False, _ts(e - timedelta(minutes=30)), "C1")])
     rc, last, _t = run_tool([u1, u2], now=nxt_now())
     man = manifest_of(last["merge_dir"])
-    unc = [s for s in man["stages"] if s["pairing"] == AN.UNC_EXCLUDED]
+    unc = [s for s in man["stages"] if s["pairing"] == AN.STOPPED_EXCLUDED and s["counted"] is False and s["stopped"] is True]
     keys = [(s["id"].split("#")[0], s["stage_start"]) for s in man["stages"]]
     check("MR-09a", "兩個 Session 都有「中止充電（不計次）」→ 整合後各自以 Session ID＋stage_start 唯一對回，不合併",
           len(unc) == 2 and len(set(keys)) == len(keys) and len({s["id"] for s in man["stages"]}) == len(man["stages"]))
+    st_mr = status_of(last["merge_dir"])
+    check("V2A-MR", "v2-align 規格識別：manifest 與 STATUS 皆有 pairing_rule＝v2-align；STATUS 各 Session 有 stopped_stages",
+          man.get("pairing_rule") == "v2-align" and st_mr.get("pairing_rule") == "v2-align"
+          and all("stopped_stages" in s and "uncounted_stages" in s for s in st_mr.get("sessions") or [])
+          and all(set(s.get("stopped_stages") or []) >= set(s.get("uncounted_stages") or []) for s in st_mr.get("sessions") or []),
+          str({k: st_mr.get(k) for k in ("pairing_rule", "overall")}))
+    import glob as _glob
+    from openpyxl import load_workbook as _lw
+    sx = [p for p in _glob.glob(os.path.join(last["merge_dir"], "整合認證報告_*.xlsx")) if "partial" not in p]
+    n_stp = sum(1 for s in man["stages"] if s["stopped"])
+    n_unp = sum(1 for s in man["stages"] if not s["stopped"] and s["cycle_id"] is None)
+    ok_tab, det_tab = False, str(sx)
+    if sx:
+        wbx = _lw(sx[0], read_only=True)
+        summ_txt = " ".join(str(v) for row in wbx["整合Summary"].iter_rows(values_only=True) for v in row if v)
+        rows_c = [r for r in wbx["循環判定"].iter_rows(values_only=True)]
+        titles = [i for i, r in enumerate(rows_c) if r and r[0] in ("有效未配對階段（不含中止排除）", "中止階段（不參與配對；原始資料完整保留）",
+                                                                     "循環加註（相鄰中止階段）")]
+        def _rows_after(i):                                                    # noqa: E306
+            out_ = []
+            for r in rows_c[i + 2:]:
+                if not r or r[0] is None:
+                    break
+                out_.append(r)
+            return out_
+        unp_rows, stp_rows = (_rows_after(titles[0]), _rows_after(titles[1])) if len(titles) == 3 else ([], [])
+        wbx.close()
+        cnt_ = man["count_invariants"] if isinstance(man.get("count_invariants"), dict) else {}
+        ok_tab = (len(titles) == 3 and f"中止排除 {n_stp}" in summ_txt and f"有效未配對階段 {n_unp}" in summ_txt
+                  and len(stp_rows) == n_stp and len(unp_rows) == n_unp and all(r[4] == "是" for r in stp_rows)
+                  and all(cnt_.get(k) for k in ("I2", "I9", "I10", "I11", "I12")))
+        det_tab = f"titles={len(titles)} stp={len(stp_rows)}/{n_stp} unp={len(unp_rows)}/{n_unp} inv={cnt_}"
+    check("V2A-TAB", "摘要統計與工作表一致：整合Summary 中止排除／有效未配對 數字＝manifest＝循環判定兩表列數；I2、I9～I12 成立",
+          ok_tab, det_tab)
+    _lm = {"written_at": "T", "verify": [], "planned_summary_name": "X.xlsx"}
+    _lbl_ok = [ln for ln in XL.first_screen_lines(dict(_lm, invariants={"I1": True, "I12": True})) if "計數不變式" in ln]
+    _lbl_ng = [ln for ln in XL.first_screen_lines(dict(_lm, invariants={"I1": True, "I12": False})) if "計數不變式" in ln]
+    check("V2A-LBL", "整合Summary 顯示「計數不變式 I1～I12」（不再顯示 I1～I8）；成立／不成立語意不變",
+          bool(sx) and "計數不變式 I1～I12：成立" in summ_txt and "I1～I8" not in summ_txt
+          and _lbl_ok == ["  計數不變式 I1～I12：成立"] and _lbl_ng == ["  計數不變式 I1～I12：不成立"], str((_lbl_ok, _lbl_ng)))
     from cert_report_xlsx import _sheet_name
     from cert_stage_engine import stage_names, strip_count_time
     class _S:                                                            # noqa: E306
@@ -2688,17 +2864,20 @@ def _t3s_pairing():
         return sa
     spec5 = [("D", "滿放", {}), ("C", "滿充", {}), ("C", "中止", {}), ("D", "滿放", {}), ("C", "滿充", {})]
     sa = unc_session(spec5, 3)
-    check("PA-01", "放、充、充（中止＋不計次）、放、充 → 2 個循環、不因不計次階段觸發 A1／A2、有加註、不計次階段保留",
+    check("PA-01", "放、充、充（中止＋不計次）、放、充 → 2 個循環、不因中止階段觸發 A1／A2、有不計次加註、中止排除（不計次）保留",
           len(sa["cycles"]) == 2 and all(c["certainty"] == AN.CERTAIN for c in sa["cycles"])
-          and sa["stages"][2]["pairing"] == AN.UNC_EXCLUDED and any(c["uncounted_notes"] for c in sa["cycles"])
+          and sa["stages"][2]["pairing"] == AN.STOPPED_EXCLUDED and sa["stages"][2]["stage"].counted is False
+          and AN.is_uncounted(sa["stages"][2]) and any(c["uncounted_notes"] for c in sa["cycles"])
           and len(sa["stages"]) == 5, str(_cy(sa)))
     sa = unc_session([("D", "滿放", {}), ("C", "滿充", {}), ("C", "中止", {}), ("C", "滿充", {})], 3)
     check("PA-02", "保護①：充1、充（不計次）、充2 → 排除後充1、充2 相鄰 → A2 仍觸發",
           sa["cycles"] and sa["cycles"][0]["certainty"] == AN.PAIR_PENDING
           and any(t.startswith("A2：") for t in sa["cycles"][0]["certainty_triggers"]), str(_cy(sa)))
     sa_n = fake_session([("D", "滿放", {}), ("C", "中止", {}), ("C", "滿充", {})])
-    check("PA-04", "只有標記中止、沒有有效不計次 → 照現行規則（D 與中止階段配對、第二個充電未配對）",
-          sa_n["cycles"] and sa_n["cycles"][0]["b"]["no"] == 2 and sa_n["stages"][2]["pairing"] != AN.UNC_EXCLUDED)
+    # v2-align（裁定 Q1、Q2；原期待：D 與中止階段配對、第二個充電未配對）
+    check("PA-04", "只有標記中止、沒有有效不計次（v2-align）→ 中止排除、不跨越：0 循環；放＝其後為中止階段、充＝前無可配",
+          not sa_n["cycles"] and [s["pairing"] for s in sa_n["stages"]] == [AN.UNP_BEFORE_STOP, AN.STOPPED_EXCLUDED, AN.UNP_NOPREV]
+          and not AN.is_uncounted(sa_n["stages"][1]), str([s["pairing"] for s in sa_n["stages"]]))
     # 保護②：交界窗口 [A−W, B+W]；階段 2（充）→ 階段 3（充，不計次）；FS：A＝開始＋100s，下一階段開始＋300s
     T = T0 + timedelta(seconds=300)                       # 階段 2 開始
     A = T + timedelta(seconds=100)
@@ -2781,13 +2960,15 @@ def _t3s_083020():
     AN.pair_session(sa, "DC")
     st = sa["stages"]
     cy = sa["cycles"]
-    unc = [s for s in st if s["pairing"] == AN.UNC_EXCLUDED]
-    paired = [s for s in st if s["pairing"] != AN.UNC_EXCLUDED and any(s["no"] in (c["a"]["no"], c["b"]["no"]) for c in cy)]
+    unc = [s for s in st if AN.is_uncounted(s)]
+    stp = [s for s in st if s["pairing"] == AN.STOPPED_EXCLUDED]
+    paired = [s for s in st if s["pairing"] != AN.STOPPED_EXCLUDED and any(s["no"] in (c["a"]["no"], c["b"]["no"]) for c in cy)]
     det = {"stages": [(s["no"], s["stage"].dir, s["stage"].label, s["pairing"], s.get("pending_pauses")) for s in st],
            "cycles": [(c["a"]["no"], c["b"]["no"], c["certainty"], c["status"], c["certainty_triggers"]) for c in cy]}
-    check("PA-B11", "保護④ 083020 獨立副本：5 階段、1 不計次（第 3 階段）、4 階段參與配對、2 個循環",
-          len(st) == 5 and [s["no"] for s in unc] == [3] and len(paired) == 4 and len(cy) == 2
-          and [(c["a"]["no"], c["b"]["no"]) for c in cy] == [(1, 2), (4, 5)], str(det))
+    # v2-align（原期待：1 不計次、4 階段參與配對、2 個循環 (1,2)、(4,5)）：第 3～5 階段標記中止 → 全部中止排除
+    check("PA-B11", "保護④ 083020 獨立副本（v2-align）：5 階段、中止排除 3（第 3～5 階段；其中不計次 1＝第 3 階段）、2 階段參與配對、1 個循環",
+          len(st) == 5 and [s["no"] for s in stp] == [3, 4, 5] and [s["no"] for s in unc] == [3] and len(paired) == 2
+          and [(c["a"]["no"], c["b"]["no"]) for c in cy] == [(1, 2)], str(det))
     check("PA-B11b", "保護④：保護②不觸發；相鄰階段（第 2 階段）7 個未決不確定停頓保留（不因不計次刪除）；全部 20 個保留",
           not any("保護②" in t for c in cy for t in c["certainty_triggers"]) and st[1].get("pending_pauses") == 7
           and sum(s.get("pending_pauses") or 0 for s in st) == 20, str(det))

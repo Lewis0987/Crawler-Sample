@@ -398,7 +398,7 @@ def write_summary(path, model, guard):
 def first_screen_lines(model):
     lines = [f"產生本檔時的狀態（{model['written_at']}）：",
              "  快照建立驗證（H1～H3）：一致",
-             f"  計數不變式 I1～I8：{'成立' if all(model['invariants'].values()) else '不成立'}",
+             f"  計數不變式 I1～I12：{'成立' if all(model['invariants'].values()) else '不成立'}",
              "  資料值驗證：" + "、".join(f"S{v['s_no']} {v['display']}" for v in model["verify"]),
              "  原始參數：UNVERIFIABLE（原始報告未記錄）",
              f"  預定檔名：{model['planned_summary_name']}"]
@@ -422,10 +422,12 @@ def _sheet_summary(ws, m):
     r += 1
     c = m["counts"]
     s = c["status"]
-    ws.cell(r, 1, f"Session {c['sessions']}｜原始階段：放電 {c['stages_D']}、充電 {c['stages_C']}｜已配對循環 {c['cycles']}"
+    ws.cell(r, 1, f"Session {c['sessions']}｜原始階段：放電 {c['stages_D']}、充電 {c['stages_C']}"
+                  f"｜有效階段：放電 {c['valid_D']}、充電 {c['valid_C']}｜中止排除 {c['stopped']}（其中不計次 {c['uncounted']}）"
+                  f"｜已配對循環 {c['cycles']}"
                   f"｜配對確定性：確定 {c['certain']}、循環配對待確認 {c['pair_pending']}"
                   f"｜確認狀態：確認完成 {s['確認完成']}、未滿 {s['未滿']}、中止 {s['中止']}、待確認 {s['待確認']}、"
-                  f"未完成 {s['未完成']}｜未配對階段 {c['unpaired']}")
+                  f"未完成 {s['未完成']}｜有效未配對階段 {c['unpaired']}")
     r += 2
     ws.cell(r, 1, "跨 Session 比較（所有已配對循環；只並列，不計算差值；不可比指標不得加總或比較）").font = FB
     rows = []
@@ -497,22 +499,24 @@ def _sheet_cycles(ws, m):
                      cy["reasons"], [f"{u['bound']}：{u['note']}" for u in cy["uncertain_bounds"]]])
     r = _table(ws, 1, ["循環", "循環 ID", "Session", "前半階段", "後半階段", "休息時間", "觀測間隔", "配對確定性",
                        "配對待確認觸發", "確認狀態", "全部理由", "不確定邊界"], rows)
+    stopped = "中止（不參與配對）"                       # = cert_merge_analysis.STOPPED_EXCLUDED（v2-align）
     un = [[s["id"], f"S{s['s_no']}", s["dir"], s["pairing"], s["effective_label"]]
-          for s in m["stages"] if s["cycle_id"] is None]
-    ws.cell(r, 1, "未配對階段").font = FB
+          for s in m["stages"] if s["cycle_id"] is None and s.get("pairing") != stopped]
+    ws.cell(r, 1, "有效未配對階段（不含中止排除）").font = FB
     r = _table(ws, r + 1, ["階段 ID", "Session", "方向", "配對結果", "有效標記"], un)
-    # r8 選項甲：不計次階段不參與配對；原始階段、量測、階段頁、Raw Data、統計與決策紀錄全部保留
+    # v2-align：中止階段（含不計次）不參與配對；原始階段、量測、階段頁、Raw Data、統計與決策紀錄全部保留
     unc = []
     for s in m["stages"]:
-        if s.get("pairing") == "不計次（不參與配對）":
+        if s.get("pairing") == stopped:
             h = (s.get("count_history") or [{}])[-1]
-            unc.append([s["id"], f"S{s['s_no']}", s["stage_start"], s["dir"], s.get("count_reason"), h.get("at"),
-                        h.get("request_id"), s.get("count_note")])
-    ws.cell(r, 1, "不計次階段（不參與配對；原始資料完整保留）").font = FB
-    r = _table(ws, r + 1, ["階段 ID", "Session", "stage_start", "方向", "不計次原因", "決策時間", "request_id", "說明"], unc)
+            unc.append([s["id"], f"S{s['s_no']}", s["stage_start"], s["dir"], "否" if s.get("count_counted", True) else "是",
+                        s.get("count_reason"), h.get("at"), h.get("request_id"), s.get("count_note")])
+    ws.cell(r, 1, "中止階段（不參與配對；原始資料完整保留）").font = FB
+    r = _table(ws, r + 1, ["階段 ID", "Session", "stage_start", "方向", "不計次", "不計次原因", "決策時間", "request_id",
+                           "說明"], unc)
     # 第 2 欄不放循環 ID（循環判定第 2 欄只供每循環一列的計數；以「循環」欄 CYn 對照上表）
     notes = [[cy["global_id"], n] for cy in m["cycles"] for n in cy.get("uncounted_notes") or []]
-    ws.cell(r, 1, "循環加註（相鄰不計次階段）").font = FB
+    ws.cell(r, 1, "循環加註（相鄰中止階段）").font = FB
     _table(ws, r + 1, ["循環", "加註"], notes)
 
 

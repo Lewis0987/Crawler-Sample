@@ -326,6 +326,21 @@ def is_uncounted(s):
     return getattr(s["stage"], "counted", True) is False and s.get("effective_label") == "中止"
 
 
+# v2-align（2026-11-27 使用者裁定 Q1～Q6）：合併摘要的中止階段排除與新版 v2 單一認證報告一致
+PAIRING_RULE = "v2-align"
+STOPPED_EXCLUDED = "中止（不參與配對）"
+UNP_BEFORE_STOP = "未配對：其後為中止階段（不跨越）"
+
+
+def is_stopped(s):
+    """
+    v2-align Q1：整合判定的有效標記＝「中止」→ 排除於有效階段與循環配對；不需要 stage_count 不計次決策。
+    有效不計次（is_uncounted）必為中止（H2：counted=false 只在標記中止時有效）→ is_uncounted ⊂ is_stopped；
+    is_uncounted 的原語意（命名、原因、決策紀錄、加註）保留，不以本函式取代。
+    """
+    return s.get("effective_label") == "中止"
+
+
 def _last_count(st):
     h = list(getattr(st, "count_history", None) or [])
     return h[-1] if h else {}
@@ -333,49 +348,71 @@ def _last_count(st):
 
 def pair_session(sa, order):
     """
-    P-4 配對；r8 選項甲：有效不計次階段不進入配對掃描、不觸發 A1／A2（保留原始階段與全部資料，只是不配對）。
-    保護①：排除後剩餘序列重新判斷 A1／A2；保護②：不計次階段與相鄰同向階段的交界有疑慮 → 相鄰循環仍待確認並加註；
-    保護③：確認狀態（P-7）與其他待確認理由不變。沒有不計次階段 → 與 r7 完全相同。
+    P-4 配對（v2-align，使用者裁定 Q1～Q3）：
+      · 有效標記中止 → STOPPED_EXCLUDED（不參與配對；原始階段、決策、量測全部保留）；不需要不計次決策。
+      · 中止階段＝不可跨越的分界：以中止階段切段，各段依 --cycle-order（first→second）由前往後配對；
+        不跨 Session、不跨中止階段；不得先移除中止階段再把原本不相鄰的有效階段配對。
+      · 保護①：確定性 A1／A2 仍以「排除中止階段後的有效序列」判斷（可觀察分界另一側的相鄰有效階段，只用於確定性）。
+      · 保護②：相鄰同向中止階段（含不計次）交界檢查；保護③：確認狀態（P-7）與其他待確認理由不變。
+      · 沒有中止階段 → 與 r7／r8 完全相同。
     """
     first, second = order[0], order[1]
     st = sa["stages"]
     cycles = []
     for s in st:
         s["pairing"], s["cycle_id"] = None, None
-    seq = [s for s in st if not is_uncounted(s)]
     for s in st:
-        if is_uncounted(s):
-            s["pairing"] = UNC_EXCLUDED
+        if is_stopped(s):
+            s["pairing"] = STOPPED_EXCLUDED
+    seq = [s for s in st if not is_stopped(s)]                     # 保護①用的有效序列（不用於配對）
     for j, s in enumerate(seq):
         s["seq_idx"] = j
-    n = len(seq)
-    i, k = 0, 0
-    while i < n:
-        s = seq[i]
-        if s["dir"] == first:
-            if i + 1 < n and seq[i + 1]["dir"] == second:
-                k += 1
-                cid = f"{sa['cert_id']}#CY{k}"
-                s["pairing"], seq[i + 1]["pairing"] = PAIR_FIRST, PAIR_SECOND
-                s["cycle_id"] = seq[i + 1]["cycle_id"] = cid
-                cycles.append({"id": cid, "cert_id": sa["cert_id"], "s_no": sa["s_no"], "a": s, "b": seq[i + 1]})
-                i += 2
-                continue
-            s["pairing"] = UNP_SAME if i + 1 < n else UNP_TAIL
+    segments, cur = [], []                                         # 以中止階段切段（段內維持原始順序）
+    for s in st:
+        if is_stopped(s):
+            if cur:
+                segments.append(cur)
+            cur = []
         else:
-            s["pairing"] = UNP_HEAD if i == 0 else UNP_NOPREV
-        i += 1
+            cur.append(s)
+    if cur:
+        segments.append(cur)
+    k = 0
+    for seg in segments:
+        n = len(seg)
+        i = 0
+        while i < n:
+            s = seg[i]
+            if s["dir"] == first:
+                if i + 1 < n and seg[i + 1]["dir"] == second:
+                    k += 1
+                    cid = f"{sa['cert_id']}#CY{k}"
+                    s["pairing"], seg[i + 1]["pairing"] = PAIR_FIRST, PAIR_SECOND
+                    s["cycle_id"] = seg[i + 1]["cycle_id"] = cid
+                    cycles.append({"id": cid, "cert_id": sa["cert_id"], "s_no": sa["s_no"], "a": s, "b": seg[i + 1]})
+                    i += 2
+                    continue
+                if i + 1 < n:
+                    s["pairing"] = UNP_SAME
+                elif s["idx"] + 1 < len(st) and is_stopped(st[s["idx"] + 1]):
+                    s["pairing"] = UNP_BEFORE_STOP
+                else:
+                    s["pairing"] = UNP_TAIL
+            else:
+                s["pairing"] = UNP_HEAD if s["seq_idx"] == 0 else UNP_NOPREV
+            i += 1
     for c in cycles:
         _certainty(c, seq)
         _protect2(c, sa)
         _confirm(c, sa)
     sa["cycles"] = cycles
+    sa["stopped_stages"] = [s for s in st if is_stopped(s)]
     sa["uncounted_stages"] = [s for s in st if is_uncounted(s)]
     return cycles
 
 
 def _certainty(c, seq):
-    """P-20（r8 保護①：以排除不計次階段後的序列判斷；沒有不計次階段時與 r7 相同）。"""
+    """P-20（保護①：以排除中止階段（含不計次）後的有效序列判斷；沒有中止階段時與 r7 相同）。"""
     a, b = c["a"], c["b"]
     trig = []
     ia, ib = a["seq_idx"], b["seq_idx"]
@@ -431,7 +468,8 @@ def junction_concern(x, y, sa):
 
 
 def _protect2(c, sa):
-    """r8 保護②：與本循環階段相鄰（原始序列）的同向不計次階段，交界有疑慮 → 本循環仍觸發 A1／A2 並加註。"""
+    """保護②（r8；v2-align Q5 擴大至中止）：與本循環階段相鄰（原始序列）的同向中止階段（含不計次），
+    交界有疑慮 → 本循環仍觸發 A1／A2 並加註。檢查內容（人工分割、邊界不確定、未決停頓／交界窗口）不變。"""
     st = sa["stages"]
     for half in (c["a"], c["b"]):
         i = half["idx"]
@@ -439,16 +477,20 @@ def _protect2(c, sa):
             if not (0 <= j < len(st)):
                 continue
             u = st[j]
-            if not is_uncounted(u) or u["dir"] != half["dir"]:
+            if not is_stopped(u) or u["dir"] != half["dir"]:
                 continue
-            last = _last_count(u["stage"])
-            c["uncounted_notes"].append(
-                f"相鄰不計次階段 {u['id']}（開始 {u['stage_start']}；原因：{getattr(u['stage'], 'count_reason', '')}；"
-                f"決策時間 {last.get('at')}；request_id {last.get('request_id')}）")
+            kind = "相鄰不計次階段" if is_uncounted(u) else "相鄰中止階段"
+            if is_uncounted(u):
+                last = _last_count(u["stage"])
+                c["uncounted_notes"].append(
+                    f"相鄰不計次階段 {u['id']}（開始 {u['stage_start']}；原因：{getattr(u['stage'], 'count_reason', '')}；"
+                    f"決策時間 {last.get('at')}；request_id {last.get('request_id')}）")
+            else:
+                c["uncounted_notes"].append(f"相鄰中止階段 {u['id']}（開始 {u['stage_start']}；有效標記中止；無有效不計次決策）")
             why = junction_concern(u, half, sa) if x_first else junction_concern(half, u, sa)
             if why:
                 c["certainty_triggers"].append(
-                    f"{'A1' if half is c['a'] else 'A2'}（保護②）：相鄰不計次階段 {u['id']} 可能與 {half['id']} 屬同一階段"
+                    f"{'A1' if half is c['a'] else 'A2'}（保護②）：{kind} {u['id']} 可能與 {half['id']} 屬同一階段"
                     f"（{'；'.join(why)}）")
                 c["certainty"] = PAIR_PENDING
 
@@ -518,24 +560,40 @@ def invariants(sessions):
     cycles = [c for sa in sessions for c in sa["cycles"]]
     engine_total = sum(len(sa["res"].stages) for sa in sessions)
     paired = [s for s in stages if s["pairing"] in (PAIR_FIRST, PAIR_SECOND)]
-    unpaired = [s for s in stages if s["pairing"] not in (PAIR_FIRST, PAIR_SECOND)]
+    stopped = [s for s in stages if s["pairing"] == STOPPED_EXCLUDED]
+    unpaired = [s for s in stages if s["pairing"] not in (PAIR_FIRST, PAIR_SECOND, STOPPED_EXCLUDED)]   # 有效未配對
+    valid = [s for s in stages if s["pairing"] != STOPPED_EXCLUDED]
     ids = Counter(x["id"] for c in cycles for x in (c["a"], c["b"]))
     st_cnt = Counter(c["status"] for c in cycles)
     ce_cnt = Counter(c["certainty"] for c in cycles)
+    unp_kinds = (UNP_HEAD, UNP_TAIL, UNP_SAME, UNP_NOPREV, UNP_BEFORE_STOP)
     r = {
         "I1": len(stages) == engine_total,
-        "I2": len(stages) == len(paired) + len(unpaired),
+        "I2": len(stages) == len(paired) + len(unpaired) + len(stopped),     # v2-align：原始＝已配對＋有效未配對＋中止排除
         "I3": len(paired) == 2 * len(cycles),
         "I4": len(cycles) == sum(st_cnt.get(k, 0) for k in STATUSES),
         "I5": len(cycles) == ce_cnt.get(CERTAIN, 0) + ce_cnt.get(PAIR_PENDING, 0),
         "I6": all(v == 1 for v in ids.values()),
         "I7": all(c["a"]["cert_id"] == c["b"]["cert_id"] for c in cycles),
         "I8": all(c["certainty"] == CERTAIN for c in cycles if c["status"] == ST_DONE),
+        # v2-align：沒有任何循環包含中止階段（新版正常配對不產生中止循環）
+        "I9": all(not is_stopped(x) for c in cycles for x in (c["a"], c["b"])),
+        # v2-align：不計次階段一定屬於中止排除（不計次為中止排除的子集合，不重複加總）
+        "I10": all(s["pairing"] == STOPPED_EXCLUDED for s in stages if is_uncounted(s)),
+        # v2-align：每個原始階段只有一個且一致的分類（中止排除⇔有效標記中止；已配對⇔有循環 ID；其餘為已知的有效未配對類型）
+        "I11": all(((s["pairing"] == STOPPED_EXCLUDED) == is_stopped(s))
+                   and ((s["pairing"] in (PAIR_FIRST, PAIR_SECOND)) == (s["cycle_id"] is not None))
+                   and s["pairing"] in (PAIR_FIRST, PAIR_SECOND, STOPPED_EXCLUDED) + unp_kinds for s in stages),
+        # v2-align：每個循環＝原始序列中相鄰（不跨越中止階段）的兩個反向階段；全部循環同一個前半方向；循環 ID 不重複
+        "I12": all(c["b"]["idx"] == c["a"]["idx"] + 1 and c["a"]["dir"] != c["b"]["dir"] for c in cycles)
+               and len({c["a"]["dir"] for c in cycles}) <= 1 and len({c["id"] for c in cycles}) == len(cycles),
     }
     counts = {"sessions": len(sessions), "stages_D": sum(1 for s in stages if s["dir"] == "D"),
               "stages_C": sum(1 for s in stages if s["dir"] == "C"), "cycles": len(cycles),
               "certain": ce_cnt.get(CERTAIN, 0), "pair_pending": ce_cnt.get(PAIR_PENDING, 0),
-              "status": {k: st_cnt.get(k, 0) for k in STATUSES}, "unpaired": len(unpaired)}
+              "status": {k: st_cnt.get(k, 0) for k in STATUSES}, "unpaired": len(unpaired),
+              "valid_D": sum(1 for s in valid if s["dir"] == "D"), "valid_C": sum(1 for s in valid if s["dir"] == "C"),
+              "stopped": len(stopped), "uncounted": sum(1 for s in stages if is_uncounted(s))}
     return r, counts
 
 

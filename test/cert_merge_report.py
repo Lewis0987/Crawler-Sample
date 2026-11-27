@@ -90,7 +90,9 @@ class Run:
         self.dir = merge_dir
         self.guard = SRC.Guard(merge_dir)
         self.hooks = hooks
+        import cert_merge_analysis as AN
         self.status = {"merge_id": os.path.basename(merge_dir), "stage": None, "overall": None, "reason": None,
+                       "pairing_rule": AN.PAIRING_RULE,                 # 合併摘要配對規格（v2-align；不取代雜湊與驗證）
                        "snapshot": {}, "integrity": {}, "count_invariants": {}, "sessions": [],
                        "publish": {"state": "NOT_ATTEMPTED", "planned": [], "done": []},
                        "manifest_sha256": None, "updated_at": None}
@@ -333,6 +335,7 @@ def _status_session(sa, v):
             "decision_snapshot": v.get("decision_snapshot"), "reproducibility": v.get("reproducibility"),
             "traceability": v.get("traceability"), "traceability_note": v.get("traceability_note"),
             "uncounted_stages": [s["id"] for s in sa.get("uncounted_stages") or []],
+            "stopped_stages": [s["id"] for s in sa.get("stopped_stages") or []],
             "declared_version": sa["declared_version"] or "未提供", "version_source": "使用者提供",
             "version_verification": "未驗證"}
 
@@ -463,7 +466,9 @@ def _manifest(run, ctx, overall, publish_state, final_names=True):
                      "data_value_verification": v, "param_traceability": "UNVERIFIABLE",
                      "unknown_keys": (sa or {}).get("params_info", {}).get("unknown_keys")})
     sessions = ctx.get("sessions", [])
+    import cert_merge_analysis as AN
     m = {"merge_id": os.path.basename(run.dir), "generated_at": ctx["started_at"], "finished_at": _now(),
+         "pairing_rule": AN.PAIRING_RULE,
          "cycle_order": a.cycle_order, "version_args": a.version, "source_count": len(infos), "tool": ctx["tool"],
          "space": ctx.get("space"), "snapshot": run.status.get("snapshot"),
          "readonly_attribute_failures": ctx.get("readonly_failures"),
@@ -472,7 +477,7 @@ def _manifest(run, ctx, overall, publish_state, final_names=True):
          "stages": [{"id": s["id"], "dir": s["dir"], "stage_start": s["stage_start"], "end_by": s["stage"].end_by,
                      "start_certain": s["stage"].start_certain, "end_certain": s["stage"].end_certain,
                      "engine_label": s["engine_label"], "effective_label": s["effective_label"],
-                     "pairing": s["pairing"], "cycle_id": s["cycle_id"],
+                     "pairing": s["pairing"], "cycle_id": s["cycle_id"], "stopped": AN.is_stopped(s),
                      "counted": s.get("count_counted", True), "count_reason": s.get("count_reason"),
                      "count_note": s.get("count_note"), "count_history": s.get("count_history")}
                     for sa in sessions for s in sa["stages"]],
