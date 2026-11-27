@@ -20,7 +20,7 @@ import cert_heat_link as HL
 import cert_report_config as CFG
 import cert_supplement as SUP
 import report_quality as RQ
-from cert_report_xlsx import EXCLUDE_STOPPED_KEY, STOPPED_FORMAT, save_report
+from cert_report_xlsx import EXCLUDE_STOPPED_KEY, OVERALL_RANGE_KEY, format_flags, save_report
 from cert_screenshot import load_manifest
 
 DETAIL_TITLE = "重產明細（非原始認證紀錄）"
@@ -260,7 +260,11 @@ def detail_meta(sa, disclaimer):
                            f"測試條件：{ti.get('conditions') or '（未輸入）'}"],
             "source_notes": notes, "cabinet_spec": ti.get("cabinet_spec"), "cycles": ti.get("cycles"),
             "commands": meta_cmds}
-    meta[EXCLUDE_STOPPED_KEY] = _baseline_format(folder, st) == STOPPED_FORMAT   # 依原始報告格式選擇重產規則（r8 補充）
+    # 依原始報告格式選擇重產規則（r8 補充；v2 補充）：Legacy＝兩旗標皆無、v1＝只排除、v2＝排除＋整體有效範圍；
+    # 未知格式 → 照舊以 Legacy 規則重產（驗證端判 UNVERIFIABLE，不猜測）
+    flags = format_flags(_baseline_format(folder, st)) or format_flags("")
+    meta[EXCLUDE_STOPPED_KEY] = flags[EXCLUDE_STOPPED_KEY]
+    meta[OVERALL_RANGE_KEY] = flags[OVERALL_RANGE_KEY]
     supp = SUP.has_supplements(folder)
     if os.path.exists(os.path.join(folder, "screenshots.jsonl")) or os.path.isdir(os.path.join(folder, "screenshots")):
         hl, _evs = HL.replay(records, p["GAP_G_SEC"], CFG.CERT_HEAT_LINK_ALERT_SEC)

@@ -21,7 +21,7 @@ from cert_report_xlsx import (LOG_KEYS, RAW1_HEADERS, _raw1_note, _sheet_name, _
                               pcs_display, raw_measurement_valid, stage_count_notes)
 from cert_report_xlsx import TITLE_FILL, _slot_title, _title_cols, screenshot_slots   # r8 FMT：H2 標題底色規則（唯讀使用）
 from cert_stage_engine import decisions_digest, stage_names
-from cert_report_xlsx import STOPPED_FORMAT, _stage_key, exclude_stopped_raw_rows, split_stopped   # 中止階段排除格式相容（r8 補充）
+from cert_report_xlsx import STOPPED_FORMATS, _stage_key, exclude_stopped_raw_rows, split_stopped   # 中止階段排除格式相容（r8／v2）
 
 RAW_VALUE_KEYS = LOG_KEYS + ["power_kw"]          # 與 write_raw_seconds 相同順序：SOC～功率 kW（RAW1 第 3～12 欄）
 
@@ -90,7 +90,8 @@ def report_list(folder, cid, state, sha256_file):
 
 
 def report_format(path):
-    """原始報告格式識別（活頁簿屬性 category）：""＝舊格式（完整階段）；STOPPED_FORMAT＝中止階段排除；其他值原樣回傳（不支援）。"""
+    """原始報告格式識別（活頁簿屬性 category）：""＝舊格式（完整階段）；STOPPED_FORMATS（v1／v2）＝中止階段排除
+    （v2 另含整體曲線有效範圍）；其他值原樣回傳（不支援）。"""
     wb = load_workbook(path, read_only=True)
     try:
         return wb.properties.category or ""
@@ -299,9 +300,9 @@ def verify_session(sa, detail_path, rs, sha256_file, *, bd=None, base_target=Non
             return _final(out, UNVERIFIABLE, "來源版本過舊或格式不支援（Raw Data 不是 13 欄格式）")
         fmt = wo.properties.category or ""
         out["report_format"] = fmt
-        if fmt not in ("", STOPPED_FORMAT):                                          # 未知格式識別：不猜測
+        if fmt not in ("",) + STOPPED_FORMATS:                                       # 未知格式識別：不猜測
             return _final(out, UNVERIFIABLE, f"原始報告格式識別不支援（category＝{fmt!r}）")
-        new_fmt = fmt == STOPPED_FORMAT
+        new_fmt = fmt in STOPPED_FORMATS             # v1／v2 共用中止階段排除驗證規則（重產端依格式選旗標）
         ok_base = bd is not None and bd["snapshot"] in (SNAP_CONFIRMED, SNAP_PRESUMED)
         out["decision_verification"] = {k: bd[k] for k in ("path", "snapshot", "reason", "trace", "evidence",
                                                             "added_lines")} if bd else None

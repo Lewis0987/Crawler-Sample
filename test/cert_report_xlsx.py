@@ -16,6 +16,7 @@
 """
 
 import dataclasses
+import math
 import os
 import re
 import zipfile
@@ -125,6 +126,32 @@ STOPPED_LABEL = "中止"
 STOPPED_FORMAT = "stopped_stages_excluded=v1"   # 活頁簿屬性 category：新格式識別（空白＝舊格式，完整階段）
 EXCLUDE_STOPPED_KEY = "exclude_stopped_stages"  # meta 旗標：只有 cert_runtime.generate_report 設定；直接呼叫 save_report 預設不排除
 EXCL_SRC_NOTE = "沿用來源屬已排除的中止階段，不顯示數值"
+# 整體溫度曲線 v2（stopped_stages_excluded=v2）：v1 全部規則＋整體曲線只取有效時間範圍、遮蔽中止區段、標題用有效完整循環數
+STOPPED_FORMAT_V2 = "stopped_stages_excluded=v2"
+STOPPED_FORMATS = (STOPPED_FORMAT, STOPPED_FORMAT_V2)   # 兩者共用同一套中止階段排除規則（v2 只多整體曲線範圍）
+OVERALL_RANGE_KEY = "overall_valid_range"       # meta 旗標：須與 EXCLUDE_STOPPED_KEY 同時設定才生效（＝v2）
+
+
+def report_category(meta):
+    """meta 旗標 → 活頁簿 category：兩者皆有＝v2；只有排除＝v1；未排除＝""（Legacy）。"""
+    if not meta.get(EXCLUDE_STOPPED_KEY):
+        return ""
+    return STOPPED_FORMAT_V2 if meta.get(OVERALL_RANGE_KEY) else STOPPED_FORMAT
+
+
+def format_flags(fmt):
+    """原始報告 category → 重產用 meta 旗標（Legacy／v1／v2）；未知格式 → None（由驗證端判 UNVERIFIABLE，不猜測）。"""
+    if not fmt:
+        return {EXCLUDE_STOPPED_KEY: False, OVERALL_RANGE_KEY: False}
+    if fmt == STOPPED_FORMAT:
+        return {EXCLUDE_STOPPED_KEY: True, OVERALL_RANGE_KEY: False}
+    if fmt == STOPPED_FORMAT_V2:
+        return {EXCLUDE_STOPPED_KEY: True, OVERALL_RANGE_KEY: True}
+    return None
+
+
+def _overall_v2(meta):
+    return bool(meta.get(EXCLUDE_STOPPED_KEY)) and bool(meta.get(OVERALL_RANGE_KEY))
 
 
 def split_stopped(res, enabled):
@@ -204,6 +231,93 @@ def pad_excluded_minutes(rows, res, spans):
     return out
 
 
+def overall_window(res, excluded):
+    """
+    整體曲線 v2 有效時間範圍（循環數不限，依完整 Stage 清單動態計算）：
+      t0＝第一個有效階段（原始 Stage.no 最小者）的 start.t；t1＝全部有效階段 A.t（最後運行觀測）的最大值。
+      masks＝依原始 Stage.no 順序相鄰的中止階段合併成一段：(該段第一階段 seq0 觀測時間, 最後階段 seq1 觀測時間, [Stage…])
+             ——連續中止階段之間的休息一併遮蔽；有效階段與中止階段之間的休息不遮蔽（範圍內照常顯示）。
+    沒有有效階段 → (None, None, masks)。不修改 res、Stage.no 或觀測。
+    """
+    ex = {st.no for st in excluded}
+    seq = sorted(res.stages, key=lambda s: s.no)
+    kept = [st for st in seq if st.no not in ex]
+    masks, run = [], []
+    for st in seq + [None]:
+        if st is not None and st.no in ex:
+            run.append(st)
+            continue
+        if run:
+            masks.append((res.obs[run[0].seq0].t, res.obs[run[-1].seq1].t, run))
+            run = []
+    if not kept:
+        return None, None, masks
+    return kept[0].start.t, max(st.A.t for st in kept), masks
+
+
+def valid_cycle_pairs(stages, excluded):
+    """
+    整體曲線 v2 有效完整循環（甲-1；循環數不限）：依原始 Stage.no 順序掃描完整 Stage 清單（含中止階段）。
+      固定第一方向＝原始最小 Stage.no 的方向（即使該階段中止也不改變）；
+      只有「原始順序相鄰」且方向為「第一方向 → 相反方向」、兩階段都有效 → 一個完整循環（跳過 2 個），否則跳過 1 個。
+      不跨越中止階段重新配對；每個階段最多配對一次。
+    回傳 [(第一階段 Stage.no, 第二階段 Stage.no), …]；循環數＝len()。不修改 Stage／P-4 pair_session。
+    """
+    seq = sorted(stages, key=lambda s: s.no)
+    if not seq:
+        return []
+    ex = {st.no for st in excluded}
+    first = seq[0].dir
+    pairs, i = [], 0
+    while i < len(seq):
+        a = seq[i]
+        if a.dir == first and i + 1 < len(seq):
+            b = seq[i + 1]
+            if b.dir != first and b.dir in ("C", "D") and a.no not in ex and b.no not in ex:
+                pairs.append((a.no, b.no))
+                i += 2
+                continue
+        i += 1
+    return pairs
+
+
+def _mask_hit(masks, T):
+    """與分鐘 [T, T+1 分) 重疊的遮蔽區段內的中止階段（依 Stage.no，不重複）。"""
+    hit = {}
+    for m0, m1, run in masks:
+        if T <= m1 and T + timedelta(minutes=1) > m0:
+            for st in run:
+                hit[st.no] = st
+    return [hit[k] for k in sorted(hit)]
+
+
+def excluded_note(stages):
+    """「已排除中止階段（第2次充電，開始 …、…）」——v1 整體頁遮蔽分鐘備註（v2 不輸出任何中止說明）。"""
+    return "已排除中止階段（" + "、".join(f"{st.dir_name}，開始 {fmt_t(st.start.t, True)}" for st in stages) + "）"
+
+
+def overall_v2_rows(res_v, t0, t1, masks, minutes_fn):
+    """
+    整體曲線 v2 分鐘列（中止階段全面排除）：先以精確時間裁切實際觀測（t0 ≤ t ≤ t1 且不在任何遮蔽區段內），再交給 minutes_fn
+    （＝overall_minutes，分鐘聚合規則不變）；候選分鐘軸＝floor(t0)～floor(t1) 逐分鐘。
+      與遮蔽區段重疊的分鐘 → 完全不保留（不留分隔列、不加任何中止說明）；前後有效分鐘直接相鄰（圖表直接銜接，
+        類別仍是原始整分時間，不產生虛構時間、不插值）。
+      其他分鐘照舊：有觀測 → 原分鐘列；沒有觀測 → N/A「該分鐘內無取樣」（真正缺少取樣，保留；dispBlanksAs＝gap 仍斷開）。
+    t0 為 None（沒有有效階段）→ []。
+    """
+    if t0 is None:
+        return []
+    clip = [o for o in res_v.obs if t0 <= o.t <= t1 and not any(m0 <= o.t <= m1 for m0, m1, _r in masks)]
+    have = {mr.T: mr for mr in minutes_fn(dataclasses.replace(res_v, obs=clip))}
+    out = []
+    M, end = t0.replace(second=0, microsecond=0), t1.replace(second=0, microsecond=0)
+    while M <= end:
+        if not _mask_hit(masks, M):
+            out.append(have.get(M) or MinuteRow(M, None, "該分鐘內無取樣", {}))
+        M += timedelta(minutes=1)
+    return out
+
+
 def stopped_notes(kept, excluded, spans, rs=None):
     """排除說明（活頁簿描述；放在計次描述之前）。沒有排除階段 → []（描述與舊格式相同）。"""
     if not excluded:
@@ -253,8 +367,11 @@ def _write_log_sheet(ws, rows, remark_fn, p, table_name):
     ws.freeze_panes = "A2"
 
 
-def _make_chart(ws, n, title):
-    """依 ws 的 A 欄與隱藏輔助欄建立範本樣式折線圖（Rack 最大／最小、傳感器溫度）。"""
+def _make_chart(ws, n, title, text_axis=False, label_skip=None):
+    """依 ws 的 A 欄與隱藏輔助欄建立範本樣式折線圖（Rack 最大／最小、傳感器溫度）。
+    text_axis=True（只用於 v2 整體圖）：X 軸固定為文字類別軸（<c:auto val="0"/>），Excel 不依日期時間差補回空白。
+    label_skip（只用於 v2 整體圖）：tickLblSkip＝每 k 個類別顯示 1 個時間標籤，文字固定直式 10pt（同階段圖樣式）；
+    類別仍引用 A 欄原始時間（不改參照、不刪資料點）。"""
     ch = LineChart()
     ch.title = title
     ch.width, ch.height = CHART_W, CHART_H
@@ -278,6 +395,11 @@ def _make_chart(ws, n, title):
     ch.x_axis.number_format = "h:mm"
     ch.x_axis.axPos = "b"
     ch.x_axis.delete = False
+    if text_axis:
+        ch.x_axis.auto = False
+    if label_skip:
+        ch.x_axis.tickLblSkip = label_skip
+        _summary_axis_style(ch)
     ch.y_axis.delete = False
     if nums:
         # 上下界對稱：下界 ceil(最小)−1、上界 ceil(最大)+1 —— 最小值剛好是整數時（例：傳感器 23.0）也留 1°C，
@@ -660,7 +782,7 @@ def _write_heat(ws, stages, names, shots=None, show_final=True):
 # =============================================================================
 # Summary
 # =============================================================================
-def _write_summary(wb, ws, res, names, sheet_of, n_rows, meta, p):
+def _write_summary(wb, ws, res, names, sheet_of, n_rows, meta, p, title=None, text_axis=False, label_skip=None):
     for i, line in enumerate(meta.get("conditions", [])[:3], 1):
         ws.cell(i, 1, _condition_text(line)).font = F14
     ws.cell(4, 1, "溫度曲線：").font = F14B
@@ -701,7 +823,9 @@ def _write_summary(wb, ws, res, names, sheet_of, n_rows, meta, p):
                 arrows.append(("downArrow", SUM_ARROW_DOWN_R if right else SUM_ARROW_DOWN_L, r0, text))
     orow = 4 + SUMMARY_PITCH * ((len(stages) + 1) // 2)
     if n_rows.get("overall"):
-        ch = _make_chart(wb["整體測試"], n_rows["overall"], overall_title(meta))   # X 軸文字方向／間隔交給 Excel（直式）
+        ch = _make_chart(wb["整體測試"], n_rows["overall"],                       # X 軸文字方向／間隔交給 Excel（直式）
+                         overall_title(meta) if title is None else title,          # v2：與整體測試頁同一標題
+                         text_axis=text_axis, label_skip=label_skip)                # v2：與整體測試頁同一 X 軸與標籤間隔
         ws.add_chart(ch, _anchor(SUM_CHART_L, orow))
     if ws._charts:
         wb._cert_summary_arrows = arrows            # 存檔後寫入 Summary 的 drawing（真正的箭頭圖形）
@@ -728,12 +852,86 @@ def cabinet_spec(meta):
     return v or None
 
 
-def overall_title(meta):
+def overall_title(meta, n_cycles=None):
     """整體溫度曲線標題：【340KW】電櫃充放2個循環溫度曲線。Summary 與「整體測試」頁共用。
-    未輸入電櫃規格 → 【電櫃規格未設定】；未輸入循環數 → 不寫循環數（不自動推算）。"""
-    cyc = meta.get("cycles")
+    未輸入電櫃規格 → 【電櫃規格未設定】。
+    n_cycles 未傳入（Legacy／v1）：循環數取 meta["cycles"]，未輸入 → 不寫循環數（不自動推算）。
+    n_cycles 有傳入：＝指定循環數；0 → 不寫循環數。v2 報告改用 overall_title_v2（獨立櫃；未配對階段 → 充放電）。"""
+    cyc = meta.get("cycles") if n_cycles is None else n_cycles
     return (f"【{cabinet_spec(meta) or '電櫃規格未設定'}】電櫃充放"
             + (f"{int(cyc)}個循環" if cyc else "") + "溫度曲線")
+
+
+def overall_title_v2(meta, pairs, kept_nos, idle=False):
+    """
+    v2 整體溫度曲線標題（Summary 與「整體測試」頁共用；Legacy／v1 仍用 overall_title）：
+      idle（原始 Stage 清單為空）→ 【規格】獨立櫃溫度曲線（沒有充放電階段，不寫充放電與循環數）；
+      全部有效階段（kept_nos）都在 valid_cycle_pairs 配對內、且至少 1 個循環 → 【規格】獨立櫃充放N個循環溫度曲線；
+      否則（有任何未配對的有效充電／放電階段，或沒有完整循環）→ 【規格】獨立櫃充放電溫度曲線。
+    逐一比對 Stage.no（不依有效階段數奇偶）；不修改配對與循環數。未輸入規格 → 【電櫃規格未設定】（共用佔位文字不變）。
+    """
+    spec = f"【{cabinet_spec(meta) or '電櫃規格未設定'}】獨立櫃"
+    if idle:
+        return spec + "溫度曲線"
+    if pairs and not unpaired_stages(pairs, kept_nos):
+        return f"{spec}充放{len(pairs)}個循環溫度曲線"
+    return spec + "充放電溫度曲線"
+
+
+def unpaired_stages(pairs, kept_nos):
+    """未配對的有效 Stage.no（有效階段 − valid_cycle_pairs 中出現過的 Stage.no），依 Stage.no 排序。"""
+    paired = {no for pr in pairs for no in pr}
+    return sorted(set(kept_nos) - paired)
+
+
+LABEL_MAX_17CM, LABEL_MIN = 40, 12      # v2 整體圖 X 軸標籤數：17 cm 圖寬最多 40 個（依圖寬等比例）；12 個為可讀性目標下限
+_NICE_STEPS = (1, 2, 3, 5, 6, 10, 15, 20, 25, 30, 45, 60)
+
+
+def _nice_steps():
+    """常用間隔（分鐘）：1、2、3、5、6、10、15、20、25、30、45、60，之後 90、120、180、240、360、480…（無上限）。"""
+    yield from _NICE_STEPS
+    a, b = 90, 120
+    while True:
+        yield a
+        yield b
+        a, b = a * 2, b * 2
+
+
+def label_base(n_pairs, n_unpaired):
+    """基礎間隔（分鐘）：N＝完整循環數＋未配對有效階段×0.5（只用於標籤密度）；N≤1 → 3、N≤2 → 6、其餘 5×(⌈N⌉−1)。"""
+    n = n_pairs + 0.5 * n_unpaired
+    if n <= 1:
+        return 3
+    if n <= 2:
+        return 6
+    return 5 * (math.ceil(n) - 1)
+
+
+def overall_label_skip(n_rows, n_pairs, n_unpaired, width_cm=CHART_W, l_max=None, l_min=LABEL_MIN):
+    """
+    v2 整體圖 X 軸 tickLblSkip（類別數；文字類別軸上 1 列＝1 類別，分隔列也算 1 個；不是經過分鐘數）。
+      lo＝⌈n／標籤上限⌉（標籤上限＝40×圖寬／17 cm，至少 1）→ 可見標籤數 ⌈n／k⌉ 不超過上限；
+      hi＝max(lo, ⌊n／12⌋)（12 個為目標下限；資料列很少時不強制 12 個）；
+      目標＝基礎間隔限制在 [lo, hi]；取 ≥ 目標的最小常用間隔，若超過 hi 改取 [lo, hi] 內最大的常用間隔，
+      都沒有 → 直接用目標整數。n_rows ≤ 0 → None（沒有圖表）。
+    """
+    if n_rows <= 0:
+        return None
+    if l_max is None:
+        l_max = max(1, int(LABEL_MAX_17CM * width_cm / 17.0))
+    lo = max(1, math.ceil(n_rows / l_max))
+    hi = max(lo, n_rows // l_min)
+    target = min(max(label_base(n_pairs, n_unpaired), lo), hi)
+    below = None
+    for s in _nice_steps():
+        if s >= target:
+            if s <= hi:
+                return s
+            break
+        if s >= lo:
+            below = s
+    return below if below is not None else target
 
 
 def _with_spec(meta, title):
@@ -1091,18 +1289,57 @@ def build_workbook(res, meta):
             _write_short_stage(ws, st, p)
 
     ws_all = wb.create_sheet("整體測試")
-    orows = overall_minutes(res_v, valid=lambda o: is_report_valid(o, p, names_full),          # 有效觀測優先（同一判定）
-                            prefer=lambda o: has_pcs_temp(o, p),                              # 與階段頁同一選樣優先條件
-                            phase=lambda o: overall_phase(o, names_full),                     # 不跨語意；沒有 → 原規則
-                            ext_scope="minute")              # 四個極值＝完整日曆分鐘（一般欄位仍為最後語意範圍）
-    orows = pad_excluded_minutes(orows, res, spans)    # 中止階段排除：保留完整原始時間軸（頭尾補 N/A）
+
+    def _overall(r):
+        return overall_minutes(r, valid=lambda o: is_report_valid(o, p, names_full),           # 有效觀測優先（同一判定）
+                               prefer=lambda o: has_pcs_temp(o, p),                               # 與階段頁同一選樣優先條件
+                               phase=lambda o: overall_phase(o, names_full),                      # 不跨語意；沒有 → 原規則
+                               ext_scope="minute")           # 四個極值＝完整日曆分鐘（一般欄位仍為最後語意範圍）
+    if _overall_v2(meta) and not res.stages:
+        # v2 Idle-only（原始 Stage 清單為空；≠ 全部中止）：無有效範圍可定義 → 保留完整觀測時間範圍（既有分鐘聚合規則），
+        # 0 個循環（標題省略循環數）；沒有觀測 → overall_minutes 回 []（不產生虛構分鐘／空白曲線）
+        orows = _overall(res_v)
+        otitle = overall_title_v2(meta, [], [], idle=True)          # 【規格】獨立櫃溫度曲線
+        pairs, unpaired = [], []
+
+        def mask_hit(T):
+            return []
+        wb._cert_overall_v2 = {"mode": "idle_only", "t0": None, "t1": None, "masks": [], "pairs": [], "title": otitle,
+                               "unpaired": []}
+    elif _overall_v2(meta):
+        # v2：有效時間範圍（第一個有效階段 start ～ 最後有效 A）＋遮蔽中止區段；先裁切觀測再聚合（循環數不限）
+        # 有階段但全部中止 → t0 為 None → 不產生整體曲線
+        t0, t1, masks = overall_window(res, excluded)
+        orows = overall_v2_rows(res_v, t0, t1, masks, _overall)
+        pairs = valid_cycle_pairs(res.stages, excluded)
+        unpaired = unpaired_stages(pairs, [st.no for st in kept])     # 只用於標題顯示條件與標籤密度（不改配對／循環數）
+        otitle = overall_title_v2(meta, pairs, [st.no for st in kept])
+
+        def mask_hit(T):
+            return []                   # 遮蔽分鐘已不保留；分隔列（T=None）的備註在 na_reason
+        wb._cert_overall_v2 = {"mode": "range" if t0 is not None else "all_stopped", "t0": t0, "t1": t1,
+                               "masks": [(m0, m1, [st.no for st in run]) for m0, m1, run in masks],
+                               "pairs": pairs, "title": otitle, "unpaired": unpaired,
+                               "separators": sum(1 for mr in orows if mr.T is None)}
+    else:
+        orows = _overall(res_v)
+        orows = pad_excluded_minutes(orows, res, spans)    # 中止階段排除（v1）：保留完整原始時間軸（頭尾補 N/A）
+        otitle = overall_title(meta)
+
+        def mask_hit(T):
+            return [st for t0, t1, st in spans if T <= t1 and T + timedelta(minutes=1) > t0]
     n_rows["overall"] = len(orows)
+    v2_axis = _overall_v2(meta)         # v2 兩張整體圖（整體測試＋Summary）：文字類別軸；Legacy／v1 不變
+    # v2 兩張整體圖共用同一 k：以較窄的「整體測試」圖寬（CHART_W 17 cm；Summary 整體圖實測略寬）計算
+    skip = overall_label_skip(len(orows), len(pairs), len(unpaired)) if v2_axis else None
+    if v2_axis:
+        wb._cert_overall_v2.update(label_base=label_base(len(pairs), len(unpaired)), label_skip=skip)
 
     def overall_remark(mr):
         if mr.obs is None:
-            hit = [st for t0, t1, st in spans if mr.T <= t1 and mr.T + timedelta(minutes=1) > t0]
+            hit = mask_hit(mr.T)
             if hit:
-                return "N/A：已排除中止階段（" + "、".join(f"{st.dir_name}，開始 {fmt_t(st.start.t, True)}" for st in hit) + "）"
+                return "N/A：" + excluded_note(hit)
             return f"N/A：{mr.na_reason}"
         if not has_hmi_values(mr.obs):          # 該分鐘內只有僅 6161 溫度的觀測
             return f"N/A：{R_NO_HMI}，僅有 6161 溫度"
@@ -1110,14 +1347,14 @@ def build_workbook(res, meta):
 
     if orows:
         _write_log_sheet(ws_all, orows, overall_remark, p, "T_overall")
-        ws_all.add_chart(_make_chart(ws_all, len(orows),
-                                     overall_title(meta)), CHART_ANCHOR)
+        ws_all.add_chart(_make_chart(ws_all, len(orows), otitle, text_axis=v2_axis, label_skip=skip), CHART_ANCHOR)
 
     shots = meta.get("screenshots")
     show_final = not is_cycle_test(meta)           # 循環測試：兩個截圖頁都不顯示「認證結束（最後狀態）」
     _write_overview(ws_ov, kept, names, shots, show_final)
     _write_heat(ws_heat, kept, names, shots, show_final)
-    _write_summary(wb, ws_sum, dataclasses.replace(res_v, stages=kept), names_full, sheet_of, n_rows, meta, p)
+    _write_summary(wb, ws_sum, dataclasses.replace(res_v, stages=kept), names_full, sheet_of, n_rows, meta, p,
+                   title=otitle, text_axis=v2_axis, label_skip=skip)   # Summary 與整體測試頁同一標題／資料來源／X 軸／標籤間隔
     # 「控制紀錄」頁已自報告移除；commands.jsonl 仍由 cert_runtime 照常記錄（不影響控制流程／稽核）
     grid = (meta.get("sampling_slots") or {}).get("grid")
     rs = exclude_stopped_raw_rows(raw_second_rows(res, grid, names_full), excluded, spans) if grid else None
@@ -1128,8 +1365,14 @@ def build_workbook(res, meta):
                                  "（不補秒、不沿用）。")
     else:
         write_raw_seconds(wb, rs, p, names_full)            # M-S2 r2：每秒一列（整筆沿用）；取代 Sampling Slots 工作表
-        wb._cert_raw_note = raw_seconds_note(rs)
-    wb._cert_stopped_notes = stopped_notes(kept, excluded, spans, rs)
+        wb._cert_raw_note = raw_seconds_note(rs, stopped_text=not _overall_v2(meta))
+    if _overall_v2(meta):
+        # v2：中止階段全面排除 → 活頁簿描述不寫任何中止說明（排除時段／筆數／Raw Data 排除列數／不計次說明）；
+        # 原始 Session、decisions、events 不變（中止紀錄只保留在原始資料）
+        wb._cert_stopped_notes = []
+        wb._cert_skip_count_nos = {st.no for st in excluded}
+    else:
+        wb._cert_stopped_notes = stopped_notes(kept, excluded, spans, rs)
     return wb
 
 
@@ -1296,8 +1539,8 @@ def write_raw_seconds(wb, rs, p, names, max_rows=None):
     return [ws.title for ws in sheets]
 
 
-def raw_seconds_note(rs):
-    """報告描述（活頁簿屬性）用的一行摘要。"""
+def raw_seconds_note(rs, stopped_text=True):
+    """報告描述（活頁簿屬性）用的一行摘要。stopped_text=False（v2）→ 不寫中止階段排除列數（其餘內容相同）。"""
     import report_display as RD
     s, rows = rs["stats"], rs["rows"]
     c = s["counts"]
@@ -1315,7 +1558,7 @@ def raw_seconds_note(rs):
         s = dict(s, max_age=max(ages) if ages else None, age_unknown=unk)
     cont = ("秒數連續不重複；" if not ex else
             f"秒數不重複；已排除中止階段 {ex['rows_dropped']} 列（排除時段不列出）、"
-            f"{ex['rows_blanked']} 列沿用中止階段讀值改為 N/A；")
+            f"{ex['rows_blanked']} 列沿用中止階段讀值改為 N/A；" if stopped_text else "秒數不重複；")
     span = f"{rows[0]['time']:%Y-%m-%d %H:%M:%S}～{rows[-1]['time']:%Y-%m-%d %H:%M:%S}" if rows else "—"
     txt = (f"Raw Data（1 秒格點認證）：每秒一列，共 {len(rows)} 列（{span}），{cont}"
            "沒有新的有效量測時整筆沿用最近一筆有效量測（沿用值不是新量測；Excel 不另外標示，各狀態秒數如下；"
@@ -1333,13 +1576,14 @@ def raw_seconds_note(rs):
                   "若未造成時間重疊則無法偵測）。階段頁、整體頁、圖表與判定只使用實際觀測，不使用本頁沿用值。")
 
 
-def stage_count_notes(res):
+def stage_count_notes(res, skip_nos=()):
     """
     H2 stage_count 說明（活頁簿屬性「描述」）：不計次原因、無效／恢復說明、完整歷史、對不到階段的決策。
     沒有任何 stage_count 決策 → []（報告描述與現行完全相同）。
+    skip_nos（v2）：已排除的中止階段 Stage.no → 不寫其計次說明（中止階段不在報告中紀錄；原始 decisions 不變）。
     """
     out = []
-    stages = [st for st in res.stages if getattr(st, "count_history", None)]
+    stages = [st for st in res.stages if getattr(st, "count_history", None) and st.no not in set(skip_nos)]
     if stages:
         nm = stage_names(res.stages)
     for st in stages:
@@ -1370,12 +1614,13 @@ def save_report(res, meta, path):
         at = next((i + 1 for i, n in enumerate(notes) if str(n).startswith("格點品質：")), len(notes))
         notes.insert(at, raw_note)
     notes += getattr(wb, "_cert_stopped_notes", [])  # 中止階段排除說明（必須在計次描述之前：r8 X10 要求計次描述在最後）
-    notes += stage_count_notes(res)                # H2：只有 stage_count 歷史／孤兒時才有內容（否則描述不變）
+    notes += stage_count_notes(res, getattr(wb, "_cert_skip_count_nos", ()))   # H2；v2 略過已排除中止階段
     if notes:
         wb.properties.description = "\n".join(str(n) for n in notes)[:3000]
         wb.properties.title = "充／放電認證測試報告"
-    if meta.get(EXCLUDE_STOPPED_KEY):              # 新格式識別（category 目前無其他用途；dec_v1 keywords 不變）
-        wb.properties.category = STOPPED_FORMAT
+    fmt = report_category(meta)                    # 新格式識別（v1／v2；category 目前無其他用途；dec_v1 keywords 不變）
+    if fmt:
+        wb.properties.category = fmt
     dec_sha = getattr(res, "dec_sha256", "")
     if dec_sha:                                    # H2 dec_v1：分析所用決策快照的指紋
         wb.properties.keywords = decisions_keywords(res.dec_n, dec_sha)

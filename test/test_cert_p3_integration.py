@@ -490,8 +490,15 @@ try:
     check("Summary 全程曲線與「整體測試」圖表引用同一資料範圍（同一份全程資料）", len(overall) == 2 and len(refs) == 1)
     titles_ = " ".join(re.findall(r"<a:t>([^<]*)</a:t>", " ".join(charts)))
     desc = wb.properties.description or ""
-    check("報告標題用輸入的電櫃規格與循環數（【340KW】電櫃充放2個循環溫度曲線）",
-          "【340KW】電櫃充放2個循環溫度曲線" in titles_)
+    # 2026-11-26 整體溫度曲線 v2（使用者授權更新期待值）：標題循環數＝實際有效完整循環（甲-1），不再取輸入的 cycles＝2。
+    # 本 fixture 階段＝放電／充電／放電（上方已驗證）、皆未中止 → 依甲-1：(第1,第2) 配成 1 個循環，第 3 階段放電無相鄰充電 → 1 個循環。
+    # 2026-11-26 v2 第二次人工驗收（使用者授權更新期待值）：存在未配對的有效階段（第 3 階段放電）→ 標題不寫循環數，
+    # 統一為「獨立櫃充放電溫度曲線」（1 個完整循環＋1 次放電；甲-1 配對與循環數不變）。
+    exp_title = "【340KW】獨立櫃充放電溫度曲線"
+    t_overall = {t for c in overall for t in re.findall(r"<a:t>([^<]*)</a:t>", c)}
+    check(f"報告標題用輸入的電櫃規格；放電→充電配成 1 個循環、第 3 階段放電未配對 → 不寫循環數（{exp_title}）",
+          [s.dir for s in res.stages] == ["D", "C", "D"] and not any(s.label == "中止" for s in res.stages)
+          and t_overall == {exp_title} and "2個循環" not in titles_)
     # 2026-11-11 M-S2（G-1 授權）：正式取樣週期 5 → 1 秒 → 來源說明文字的期待值依新設定更新（其餘條件不變）
     check("來源說明（取樣週期 1 秒＝正式設定、其他暫用參數、指令快照限制、服務中斷期間）寫入活頁簿屬性，不改動已確認版面",
           "取樣週期 1 秒為正式設定" in desc and "其他參數（G、確認門檻" in desc and "暫用測試值" in desc
@@ -811,9 +818,19 @@ try:
     rmk = {c.value.strftime("%H:%M"): wa_.cell(r_, 11).value for r_, c in enumerate(wa_["A"][1:], 2)
            if hasattr(c.value, "strftime")}
     print("     整體測試備註：", {k: rmk[k] for k in ("09:01", "09:05", "09:12", "09:17", "09:20") if k in rmk})
-    check("整體測試備註：待機（已上電）／第1次放電／待機／停機（已下電）／故障（PCS 故障旗標）",
-          rmk.get("09:01") == "待機" and rmk.get("09:05") == "第1次放電" and rmk.get("09:12") == "待機"
-          and rmk.get("09:17") == "停機" and rmk.get("09:20") == "故障" and "休息" not in rmk.values())
+    # 2026-11-26 整體溫度曲線 v2（使用者授權更新期待值）：整體頁只取有效範圍＝唯一有效階段的首筆觀測 ～ 最後運行觀測（A）所在分鐘；
+    # 範圍外的待機（09:01）／階段後待機（09:12）／停機（09:17）／故障（09:20）不在整體頁分鐘軸（Raw Data 照舊，見下方）。
+    st0 = res_s.stages[0]
+    exp_axis = []
+    _m = st0.start.t.replace(second=0, microsecond=0)
+    while _m <= st0.A.t.replace(second=0, microsecond=0):
+        exp_axis.append(_m.strftime("%H:%M"))
+        _m += timedelta(minutes=1)
+    check(f"整體測試分鐘軸＝有效範圍 {exp_axis[0]}～{exp_axis[-1]}（唯一有效階段首筆～最後運行觀測；{len(exp_axis)} 列）",
+          len(res_s.stages) == 1 and list(rmk) == exp_axis)
+    check("整體測試備註：範圍內 09:05＝第1次放電；範圍外 09:01（待機）／09:12（待機）／09:17（停機）／09:20（故障）不在分鐘軸；無「休息」",
+          rmk.get("09:05") == "第1次放電" and not ({"09:01", "09:12", "09:17", "09:20"} & set(rmk))
+          and "休息" not in rmk.values())
     rws = wbs["Raw Data"]
     rh = [c.value for c in rws[1]]
     rrows = [[c.value for c in r_] for r_ in rws.iter_rows(min_row=2) if r_[rh.index("序號")].value is not None]
